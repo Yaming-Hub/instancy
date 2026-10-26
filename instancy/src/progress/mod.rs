@@ -102,6 +102,7 @@ pub(crate) mod reachability;
 pub(crate) mod subgraph;
 pub mod timestamp;
 #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+#[doc(hidden)]
 pub mod trace;
 
 /// An operator's output retry queue. With the progress checker compiled in
@@ -126,3 +127,14 @@ pub(crate) type CheckCtx = Option<check::Ctx>;
 /// out.
 #[cfg(not(any(debug_assertions, feature = "progress-check")))]
 pub(crate) type CheckCtx = ();
+
+/// A task's handle on a flight recorder ring (see [`trace`]); the unit type
+/// when the recorder is compiled out.
+#[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+#[cfg_attr(not(feature = "transport"), allow(dead_code))]
+pub(crate) type TraceHandle = Option<std::sync::Arc<trace::Recorder>>;
+/// A task's handle on a flight recorder ring; the unit type when the
+/// recorder is compiled out.
+#[cfg(not(any(debug_assertions, feature = "progress-check", feature = "test-utils")))]
+#[cfg_attr(not(feature = "transport"), allow(dead_code))]
+pub(crate) type TraceHandle = ();

@@ -2865,6 +2865,14 @@ impl RuntimeHandle {
             })?;
             let (outbox, forwarder) =
                 spawn_peer_outbox(&peer_id, payload_sender, events_tx.clone(), runtime_handle);
+            traced! {
+                outbox.link().attach_trace(crate::progress::trace::bridge(
+                    dataflow_id,
+                    local_node_id,
+                    &peer_id,
+                    total_workers,
+                ));
+            }
             outboxes.insert(peer_id.clone(), outbox);
             forwarders.insert(peer_id, forwarder);
         }
@@ -2889,6 +2897,9 @@ impl RuntimeHandle {
         for (edge_order, (edge_idx, edge_capacity, creator)) in
             network_creators.into_iter().enumerate()
         {
+            traced! {
+                crate::progress::trace::describe_exchanges(dataflow_id, [(edge_order, edge_idx)]);
+            }
             // Extract receivers for this specific exchange edge from the shared map.
             let mut edge_receivers: std::collections::HashMap<
                 String,
@@ -3336,6 +3347,8 @@ impl RuntimeHandle {
                 failure_announced: false,
                 unfinished_announced: false,
                 worker_failure: None,
+                #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+                trace_pending: None,
                 _teardown: teardown_notifier,
             };
             runtime_handle.spawn(lifecycle.run());
@@ -5731,12 +5744,22 @@ fn materialize_executor<T: Timestamp>(
                 worker_context.worker_index(),
                 worker_context.num_workers(),
             ));
-            crate::progress::trace::name_operators(
+            let graph = &dataflow.graph;
+            let edges = graph.edges();
+            crate::progress::trace::describe_graph(
                 *id,
-                dataflow
-                    .graph
-                    .operators()
-                    .map(|op| (op.index, op.name.clone())),
+                graph.operators().map(|op| (op.index, op.name.clone())),
+                edges
+                    .iter()
+                    .chain(graph.feedback_edges().iter())
+                    .enumerate()
+                    .map(|(index, edge)| {
+                        (
+                            index,
+                            (edge.source.operator_index, edge.source.slot_index),
+                            (edge.target.operator_index, edge.target.slot_index),
+                        )
+                    }),
             );
         }
     }

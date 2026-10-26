@@ -956,6 +956,8 @@ struct TraceState {
     /// Per peer (by worker index): batches applied from its lane, and the
     /// lane's state as last recorded.
     lanes: Vec<(u64, LaneState)>,
+    /// Peer lane state changes applied so far (seals and closes).
+    lane_changes: u64,
 }
 
 /// Per-operator frontier state tracked by the progress tracker.
@@ -1040,6 +1042,20 @@ impl<T: Timestamp> ProgressTracker<T> {
                     stack.extend(upstream.iter().cloned());
                 }
             }
+        }
+        traced! {
+            use crate::progress::trace::{self, Site};
+            trace::with(Site::Tracker, |recorder| {
+                let mut locations: Vec<&ScopeLocation> = seen.iter().collect();
+                locations.sort();
+                for (scope, location) in locations {
+                    let (source, node, port) = match *location {
+                        Location::Source { node, port } => (true, node, port),
+                        Location::Target { node, port } => (false, node, port),
+                    };
+                    recorder.record(trace::scope_location(*scope, source, node, port));
+                }
+            });
         }
         self.assign_scope(&seen);
     }
@@ -1194,6 +1210,20 @@ impl<T: Timestamp> ProgressTracker<T> {
                     continue;
                 };
                 for (time, diff) in batch.drain() {
+                    traced! {
+                        use crate::progress::trace::{self, Change, Kind, Site};
+                        let seeded = Change::of(
+                            self.scope_id,
+                            ProgressKind::Source,
+                            location.node(),
+                            location_port(&location),
+                            &time,
+                            diff * copies,
+                        );
+                        trace::with(Site::Tracker, |recorder| {
+                            recorder.change(Kind::Seed, &seeded, 0, index as u64);
+                        });
+                    }
                     self.tracker.update_source(
                         location.node(),
                         location_port(&location),
@@ -2393,6 +2423,9 @@ fn trace_lane<T: Timestamp>(
     let changed = lane.1 != state;
     lane.1 = state;
     let batches = lane.0;
+    if changed {
+        trace.lane_changes += 1;
+    }
     if drained.is_empty() && !changed {
         return;
     }
@@ -2438,6 +2471,11 @@ impl<T: Timestamp> ProgressTracker<T> {
     /// Commits this worker sent so far.
     pub(crate) fn trace_commits(&self) -> u64 {
         self.trace.commits
+    }
+
+    /// Peer lane state changes (seals and closes) applied so far.
+    pub(crate) fn trace_lane_changes(&self) -> u64 {
+        self.trace.lane_changes
     }
 
     /// Every non-zero raw count in the worker's scope, in every scope (what

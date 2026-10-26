@@ -303,11 +303,21 @@ impl ChannelEndpoints {
             .reporters()
             .and_then(|r| r.consumed::<T>(self.operator, port))
             .unwrap_or_default();
-        Ok(crate::dataflow::shell::CountedInput::new(
+        #[cfg_attr(
+            not(any(debug_assertions, feature = "progress-check", feature = "test-utils")),
+            allow(unused_mut)
+        )]
+        let mut input = crate::dataflow::shell::CountedInput::new(
             format!("{operator}:input{port}"),
             pull,
             ledger,
-        ))
+        );
+        traced! {
+            if crate::progress::trace::enabled() {
+                input.trace_at(self.operator, port);
+            }
+        }
+        Ok(input)
     }
 
     /// Every remaining input port, in port order (for an operator with a
@@ -363,13 +373,23 @@ impl ChannelEndpoints {
         let reporter = self
             .progress_reporter::<T>(self.operator, port)
             .unwrap_or_default();
-        Ok(crate::dataflow::shell::CountedOutput::new(
+        #[cfg_attr(
+            not(any(debug_assertions, feature = "progress-check", feature = "test-utils")),
+            allow(unused_mut)
+        )]
+        let mut output = crate::dataflow::shell::CountedOutput::new(
             format!("{operator}:output{port}"),
             push,
             ledger,
             reporter,
             self.wake_handle.clone(),
-        ))
+        );
+        traced! {
+            if crate::progress::trace::enabled() {
+                output.trace_at(self.operator, port);
+            }
+        }
+        Ok(output)
     }
 
     /// Returns the progress reporter for the given operator output, if one was

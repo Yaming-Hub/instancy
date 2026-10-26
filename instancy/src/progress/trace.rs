@@ -63,8 +63,9 @@
 //! executor is dropped), commits and markers a retired link dropped, and
 //! finished dataflows evicted from the registry.
 
-// The data-path and link events are recorded from the following change.
-#![allow(dead_code)]
+// Links, bridges and network channels exist only with the `transport`
+// feature; so do the events about them.
+#![cfg_attr(not(feature = "transport"), allow(dead_code))]
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
@@ -155,11 +156,16 @@ fn ring_events() -> usize {
     })
 }
 
-/// Nanoseconds since the first recorded event of the process (monotonic,
-/// comparable across threads).
-fn now_ns() -> u64 {
+/// The process's trace clock: its first use. Every ring measures `t_ns`
+/// from it, on the monotonic clock (`Instant`).
+fn epoch() -> Instant {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
-    EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// Nanoseconds since [`epoch`].
+fn now_ns() -> u64 {
+    epoch().elapsed().as_nanos() as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +345,11 @@ pub(crate) enum Kind {
     Retired = 25,
     /// The coordinator acted on the link.
     Coordinator = 26,
+    /// An initial capability seeded at the tracker's initialization.
+    Seed = 27,
+    /// A location in the worker's scope (S2b), at the tracker's
+    /// initialization.
+    Scope = 28,
 }
 
 impl Kind {
@@ -371,6 +382,8 @@ impl Kind {
             24 => Link,
             25 => Retired,
             26 => Coordinator,
+            27 => Seed,
+            28 => Scope,
             _ => return None,
         })
     }
@@ -404,6 +417,8 @@ impl Kind {
             Link => "link",
             Retired => "retired",
             Coordinator => "coordinator",
+            Seed => "seed",
+            Scope => "scope",
         }
     }
 }
@@ -420,6 +435,7 @@ pub(crate) struct Ev {
 }
 
 impl Ev {
+    #[inline(always)]
     pub(crate) fn new(kind: Kind) -> Self {
         Self {
             kind,
@@ -430,22 +446,26 @@ impl Ev {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn a(mut self, a: usize) -> Self {
         self.a = a.min(u16::MAX as usize) as u16;
         self
     }
 
+    #[inline(always)]
     pub(crate) fn b(mut self, b: usize) -> Self {
         self.b = b.min(u32::MAX as usize) as u32;
         self
     }
 
     /// Word `i` (0..5); a timed event uses words 0 and 1 for the time.
+    #[inline(always)]
     pub(crate) fn w(mut self, i: usize, v: u64) -> Self {
         self.w[i] = v;
         self
     }
 
+    #[inline(always)]
     pub(crate) fn time(mut self, t: TimeRepr) -> Self {
         self.tag = t.tag;
         self.w[0] = t.a;
@@ -453,6 +473,7 @@ impl Ev {
         self
     }
 
+    #[inline(always)]
     fn header(&self) -> u64 {
         self.kind as u64 | (self.tag as u64) << 8 | (self.a as u64) << 16 | (self.b as u64) << 32
     }
@@ -504,6 +525,15 @@ impl Change {
             .w(3, self.diff as u64)
             .w(4, reference)
     }
+}
+
+/// The event of a location in a worker's scope: progress scope `scope`,
+/// an output (`source`) or input `port` of node `node`.
+pub(crate) fn scope_location(scope: usize, source: bool, node: usize, port: usize) -> Ev {
+    Ev::new(Kind::Scope).a(scope).w(
+        2,
+        (node as u64 & 0xffff_ffff) | (port as u64 & 0xffff) << 32 | (source as u64) << 48,
+    )
 }
 
 /// How a push ended.
@@ -585,6 +615,8 @@ struct Ring {
     who: Who,
     total_workers: usize,
     capacity: u64,
+    /// The process's trace clock (see [`epoch`]).
+    epoch: Instant,
     next: AtomicU64,
     chunks: Box<[OnceLock<Box<[Slot]>>]>,
     /// Commits and markers a retired link dropped (a worker's ring).
@@ -596,6 +628,9 @@ struct Snapshot {
     events: Vec<(u64, [u64; 7])>,
     written: u64,
     torn: u64,
+    /// When the ring was read: it holds every event recorded before then
+    /// (or counts it as overwritten or torn).
+    at_ns: u64,
 }
 
 impl Ring {
@@ -606,36 +641,40 @@ impl Ring {
             who,
             total_workers,
             capacity: events as u64,
+            epoch: epoch(),
             next: AtomicU64::new(0),
             chunks: (0..events / CHUNK).map(|_| OnceLock::new()).collect(),
             lane_drops: AtomicU64::new(0),
         }
     }
 
+    #[inline(always)]
     fn push(&self, ev: &Ev) {
         let idx = self.next.fetch_add(1, Ordering::Relaxed);
         let pos = (idx % self.capacity) as usize;
-        let chunk =
-            self.chunks[pos / CHUNK].get_or_init(|| (0..CHUNK).map(|_| Slot::default()).collect());
+        let chunk = match self.chunks[pos / CHUNK].get() {
+            Some(chunk) => chunk,
+            None => self.chunks[pos / CHUNK]
+                .get_or_init(|| (0..CHUNK).map(|_| Slot::default()).collect()),
+        };
         let slot = &chunk[pos % CHUNK];
-        let words = [
-            ev.header(),
-            now_ns(),
-            ev.w[0],
-            ev.w[1],
-            ev.w[2],
-            ev.w[3],
-            ev.w[4],
-        ];
+        let t_ns = self.epoch.elapsed().as_nanos() as u64;
         slot.seq.store(2 * idx + 1, Ordering::Relaxed);
         fence(Ordering::Release);
-        for (dst, v) in slot.w.iter().zip(words) {
-            dst.store(v, Ordering::Relaxed);
-        }
+        slot.w[0].store(ev.header(), Ordering::Relaxed);
+        slot.w[1].store(t_ns, Ordering::Relaxed);
+        slot.w[2].store(ev.w[0], Ordering::Relaxed);
+        slot.w[3].store(ev.w[1], Ordering::Relaxed);
+        slot.w[4].store(ev.w[2], Ordering::Relaxed);
+        slot.w[5].store(ev.w[3], Ordering::Relaxed);
+        slot.w[6].store(ev.w[4], Ordering::Relaxed);
         slot.seq.store(2 * idx + 2, Ordering::Release);
     }
 
     fn snapshot(&self) -> Snapshot {
+        // Before the slots are claimed: an event timed before this was
+        // claimed before it too.
+        let at_ns = self.epoch.elapsed().as_nanos() as u64;
         let written = self.next.load(Ordering::Acquire);
         let start = written.saturating_sub(self.capacity);
         let mut events = Vec::with_capacity((written - start) as usize);
@@ -664,6 +703,7 @@ impl Ring {
             events,
             written,
             torn,
+            at_ns,
         }
     }
 
@@ -700,8 +740,15 @@ pub(crate) enum Trigger {
     DataLost,
     InboundDataLost,
     Residual,
+    /// A finding of the progress checker (compiled in only with it).
+    #[cfg_attr(
+        not(any(debug_assertions, feature = "progress-check")),
+        allow(dead_code)
+    )]
     Checker,
     Explicit,
+    /// The dataflow ended after an earlier dump: every ring's final state.
+    Final,
 }
 
 impl Trigger {
@@ -712,14 +759,16 @@ impl Trigger {
             Trigger::Residual => "residual",
             Trigger::Checker => "checker",
             Trigger::Explicit => "explicit",
+            Trigger::Final => "final",
         }
     }
 }
 
 #[derive(Default)]
 struct Dumps {
-    kinds: Vec<&'static str>,
-    root: Option<PathBuf>,
+    /// Each trigger kind dumped, with the directory its dump went to
+    /// (`None`: it could not be written).
+    kinds: Vec<(&'static str, Option<PathBuf>)>,
 }
 
 /// One dataflow's rings.
@@ -728,8 +777,22 @@ struct Entry {
     /// Live recorders (rings' owners).
     owners: AtomicUsize,
     rings: Mutex<Vec<Arc<Ring>>>,
-    names: Mutex<BTreeMap<usize, String>>,
+    graph: Mutex<Graph>,
     dumps: Mutex<Dumps>,
+    /// Where this dataflow dumps instead of the process's destination (unit
+    /// tests only).
+    dir: Option<PathBuf>,
+}
+
+/// What a dump needs to name locations and decode channel ids.
+#[derive(Default)]
+struct Graph {
+    /// Operator index to name.
+    names: BTreeMap<usize, String>,
+    /// Edge index to `(source operator, port, target operator, port)`.
+    edges: BTreeMap<usize, (usize, usize, usize, usize)>,
+    /// Exchange edges in network channel ids: ordinal to edge index.
+    exchanges: BTreeMap<usize, usize>,
 }
 
 #[derive(Default)]
@@ -756,6 +819,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(crate) struct Recorder {
     ring: Arc<Ring>,
     entry: Arc<Entry>,
+    /// Dumps deferred until this ring's worker has returned its failure
+    /// (see [`Recorder::defer`]): at most one per trigger kind.
+    pending: Mutex<Vec<(Trigger, String)>>,
 }
 
 impl fmt::Debug for Recorder {
@@ -771,6 +837,16 @@ fn attach(id: DataflowId, node: &str, who: Who, total_workers: usize) -> Option<
     if !enabled() {
         return None;
     }
+    Some(register(id, node, who, total_workers, None))
+}
+
+fn register(
+    id: DataflowId,
+    node: &str,
+    who: Who,
+    total_workers: usize,
+    dir: Option<PathBuf>,
+) -> Arc<Recorder> {
     let entry = {
         let mut registry = registry();
         let entry = registry
@@ -781,8 +857,9 @@ fn attach(id: DataflowId, node: &str, who: Who, total_workers: usize) -> Option<
                     id,
                     owners: AtomicUsize::new(0),
                     rings: Mutex::new(Vec::new()),
-                    names: Mutex::new(BTreeMap::new()),
+                    graph: Mutex::new(Graph::default()),
                     dumps: Mutex::new(Dumps::default()),
+                    dir,
                 })
             })
             .clone();
@@ -791,7 +868,30 @@ fn attach(id: DataflowId, node: &str, who: Who, total_workers: usize) -> Option<
     };
     let ring = Arc::new(Ring::new(node, who, total_workers));
     lock(&entry.rings).push(Arc::clone(&ring));
-    Some(Arc::new(Recorder { ring, entry }))
+    Arc::new(Recorder {
+        ring,
+        entry,
+        pending: Mutex::new(Vec::new()),
+    })
+}
+
+/// A recorder of dataflow `id` (`worker`, else the link to `peer`) that
+/// records, and dumps to `dir`, whatever the process's destination: for
+/// unit tests, which share their process with every other unit test.
+#[cfg(test)]
+pub(crate) fn recorder_for_test(
+    id: DataflowId,
+    node: &str,
+    worker: Option<usize>,
+    peer: &str,
+    total_workers: usize,
+    dir: &Path,
+) -> Arc<Recorder> {
+    let who = match worker {
+        Some(worker) => Who::Worker(worker),
+        None => Who::Bridge(peer.to_string()),
+    };
+    register(id, node, who, total_workers, Some(dir.to_path_buf()))
 }
 
 /// The recorder of `worker` (of `total_workers`) on `node`, for dataflow
@@ -816,24 +916,64 @@ pub(crate) fn bridge(
     attach(id, node, Who::Bridge(peer.to_string()), total_workers)
 }
 
-/// Name the dataflow's operators in its dumps.
-pub(crate) fn name_operators(id: DataflowId, names: impl IntoIterator<Item = (usize, String)>) {
+/// Name the dataflow's operators and edges in its dumps: `edges` maps an
+/// edge index to its source and target `(operator, port)`.
+pub(crate) fn describe_graph(
+    id: DataflowId,
+    names: impl IntoIterator<Item = (usize, String)>,
+    edges: impl IntoIterator<Item = (usize, (usize, usize), (usize, usize))>,
+) {
     if !enabled() {
         return;
     }
     let entry = registry().entries.get(&id).cloned();
     if let Some(entry) = entry {
-        let mut known = lock(&entry.names);
-        if known.is_empty() {
-            known.extend(names);
+        let mut graph = lock(&entry.graph);
+        if graph.names.is_empty() {
+            graph.names.extend(names);
         }
+        if graph.edges.is_empty() {
+            graph.edges.extend(
+                edges
+                    .into_iter()
+                    .map(|(edge, (sop, sport), (top, tport))| (edge, (sop, sport, top, tport))),
+            );
+        }
+    }
+}
+
+/// The exchange edges of a cluster dataflow, in the order their network
+/// channel ids number them: ordinal to edge index.
+#[cfg_attr(not(feature = "transport"), allow(dead_code))]
+pub(crate) fn describe_exchanges(
+    id: DataflowId,
+    exchanges: impl IntoIterator<Item = (usize, usize)>,
+) {
+    if !enabled() {
+        return;
+    }
+    let entry = registry().entries.get(&id).cloned();
+    if let Some(entry) = entry {
+        lock(&entry.graph).exchanges.extend(exchanges);
     }
 }
 
 impl Drop for Recorder {
     fn drop(&mut self) {
+        // A dump this ring deferred and nothing fired.
+        self.fire_pending();
         if self.entry.owners.fetch_sub(1, Ordering::SeqCst) != 1 {
             return;
+        }
+        // The dataflow ended after a dump: write every ring's final state
+        // too (exits and results included), before it may be evicted.
+        let dumped = !lock(&self.entry.dumps).kinds.is_empty();
+        if dumped {
+            dump_entry(
+                &self.entry,
+                Trigger::Final,
+                "the dataflow ended: the final state of every ring, after the dumps above",
+            );
         }
         let mut registry = registry();
         registry.finished.push_back(self.entry.id);
@@ -855,7 +995,7 @@ impl Drop for Recorder {
 
 impl Recorder {
     /// Record one event.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn record(&self, ev: Ev) {
         self.ring.push(&ev);
     }
@@ -895,14 +1035,28 @@ impl Recorder {
         self.ring.push(&ev);
     }
 
-    /// The dataflow this recorder belongs to.
-    pub(crate) fn dataflow(&self) -> DataflowId {
-        self.entry.id
-    }
-
     /// Dump every ring of this recorder's dataflow (see [`trigger`]).
     pub(crate) fn trigger(&self, trigger: Trigger, reason: &str) -> Option<PathBuf> {
         dump_entry(&self.entry, trigger, reason)
+    }
+
+    /// Dump once this ring's worker has returned the failure it found (the
+    /// executor fires it as it records its exit): a dump must never delay
+    /// a failure. The first deferred dump of each trigger kind wins (a dump
+    /// is written once per kind in any case).
+    pub(crate) fn defer(&self, trigger: Trigger, reason: &str) {
+        let mut pending = lock(&self.pending);
+        if !pending.iter().any(|(t, _)| t.name() == trigger.name()) {
+            pending.push((trigger, reason.to_string()));
+        }
+    }
+
+    /// Write the dumps [`defer`](Self::defer)red, in order.
+    pub(crate) fn fire_pending(&self) {
+        let pending = std::mem::take(&mut *lock(&self.pending));
+        for (trigger, reason) in pending {
+            dump_entry(&self.entry, trigger, &reason);
+        }
     }
 }
 
@@ -916,8 +1070,6 @@ pub(crate) enum Note {
     LinkDetail = 2,
     /// Why records were lost.
     Loss = 3,
-    /// A network pull's failure.
-    PullFailure = 4,
 }
 
 impl Note {
@@ -926,7 +1078,6 @@ impl Note {
             1 => "exit-error",
             2 => "link-detail",
             3 => "loss",
-            4 => "pull-failure",
             _ => "text",
         }
     }
@@ -1009,6 +1160,20 @@ pub(crate) fn active() -> bool {
     CURRENT.try_with(|c| c.borrow().is_some()).unwrap_or(false)
 }
 
+/// Defer a dump of dataflow `id` to the thread's current worker, if it is
+/// one of that dataflow's (see [`Recorder::defer`]); false otherwise.
+pub(crate) fn defer_current(id: DataflowId, trigger: Trigger, reason: &str) -> bool {
+    CURRENT
+        .try_with(|c| match &*c.borrow() {
+            Some(recorder) if recorder.entry.id == id => {
+                recorder.defer(trigger, reason);
+                true
+            }
+            _ => false,
+        })
+        .unwrap_or(false)
+}
+
 /// The output port pushing right now (for exchange and broadcast pushes).
 pub(crate) struct PortScope(u64);
 
@@ -1027,6 +1192,13 @@ impl Drop for PortScope {
 /// The pushing output port, packed (`u64::MAX`: none).
 pub(crate) fn port() -> u64 {
     PORT.try_with(Cell::get).unwrap_or(u64::MAX)
+}
+
+/// A new pusher or puller number (fan-out and fan-in endpoints are named by
+/// it in events).
+pub(crate) fn next_tag() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// A commit `seq` is about to be sent: network senders count its frames.
@@ -1063,9 +1235,9 @@ pub(crate) fn end_sends() -> (u64, u64) {
 // ---------------------------------------------------------------------------
 
 /// Dump every ring of dataflow `id` now (reason `reason`), unless an
-/// explicit dump of it was already written. Returns the dataflow's dump
-/// directory, if it has one; `None` when recording is off, the dataflow is
-/// unknown (or evicted), or nothing could be written.
+/// explicit dump of it was already written. Returns the directory of the
+/// explicit dump (the one written now, or earlier); `None` when recording is
+/// off, the dataflow is unknown (or evicted), or nothing could be written.
 ///
 /// For test harnesses: call it on any unexpected outcome. The runtime dumps
 /// on its own triggers (see the [module docs](self)).
@@ -1073,36 +1245,44 @@ pub fn dump_traces(id: DataflowId, reason: &str) -> Option<PathBuf> {
     trigger(id, Trigger::Explicit, reason)
 }
 
-/// Dump every ring of dataflow `id`, at most once per trigger kind.
+/// Dump every ring of dataflow `id`, at most once per trigger kind. Returns
+/// the directory of that kind's dump.
 pub(crate) fn trigger(id: DataflowId, trigger: Trigger, reason: &str) -> Option<PathBuf> {
-    if !enabled() {
-        return None;
-    }
+    // A dataflow has an entry only if it records.
     let entry = registry().entries.get(&id).cloned()?;
     dump_entry(&entry, trigger, reason)
 }
 
 fn dump_entry(entry: &Entry, trigger: Trigger, reason: &str) -> Option<PathBuf> {
-    let base = dir()?;
+    let base = entry.dir.clone().or_else(dir)?;
     let (dir, root, first) = {
         let mut dumps = lock(&entry.dumps);
         let root = base.join(entry.id.as_uuid().to_string());
-        if dumps.kinds.contains(&trigger.name()) {
-            return dumps.root.clone();
+        if let Some((_, dir)) = dumps.kinds.iter().find(|(kind, _)| *kind == trigger.name()) {
+            return dir.clone();
         }
-        dumps.kinds.push(trigger.name());
-        let n = dumps.kinds.len();
-        dumps.root = Some(root.clone());
+        let n = dumps.kinds.len() + 1;
         let dir = if n == 1 {
             root.clone()
         } else {
             root.join(format!("{n}-{}", trigger.name()))
         };
+        dumps.kinds.push((trigger.name(), Some(dir.clone())));
         (dir, root, n == 1)
     };
     let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         write_dump(entry, &dir, trigger, reason)
     }));
+    let failed = || {
+        let mut dumps = lock(&entry.dumps);
+        if let Some((_, dir)) = dumps
+            .kinds
+            .iter_mut()
+            .find(|(kind, _)| *kind == trigger.name())
+        {
+            *dir = None;
+        }
+    };
     match written {
         Ok(Ok(())) => {}
         Ok(Err(_e)) => {
@@ -1112,9 +1292,13 @@ fn dump_entry(entry: &Entry, trigger: Trigger, reason: &str) -> Option<PathBuf> 
                 "could not write the progress trace dump to {}: {_e}",
                 dir.display()
             );
+            failed();
             return None;
         }
-        Err(_) => return None,
+        Err(_) => {
+            failed();
+            return None;
+        }
     }
     if !first {
         let _ = append(
@@ -1135,7 +1319,7 @@ fn dump_entry(entry: &Entry, trigger: Trigger, reason: &str) -> Option<PathBuf> 
         dir.display(),
         trigger.name()
     );
-    Some(root)
+    Some(dir)
 }
 
 fn append(path: &Path, text: &str) -> std::io::Result<()> {
@@ -1156,7 +1340,14 @@ fn write_dump(entry: &Entry, dir: &Path, trigger: Trigger, reason: &str) -> std:
     let at_ns = now_ns();
     std::fs::create_dir_all(dir)?;
     let id = entry.id.as_uuid().to_string();
-    let names = lock(&entry.names).clone();
+    let graph = {
+        let g = lock(&entry.graph);
+        Graph {
+            names: g.names.clone(),
+            edges: g.edges.clone(),
+            exchanges: g.exchanges.clone(),
+        }
+    };
     let evicted = registry().evicted;
 
     let mut header = String::new();
@@ -1166,7 +1357,7 @@ fn write_dump(entry: &Entry, dir: &Path, trigger: Trigger, reason: &str) -> std:
     json_str(reason, &mut header);
     let _ = write!(
         header,
-        ",\"t_ns\":{at_ns},\"ring_events\":{},\"untraced\":{{",
+        ",\"t_ns\":{at_ns},\"ring_events\":{},\"legend\":{LEGEND},\"untraced\":{{",
         ring_events()
     );
     for (i, site) in SITES.iter().enumerate() {
@@ -1179,12 +1370,29 @@ fn write_dump(entry: &Entry, dir: &Path, trigger: Trigger, reason: &str) -> std:
         header,
         "}},\"evicted_dataflows\":{evicted},\"operators\":{{"
     );
-    for (i, (op, name)) in names.iter().enumerate() {
+    for (i, (op, name)) in graph.names.iter().enumerate() {
         if i > 0 {
             header.push(',');
         }
         let _ = write!(header, "\"{op}\":");
         json_str(name, &mut header);
+    }
+    header.push_str("},\"edges\":{");
+    for (i, (edge, (sop, sport, top, tport))) in graph.edges.iter().enumerate() {
+        if i > 0 {
+            header.push(',');
+        }
+        let _ = write!(
+            header,
+            "\"{edge}\":{{\"from\":[{sop},{sport}],\"to\":[{top},{tport}]}}"
+        );
+    }
+    header.push_str("},\"exchange_edges\":{");
+    for (i, (ordinal, edge)) in graph.exchanges.iter().enumerate() {
+        if i > 0 {
+            header.push(',');
+        }
+        let _ = write!(header, "\"{ordinal}\":{edge}");
     }
     header.push_str("},\"rings\":[");
 
@@ -1216,13 +1424,14 @@ fn write_dump(entry: &Entry, dir: &Path, trigger: Trigger, reason: &str) -> std:
         let _ = write!(
             ring_header,
             ",\"total_workers\":{},\"capacity\":{},\"written\":{},\"retained\":{},\
-             \"overwritten\":{overwritten},\"torn\":{},\"lane_drops\":{}}}",
+             \"overwritten\":{overwritten},\"torn\":{},\"lane_drops\":{},\"snapshot_t_ns\":{}}}",
             ring.total_workers,
             ring.capacity,
             snap.written,
             snap.events.len(),
             snap.torn,
-            ring.lane_drops.load(Ordering::Relaxed)
+            ring.lane_drops.load(Ordering::Relaxed),
+            snap.at_ns
         );
         if i > 0 {
             header.push(',');
@@ -1248,7 +1457,7 @@ fn write_dump(entry: &Entry, dir: &Path, trigger: Trigger, reason: &str) -> std:
             p
         };
         for (seq, words) in &snap.events {
-            render(*seq, words, &prefix, ring.total_workers, &mut out);
+            render(*seq, words, &prefix, ring.total_workers, &graph, &mut out);
             out.push('\n');
         }
         let mut f = std::fs::File::create(dir.join(&file))?;
@@ -1300,6 +1509,9 @@ const DECISIONS: [&str; 5] = [
     "residual",
     "s3-failed",
 ];
+
+/// The dump header's `legend`: how to read the events.
+const LEGEND: &str = r#"{"t_ns":"nanoseconds since the process's first recorded event, on one monotonic clock (std::time::Instant) shared by every ring of the process: events of different rings and nodes are ordered by it","seq":"the ring's event number, from 0; a ring keeps its newest `capacity` events","commit":"a worker's commit sequence number: its n-th non-empty commit, from 1","frames":"frames with changes each network lane got for this commit (a commit over the progress batch cap is split, positives first)","frames_before":"frames with changes each network lane got for the worker's earlier commits","lane_batch":"a batch's position on the lane from `from`, from 1: an in-process lane carries one batch per commit (lane_batch = commit); a network lane one per frame (frames_before < lane_batch <= frames_before + frames of the commit); markers (seal, abandon, end-of-stream, ack) are never counted","lane-state":"a peer's seal (sealed) or the end of its lane (closed; closed without sealed: abandoned), as this worker applied it, after lane_batches batches","skipped":"decisions since the previous recorded one that were not recorded: not-ready or shut-down decisions made before every hosted operator was shut down or exhausted (S2b cannot hold then), or identical to the previous recorded one (outcome, flags, lane states and view activity)","decision-count":"a non-zero raw count in the worker's scope (what exact zero judges) at the decision just before it","decision-lane":"after a success, residual or S3 decision: each peer lane's applied position and state","loc":"src: an operator output (capabilities); tgt: an operator input (records); loc_node is the node in the scope (the operator index in scope 0)","seed":"an initial capability seeded when the tracker was initialized; `operator` is the operator seeded","scope":"as a field: the progress scope (0: the root); as an event: a location in the worker's scope (S2b, what its exact zero judges), recorded when its tracker was initialized (no scope event: every location)","frame":"net-send: the data frames this channel's push enqueued so far, this one included if it was enqueued (outcome accepted or lost-while-finishing); net-recv (data): the data frames the channel received so far, this one included","data_channel_id":"2^63 + (exchange * total_workers + src) * total_workers + dst, where `exchange` indexes exchange_edges, which gives the edge","progress_channel_id":"2^62 + src * total_workers + dst","untraced":"events at sites that ran outside any traced worker, process-wide, by site","snapshot_t_ns":"when the ring was read for this dump: it holds every event it recorded before then, unless counted as overwritten or torn","goodbye-sent":"recorded before the end-of-stream frames to that peer are queued","lane_drops":"commits and markers a network lane dropped (its link was retired, the frame did not encode, or the outbox closed)"}"#;
 
 /// The flags of a [`Kind::Decision`].
 pub(crate) mod decision {
@@ -1420,7 +1632,14 @@ fn name_at(names: &[&'static str], i: u64) -> &'static str {
 }
 
 /// Render one event as a JSON object (without the newline).
-fn render(seq: u64, words: &[u64; 7], prefix: &str, total_workers: usize, out: &mut String) {
+fn render(
+    seq: u64,
+    words: &[u64; 7],
+    prefix: &str,
+    total_workers: usize,
+    graph: &Graph,
+    out: &mut String,
+) {
     let header = words[0];
     let kind = Kind::from_u8(header as u8);
     let tag = (header >> 8) as u8;
@@ -1438,7 +1657,7 @@ fn render(seq: u64, words: &[u64; 7], prefix: &str, total_workers: usize, out: &
         out.push_str(",\"time\":");
         render_time(tag, w[0], w[1], out);
     };
-    let change = |out: &mut String, from: &str, reference: &str| {
+    let location = |out: &mut String| {
         let packed = w[2];
         let _ = write!(
             out,
@@ -1447,6 +1666,9 @@ fn render(seq: u64, words: &[u64; 7], prefix: &str, total_workers: usize, out: &
             packed & 0xffff_ffff,
             packed >> 32 & 0xffff
         );
+    };
+    let change = |out: &mut String, from: &str, reference: &str| {
+        location(out);
         out.push_str(",\"time\":");
         render_time(tag, w[0], w[1], out);
         let _ = write!(out, ",\"diff\":{}", w[3] as i64);
@@ -1507,7 +1729,7 @@ fn render(seq: u64, words: &[u64; 7], prefix: &str, total_workers: usize, out: &
                 out,
                 ",\"outcome\":\"{}\",\"nonzero\":{b},\"all_done\":{},\"scope_zero\":{},\
                  \"sealed\":{},\"all_sealed\":{},\"all_exhausted\":{},\"uncollected\":{},\
-                 \"lanes_final\":{},\"activity\":{},\"repeats\":{},\"stopped_peers\":{},\
+                 \"lanes_final\":{},\"activity\":{},\"skipped\":{},\"stopped_peers\":{},\
                  \"commits\":{}",
                 name_at(&DECISIONS, a),
                 flags & decision::ALL_DONE != 0,
@@ -1524,6 +1746,8 @@ fn render(seq: u64, words: &[u64; 7], prefix: &str, total_workers: usize, out: &
             );
         }
         DecisionCount => change(out, "", ""),
+        Seed => change(out, "", "operator"),
+        Scope => location(out),
         ShutDown => {
             let _ = write!(out, ",\"operator\":{b}");
         }
@@ -1600,7 +1824,7 @@ fn render(seq: u64, words: &[u64; 7], prefix: &str, total_workers: usize, out: &
         }
         NetSend | NetRecv => {
             let _ = write!(out, ",\"channel\":{}", w[4]);
-            channel_parts(w[4], total_workers, out);
+            channel_parts(w[4], total_workers, graph, out);
             if kind == NetRecv {
                 let what = match a {
                     0 => "data",
@@ -1615,6 +1839,9 @@ fn render(seq: u64, words: &[u64; 7], prefix: &str, total_workers: usize, out: &
             if kind == NetSend {
                 let _ = write!(out, ",\"outcome\":\"{}\"", Outcome::name(w[3]));
             }
+            if kind == NetSend || a == 0 {
+                let _ = write!(out, ",\"frame\":{b}");
+            }
         }
         SourcePull => {
             let _ = write!(out, ",\"puller\":{b},\"source\":{a}");
@@ -1627,10 +1854,11 @@ fn render(seq: u64, words: &[u64; 7], prefix: &str, total_workers: usize, out: &
                 1 => "lost-operator-finished",
                 2 => "lost-as-operator-finished",
                 3 => "after-close",
+                4 => "discarded",
                 _ => "?",
             };
             let _ = write!(out, ",\"channel\":{}", w[0]);
-            channel_parts(w[0], total_workers, out);
+            channel_parts(w[0], total_workers, graph, out);
             let _ = write!(
                 out,
                 ",\"bytes\":{},\"records\":{},\"close\":{},\"outcome\":\"{outcome}\"",
@@ -1687,26 +1915,25 @@ fn render(seq: u64, words: &[u64; 7], prefix: &str, total_workers: usize, out: &
     out.push('}');
 }
 
-/// `edge`, `src` and `dst` of a data channel id (see
+/// `exchange` (and its `edge`), `src` and `dst` of a data channel id (see
 /// `transport_session::data_channel_id`).
-fn channel_parts(channel: u64, total_workers: usize, out: &mut String) {
+fn channel_parts(channel: u64, total_workers: usize, graph: &Graph, out: &mut String) {
     #[cfg(feature = "transport")]
     {
         use crate::communication::transport_session::{DATA_CHANNEL_BASE, RESERVED_CHANNEL_BASE};
         let n = total_workers as u64;
         if (DATA_CHANNEL_BASE..RESERVED_CHANNEL_BASE).contains(&channel) && n > 0 {
             let offset = channel - DATA_CHANNEL_BASE;
-            let _ = write!(
-                out,
-                ",\"edge\":{},\"src\":{},\"dst\":{}",
-                offset / n / n,
-                offset / n % n,
-                offset % n
-            );
+            let exchange = offset / n / n;
+            let _ = write!(out, ",\"exchange\":{exchange}");
+            if let Some(edge) = graph.exchanges.get(&(exchange as usize)) {
+                let _ = write!(out, ",\"edge\":{edge}");
+            }
+            let _ = write!(out, ",\"src\":{},\"dst\":{}", offset / n % n, offset % n);
         }
     }
     #[cfg(not(feature = "transport"))]
-    let _ = (channel, total_workers, out);
+    let _ = (channel, total_workers, graph, out);
 }
 
 /// `src` and `dst` of a progress channel id (see
@@ -1780,12 +2007,14 @@ mod tests {
             id: DataflowId::new(),
             owners: AtomicUsize::new(1),
             rings: Mutex::new(vec![ring.clone()]),
-            names: Mutex::new(BTreeMap::new()),
+            graph: Mutex::new(Graph::default()),
             dumps: Mutex::new(Dumps::default()),
+            dir: None,
         });
         let recorder = Recorder {
             ring: ring.clone(),
             entry,
+            pending: Mutex::new(Vec::new()),
         };
         let text = "records sent while the peer was finishing: \"quoted\"";
         recorder.note(Note::Loss, text);
@@ -1793,7 +2022,7 @@ mod tests {
         let mut joined = String::new();
         for (seq, words) in &snap.events {
             let mut line = String::new();
-            render(*seq, words, "\"x\":0", 1, &mut line);
+            render(*seq, words, "\"x\":0", 1, &Graph::default(), &mut line);
             let v: serde_json::Value = serde_json::from_str(&line).unwrap();
             joined.push_str(v["text"].as_str().unwrap());
         }

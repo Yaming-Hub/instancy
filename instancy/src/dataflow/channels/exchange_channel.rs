@@ -334,6 +334,9 @@ pub struct ExchangePush<T: Timestamp, D: Send + 'static> {
     owed: Vec<bool>,
     /// Optional channel metrics collector (enabled via `MetricsConfig::channel_counters`).
     channel_metrics: Option<Arc<crate::metrics::ChannelMetricsCollector>>,
+    /// This pusher in the flight recorder's events (`progress::trace`).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    trace_tag: u32,
 }
 
 impl<T: Timestamp, D: Send + 'static> ExchangePush<T, D> {
@@ -355,6 +358,8 @@ impl<T: Timestamp, D: Send + 'static> ExchangePush<T, D> {
             pending: None,
             owed: vec![false; num_targets],
             channel_metrics: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace_tag: crate::progress::trace::next_tag(),
         }
     }
 
@@ -382,8 +387,18 @@ impl<T: Timestamp, D: Send + 'static> ExchangePush<T, D> {
                 continue;
             }
             let bucket = std::mem::take(&mut self.buckets[target_idx]);
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            let records = bucket.len();
 
-            match self.targets[target_idx].try_push(Envelope::data(time.clone(), bucket)) {
+            let pushed = self.targets[target_idx].try_push(Envelope::data(time.clone(), bucket));
+            traced! {
+                let outcome = match &pushed {
+                    Ok(()) => crate::progress::trace::Outcome::Accepted,
+                    Err((error, _)) => crate::progress::trace::Outcome::of_error(error),
+                };
+                trace_target(self.trace_tag, 1, target_idx, time, records, outcome);
+            }
+            match pushed {
                 Ok(()) => self.wakes.wake(target_idx),
                 Err((err, returned)) => {
                     match returned.payload {
@@ -446,6 +461,48 @@ fn returned_wrong_envelope() -> Error {
     Error::Dataflow(DataflowError::InvalidGraph(
         "channel target returned a different envelope from try_push".into(),
     ))
+}
+
+/// The flight recorder (`progress::trace`): a fan-out pusher (`via`: 1
+/// exchange, 2 broadcast) handed `records` at `time` to `target`, which
+/// answered `outcome`.
+#[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+fn trace_target<T: Timestamp>(
+    pusher: u32,
+    via: u64,
+    target: usize,
+    time: &T,
+    records: usize,
+    outcome: crate::progress::trace::Outcome,
+) {
+    use crate::progress::trace::{self, Ev, Kind, Site};
+    trace::with(Site::Exchange, |recorder| {
+        recorder.record(
+            Ev::new(Kind::TargetPush)
+                .a(target)
+                .b(pusher as usize)
+                .time(trace::time(time))
+                .w(2, records as u64)
+                .w(3, outcome as u64 | via << 8)
+                .w(4, trace::port()),
+        );
+    });
+}
+
+/// The flight recorder: a fan-in puller took `records` at `time` from
+/// `source`.
+#[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+fn trace_source<T: Timestamp>(puller: u32, source: usize, time: &T, records: usize) {
+    use crate::progress::trace::{self, Ev, Kind, Site};
+    trace::with(Site::Exchange, |recorder| {
+        recorder.record(
+            Ev::new(Kind::SourcePull)
+                .a(source)
+                .b(puller as usize)
+                .time(trace::time(time))
+                .w(2, records as u64),
+        );
+    });
 }
 
 /// Offer `make()` to every target with `owed[t]` set, clearing it on success.
@@ -680,6 +737,9 @@ pub struct BroadcastPush<T: Timestamp, D: Clone + Send + 'static> {
     pending: Option<PendingEnvelope<T>>,
     /// `owed[t]` while target `t` has not accepted the pending envelope.
     owed: Vec<bool>,
+    /// This pusher in the flight recorder's events (`progress::trace`).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    trace_tag: u32,
 }
 
 impl<T: Timestamp, D: Clone + Send + 'static> BroadcastPush<T, D> {
@@ -696,6 +756,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> BroadcastPush<T, D> {
             closed: false,
             pending: None,
             owed: vec![false; num_targets],
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace_tag: crate::progress::trace::next_tag(),
         }
     }
 }
@@ -732,13 +794,35 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for BroadcastPush<T, D>
                         data.clone()
                     };
                     if !batch.is_empty() {
-                        target.push(Envelope::data(time.clone(), batch))?;
+                        #[cfg(any(
+                            debug_assertions,
+                            feature = "progress-check",
+                            feature = "test-utils"
+                        ))]
+                        let records = batch.len();
+                        let pushed = target.push(Envelope::data(time.clone(), batch));
+                        traced! {
+                            let outcome = crate::progress::trace::Outcome::of(&pushed);
+                            trace_target(self.trace_tag, 2, target_idx, &time, records, outcome);
+                        }
+                        pushed?;
                         self.wakes.wake(target_idx);
                     }
                 }
                 // Send owned data to the last target.
                 if !data.is_empty() {
-                    self.targets[last_idx].push(Envelope::data(time, data))?;
+                    #[cfg(any(
+                        debug_assertions,
+                        feature = "progress-check",
+                        feature = "test-utils"
+                    ))]
+                    let (records, at) = (data.len(), time.clone());
+                    let pushed = self.targets[last_idx].push(Envelope::data(time, data));
+                    traced! {
+                        let outcome = crate::progress::trace::Outcome::of(&pushed);
+                        trace_target(self.trace_tag, 2, last_idx, &at, records, outcome);
+                    }
+                    pushed?;
                     self.wakes.wake(last_idx);
                 }
             }
@@ -787,9 +871,31 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for BroadcastPush<T, D>
             self.owed.fill(true);
         }
 
-        match deliver_to_owed(&mut self.targets, &mut self.owed, &self.wakes, || {
+        #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+        let owed_before = crate::progress::trace::active().then(|| self.owed.clone());
+        let delivered = deliver_to_owed(&mut self.targets, &mut self.owed, &self.wakes, || {
             envelope.clone()
-        }) {
+        });
+        traced! {
+            // Every target that took its copy now, and every target still
+            // owed one (with how the delivery ended).
+            if let (Some(owed_before), Payload::Data { time, data }) =
+                (owed_before, &envelope.payload)
+            {
+                use crate::progress::trace::Outcome;
+                let refused = match &delivered {
+                    Ok(()) => Outcome::Accepted,
+                    Err(error) => Outcome::of_error(error),
+                };
+                for (target, (&before, &after)) in owed_before.iter().zip(&self.owed).enumerate() {
+                    if before {
+                        let outcome = if after { refused } else { Outcome::Accepted };
+                        trace_target(self.trace_tag, 2, target, time, data.len(), outcome);
+                    }
+                }
+            }
+        }
+        match delivered {
             Ok(()) => {
                 self.pending = None;
                 Ok(())
@@ -986,6 +1092,9 @@ pub struct ExchangePull<T: Timestamp, D> {
     frontier_agg: FrontierAggregator<T>,
     /// Buffered watermark envelopes produced by frontier aggregation.
     pending_watermarks: VecDeque<T>,
+    /// This puller in the flight recorder's events (`progress::trace`).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    trace_tag: u32,
 }
 
 impl<T: Timestamp, D> ExchangePull<T, D> {
@@ -1003,6 +1112,8 @@ impl<T: Timestamp, D> ExchangePull<T, D> {
             wakes,
             frontier_agg,
             pending_watermarks: VecDeque::new(),
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace_tag: crate::progress::trace::next_tag(),
         }
     }
 }
@@ -1041,6 +1152,11 @@ impl<T: Timestamp, D: Send + 'static> Pull<T, D> for ExchangePull<T, D> {
 
                     match env.payload {
                         Payload::Data { .. } => {
+                            traced! {
+                                if let Payload::Data { time, data } = &env.payload {
+                                    trace_source(self.trace_tag, idx, time, data.len());
+                                }
+                            }
                             return Some(env);
                         }
                         Payload::Control(ControlSignal::Watermark(t)) => {
@@ -1090,6 +1206,11 @@ impl<T: Timestamp, D: Send + 'static> Pull<T, D> for ExchangePull<T, D> {
 
                     match env.payload {
                         Payload::Data { .. } => {
+                            traced! {
+                                if let Payload::Data { time, data } = &env.payload {
+                                    trace_source(self.trace_tag, src_idx, time, data.len());
+                                }
+                            }
                             buffer.push(env);
                             count += 1;
                         }

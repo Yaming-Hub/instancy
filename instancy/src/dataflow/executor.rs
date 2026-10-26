@@ -609,10 +609,11 @@ struct ExecutorTrace {
     recorder: Option<Arc<crate::progress::trace::Recorder>>,
     /// The path that produced the result being returned.
     exit: Option<crate::progress::trace::ExitSource>,
-    /// The last decision recorded: `(outcome, flags, activity)`.
-    last: Option<(usize, u64, u64)>,
-    /// Decisions identical to the last one recorded, not recorded.
-    repeats: u64,
+    /// The last decision recorded: `(outcome, all done, all exhausted,
+    /// uncollected, sealed, view activity, lane changes)`.
+    last: Option<(usize, bool, bool, bool, bool, u64, u64)>,
+    /// Decisions since the last one recorded, not recorded.
+    skipped: u64,
 }
 
 impl<T: Timestamp> DataflowExecutor<T> {
@@ -1062,19 +1063,10 @@ impl<T: Timestamp> DataflowExecutor<T> {
         self.trace.exit = Some(source);
     }
 
-    /// The flight recorder: the executor returns `result`.
-    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
-    fn trace_result(&mut self, result: &Result<bool>) {
-        match result {
-            Ok(ok) => self.trace_exit(Some(*ok), None, false),
-            Err(error) => self.trace_exit(None, Some(error.to_string()), false),
-        }
-    }
-
     /// The flight recorder: the executor returns `Ok(ok)`, or fails with
     /// `error` (`panicked`: an operator panic unwound out of it).
     #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
-    fn trace_exit(&mut self, ok: Option<bool>, error: Option<String>, panicked: bool) {
+    fn trace_exit(&mut self, ok: Option<bool>, error: Option<&Error>, panicked: bool) {
         use crate::progress::trace::{Ev, ExitSource, Kind, Note};
         let tagged = self.trace.exit.take();
         let Some(recorder) = &self.trace.recorder else {
@@ -1097,36 +1089,70 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 .w(0, u64::from(sealed) | u64::from(self.draining) << 1),
         );
         if let Some(error) = error {
-            recorder.note(Note::ExitError, &error);
+            recorder.note(Note::ExitError, &error.to_string());
         }
+        // A dump found in this run (a residual, records lost to a retired
+        // link) waits for the failure it explains.
+        recorder.fire_pending();
     }
 
     /// The flight recorder: a decision (`outcome`, see
-    /// `trace::decision`). Not-ready and shut-down decisions are recorded
-    /// only when the view or the outcome changed since the last one
-    /// recorded; repeats are counted.
+    /// `trace::decision`). A success, a residual and an S3 failure are
+    /// always recorded. A not-ready or shut-down decision is recorded only
+    /// once every hosted operator is shut down or exhausted (before that S2b
+    /// cannot hold), and only when its outcome, flags, lane states or view
+    /// changed since the last one recorded; the others are counted.
     #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
     fn trace_decision(&mut self, outcome: usize, all_exhausted: bool, uncollected: bool) {
         use crate::progress::trace::{Ev, Kind, decision};
         let Some(recorder) = self.trace.recorder.clone() else {
             return;
         };
+        let all_done = self.done.iter().all(|&d| d);
+        let (activity, lane_changes, sealed) =
+            self.progress_tracker
+                .as_ref()
+                .map_or((0, 0, false), |tracker| {
+                    (
+                        tracker.trace_activity(),
+                        tracker.trace_lane_changes(),
+                        tracker.is_sealed(),
+                    )
+                });
+        let key = (
+            outcome,
+            all_done,
+            all_exhausted,
+            uncollected,
+            sealed,
+            activity,
+            lane_changes,
+        );
+        let always = !matches!(outcome, decision::NOT_READY | decision::SHUT_DOWN);
+        if !always && (!(all_done || all_exhausted) || self.trace.last == Some(key)) {
+            self.trace.skipped += 1;
+            return;
+        }
+        self.trace.last = Some(key);
+        let skipped = std::mem::take(&mut self.trace.skipped);
         let mut flags = 0;
-        if self.done.iter().all(|&d| d) {
-            flags |= decision::ALL_DONE;
+        for (on, flag) in [
+            (all_done, decision::ALL_DONE),
+            (all_exhausted, decision::ALL_EXHAUSTED),
+            (uncollected, decision::UNCOLLECTED),
+            (sealed, decision::SEALED),
+        ] {
+            if on {
+                flags |= flag;
+            }
         }
-        if all_exhausted {
-            flags |= decision::ALL_EXHAUSTED;
-        }
-        if uncollected {
-            flags |= decision::UNCOLLECTED;
-        }
-        let (mut activity, mut stopped, mut commits) = (0, 0, 0);
+        let (mut stopped, mut commits) = (0, 0);
+        let mut counts = Vec::new();
+        let mut lanes = Vec::new();
         match &self.progress_tracker {
             Some(tracker) => {
                 for (on, flag) in [
                     (tracker.is_completed(), decision::SCOPE_ZERO),
-                    (tracker.is_sealed(), decision::SEALED),
                     (tracker.all_sealed(), decision::ALL_SEALED),
                     (tracker.peer_lanes_final(), decision::LANES_FINAL),
                 ] {
@@ -1134,27 +1160,14 @@ impl<T: Timestamp> DataflowExecutor<T> {
                         flags |= flag;
                     }
                 }
-                activity = tracker.trace_activity();
                 stopped = tracker.stopped_peers().len() as u64;
                 commits = tracker.trace_commits();
+                tracker.trace_nonzero(&mut |change| counts.push(change));
+                if always {
+                    lanes = tracker.trace_lanes();
+                }
             }
             None => flags |= decision::SCOPE_ZERO,
-        }
-        let key = (outcome, flags, activity);
-        let always = !matches!(outcome, decision::NOT_READY | decision::SHUT_DOWN);
-        if !always && self.trace.last == Some(key) {
-            self.trace.repeats += 1;
-            return;
-        }
-        self.trace.last = Some(key);
-        let repeats = std::mem::take(&mut self.trace.repeats);
-        let mut counts = Vec::new();
-        let mut lanes = Vec::new();
-        if let Some(tracker) = &self.progress_tracker {
-            tracker.trace_nonzero(&mut |change| counts.push(change));
-            if always {
-                lanes = tracker.trace_lanes();
-            }
         }
         recorder.record(
             Ev::new(Kind::Decision)
@@ -1162,7 +1175,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 .b(counts.len())
                 .w(0, flags)
                 .w(1, activity)
-                .w(2, repeats)
+                .w(2, skipped)
                 .w(3, stopped)
                 .w(4, commits),
         );
@@ -1597,7 +1610,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                         self.trace_decision(decision::RESIDUAL, all_exhausted, uncollected);
                         self.trace_ending(ExitSource::Residual);
                         if let Some(recorder) = &self.trace.recorder {
-                            recorder.trigger(Trigger::Residual, &error.to_string());
+                            recorder.defer(Trigger::Residual, &error.to_string());
                         }
                     }
                     return Err(error);
@@ -1665,9 +1678,6 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 Err(payload) => std::panic::resume_unwind(original_panic_payload(payload)),
             };
         self.update_wall_time_metric();
-        traced! {
-            self.trace_result(&result);
-        }
         result
     }
 
@@ -2016,6 +2026,17 @@ impl<T: Timestamp> DataflowExecutor<T> {
 
         let outcome = self.run_one_sweep_inner();
 
+        // The flight recorder: how this run ends, before the checker's
+        // report of it (which may dump).
+        traced! {
+            match &outcome {
+                Ok(SweepOutcome::Completed) => self.trace_exit(Some(true), None, false),
+                Ok(SweepOutcome::Quiescent) => self.trace_exit(Some(false), None, false),
+                Err(error) => self.trace_exit(None, Some(error), false),
+                Ok(_) => {}
+            }
+        }
+
         // Tell the progress checker how this worker ended.
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         if let Some(tracker) = &mut self.progress_tracker {
@@ -2260,13 +2281,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // (only for this synchronous call: never across an `.await`).
         #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
         let _trace = crate::progress::trace::enter(&self.trace.recorder);
-        let poll = self.poll_sweeps(cx);
-        traced! {
-            if let Poll::Ready(result) = &poll {
-                self.trace_result(result);
-            }
-        }
-        poll
+        self.poll_sweeps(cx)
     }
 
     /// [`poll_run`](Self::poll_run)'s sweeps.
@@ -2448,7 +2463,7 @@ impl<T: Timestamp> Future for DataflowExecutor<T> {
                 this.wake_handle.clear_waker();
                 let error = operator_panic_error(payload, Some(this.worker_index));
                 traced! {
-                    this.trace_exit(None, Some(error.to_string()), true);
+                    this.trace_exit(None, Some(&error), true);
                 }
                 if let (Some(ctrl), Error::OperatorPanic { operator, .. }) =
                     (this.control_sender.as_ref(), &error)

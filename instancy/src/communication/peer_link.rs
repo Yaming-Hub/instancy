@@ -130,6 +130,9 @@ pub(crate) struct PeerLinkState {
     /// A data push to the peer found its queue closed: it backs off on a
     /// frame that can never leave.
     push_blocked: AtomicBool,
+    /// The flight recorder's ring of this link (see `progress::trace`).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    trace: std::sync::OnceLock<Arc<crate::progress::trace::Recorder>>,
 }
 
 impl PeerLinkState {
@@ -145,8 +148,41 @@ impl PeerLinkState {
 
     /// Mark the link retired. Idempotent.
     pub(crate) fn retire(&self) {
+        traced! {
+            if let Some(recorder) = self.recorder() {
+                recorder.record(
+                    crate::progress::trace::Ev::new(crate::progress::trace::Kind::Retired)
+                        .a(usize::from(self.retired.load(Ordering::SeqCst))),
+                );
+            }
+        }
         self.retired.store(true, Ordering::SeqCst);
     }
+
+    /// Record this link's events into `recorder` (the flight recorder).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    pub(crate) fn attach_trace(&self, recorder: Option<Arc<crate::progress::trace::Recorder>>) {
+        if let Some(recorder) = recorder {
+            let _ = self.trace.set(recorder);
+        }
+    }
+
+    /// This link's flight recorder, if it records.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    pub(crate) fn recorder(&self) -> Option<&crate::progress::trace::Recorder> {
+        self.trace.get().map(|recorder| &**recorder)
+    }
+
+    /// This link's flight recorder, for a task that records into it (the
+    /// unit type where the recorder is compiled out).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    pub(crate) fn trace_handle(&self) -> crate::progress::TraceHandle {
+        self.trace.get().cloned()
+    }
+
+    /// The unit type: the flight recorder is compiled out.
+    #[cfg(not(any(debug_assertions, feature = "progress-check", feature = "test-utils")))]
+    pub(crate) fn trace_handle(&self) -> crate::progress::TraceHandle {}
 
     /// Whether a data push to the peer is backing off on a closed queue.
     pub(crate) fn push_blocked(&self) -> bool {
@@ -213,6 +249,8 @@ impl PeerOutbox {
         PeerMonitor {
             peer: Arc::clone(&self.peer),
             events: self.events.clone(),
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            link: Arc::clone(&self.link),
         }
     }
 }
@@ -222,6 +260,9 @@ impl PeerOutbox {
 pub(crate) struct PeerMonitor {
     peer: Arc<str>,
     events: LifecycleEventSender,
+    /// The link's state, for its flight recorder ring.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    link: Arc<PeerLinkState>,
 }
 
 impl PeerMonitor {
@@ -230,12 +271,33 @@ impl PeerMonitor {
         report_link_event(&self.events, &self.peer, event);
     }
 
+    /// The link's flight recorder, if it records.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    pub(crate) fn recorder(&self) -> Option<&crate::progress::trace::Recorder> {
+        self.link.recorder()
+    }
+
+    /// Records from this peer were lost (`detail`): note it in the link's
+    /// ring and dump at once (the coordinator reports it too).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    pub(crate) fn trace_lost(&self, detail: &str) {
+        if let Some(recorder) = self.recorder() {
+            recorder.note(crate::progress::trace::Note::Loss, detail);
+            recorder.trigger(
+                crate::progress::trace::Trigger::InboundDataLost,
+                &format!("records from peer {} were lost: {detail}", self.peer),
+            );
+        }
+    }
+
     /// A monitor for tests.
     #[cfg(test)]
     pub(crate) fn for_test(peer: &str, events: LifecycleEventSender) -> Self {
         Self {
             peer: Arc::from(peer),
             events,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            link: Arc::default(),
         }
     }
 }
