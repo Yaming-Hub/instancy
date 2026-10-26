@@ -88,11 +88,14 @@ Rev `0286a9d` is the revision under review. It has since been rebased onto `e7ac
     - **Liveness rule L6** (R44): every cycle has an unbounded channel, so a loop's back-edge is unbounded (§2.6).
     - **One final call when the input frontier empties** for every closure (R45), so stash-and-flush fails loudly (§5.1.3).
     - **The recursive-export regression is modelled** in [`tla/NestedScopes.tla`](./tla/NestedScopes.tla) (decision log O1, §5.8, §5.9).
+16. **Step 3 merged** (#298, `bad90a1`; decision log R50–R51).
+    - **Stopped-peer grace** (R50): a draining worker fails under R48 only after its view has stayed unchanged for `stopped_peer_grace` (500 ms), because a stopped peer's records and progress can arrive after its stop announcement. It can turn a drain into a failure, never into a false success.
+    - **Final design-fidelity review** (R51) passed with no blockers. It added the abandon wire marker (§5.5), `ExecutorConfig` leaving the public API (§5.6), and the note on `J`'s summaries (§5.1.3).
 
 ---
 
-**Status:** design approved; implementation under way. Step 1 (#293) is merged as `ba1bd37`, and step 2 (#295) as `6cb3ced`. Step 3 is in progress; step 4 follows (§5.7). Targeted experiments ran on a local branch, `exp-pcp-verify`, last re-run on `e7ac01e`; §5.9 lists what they verified.
-**Date:** 2026-10-24 (first written 2026-10-20). **instancy base:** `main` @ `6cb3ced`, which includes #285–#295, among them PR7 (#291), PR8 (#292), step 1 (#293) and step 2 (#295). Line citations elsewhere in this doc were last checked on `e7ac01e`; §5.1.8 is checked on `ba1bd37`. The step-3 brief carries citations checked on `6cb3ced`.
+**Status:** design approved and implemented. Step 1 (#293) is merged as `ba1bd37`, step 2 (#295) as `6cb3ced`, and step 3 (#298) as `bad90a1`. PR9 (shared-transport reliability) comes next; step 4 (downstream projects) follows it, and step 5 (confidence against the latest timely, decision log O14) after that (§5.7). Targeted experiments ran on a local branch, `exp-pcp-verify`, last re-run on `e7ac01e`; §5.9 lists what they verified.
+**Date:** 2026-10-25 (first written 2026-10-20). **instancy base:** `main` @ `bad90a1`, which includes #285–#298. Line citations elsewhere in this doc were last checked on `e7ac01e`; §5.1.8 is checked on `ba1bd37`. The step-3 brief carries citations checked on `6cb3ced`; the code after step 3 is described in `progress-tracking.md`.
 **timely reference:** `TimelyDataflow/timely-dataflow` `master` @ `3012f8f` (2026-10-16). The latest release is **timely v0.31.0** (2026-07-14). instancy's `timely` 0.12 dev-dependency (2021) is used only to say what changed.
 **Scope:** audit root causes 1, 2 and 4 (fragile counting, opt-in accounting, duplicated paths), and how a new design interacts with root cause 3 (PR7 #291, merged, and PR8 #292). The bug tracker's PR4, PR5, PR6 and PR12 are replaced by the four steps in §5.7.
 
@@ -588,6 +591,7 @@ Anything an operator keeps *across activations* and may later emit at `t` must b
 - `summary(in→out)(t′)` for every batch at `t′` actually *consumed* in this call, using the summary of the input that batch came from. This matters for binary operators.
 
 Capabilities dropped during the call, for example by `next_notification()`, stay in `J` until the call returns. `J` is validated and dropped when the call returns, before the call's delta joins the worker's pending commit. A commit may batch many calls' deltas but never their `J`, so input consumed by one call can never justify output from a later one (R36). An operator may *acquire*, *downgrade to*, or *emit output at* `t` on an output only if some element of `J` for that output is `≤ t`.
+- *As implemented in step 3* (R51): each output's reporter answers "held now, or released during this call, at or before `t`", logging releases only while the call runs, so nothing is copied per call. That set equals the one above: capabilities acquired during the call already passed this check, so they justify nothing new. Consumed input is added at its own time, which is exact while every built-in operator's summary is the identity (feedback's `+1` output is at or after the consumed time). An operator with a non-identity summary would have to add `summary(in→out)(t′)` instead.
 - *Sound:* any emission or acquisition is committed in the same batch as the consumption or capability release that justifies it (A2).
 - *Not frontier-based:* the input frontier alone is never a justification, and neither is a batch that is merely available but not consumed.
 
@@ -769,6 +773,7 @@ PCP changes the protocol twice, each time with one version bump. `ba1bd37` is st
 - **Step 2, v4.** A4 seeding (§5.1.4): initial capabilities are seeded from the physical plan, not sent. The plan's digest joins the handshake fingerprint (`control_protocol.rs:390`).
 - **Step 3, v5:**
   - the seal marker, as a third reserved count, `u32::MAX − 2`, with the encoder cap lowered below it;
+  - an abandon marker, `u32::MAX − 3`, sent in order behind a worker's last batch when it stops without sealing (a failure, R34, or a stop mid-drain). It only marks the lane as stopped unsealed, which feeds R48's fail-fast, so it can cause a failure but never a success (R51);
   - scope ids on progress entries (§5.1.7).
 - Positives-first ordering needed no bump, and PR8 already ships it.
 
@@ -881,7 +886,7 @@ There are no compatibility constraints. Nobody depends on instancy yet; downstre
   - a loop's feedback channel is unbounded, and `with_capacity` on the feedback pipe is ignored (R44, liveness rule L6);
   - under the `transport` feature, `iterate` requires `TInner: ExchangeData`, as `exchange` already requires of its types (R42, breaking).
 - **Additions and removals approved during step 3** (R40): `InputHandle::frontier()`; `Retained<T>` (`Send`, not `Clone`); `EdgeInfo.delivery` and `Delivery { One, AllTargetHosts }`; `ProgressError` gains `Unjustified`, `UpstreamError`, `RecordAfterShutdown` and `Residual`, and loses `InvalidNotificationTime`; `ChannelSourceOperator` and `ChannelSinkOperator` leave the re-exports.
-- **Public-but-internal types:** `SchedulableOperator`, `OperatorFactory`, `ChannelEndpoints`, `Push`, `Pull` and `DataflowExecutor` (`dataflow/mod.rs:34`, `:40`; `channels/mod.rs:26`), plus `InputHandle::{new, push_vec, mark_exhausted}` and `OutputHandle::drain` (`handles.rs:35-55`, `:196-202`). They become sealed or crate-private. That is a breaking change, which costs nothing today; there's no public way to register a custom factory anyway.
+- **Public-but-internal types:** `SchedulableOperator`, `OperatorFactory`, `ChannelEndpoints`, `Push`, `Pull` and `DataflowExecutor` (`dataflow/mod.rs:34`, `:40`; `channels/mod.rs:26`), plus `InputHandle::{new, push_vec, mark_exhausted}` and `OutputHandle::drain` (`handles.rs:35-55`, `:196-202`). They become sealed or crate-private, and `ExecutorConfig` leaves the public re-exports with `DataflowExecutor` (R51). That is a breaking change, which costs nothing today; there's no public way to register a custom factory anyway.
 - **CHANGELOG** entries are needed for the behaviour changes and for removing `set_inflight_reporter`.
 
 ### 5.7 Migration plan
