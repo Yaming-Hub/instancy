@@ -1,6 +1,6 @@
-# A TLA+ model of progress accounting
+# TLA+ models of progress accounting and the cluster transport
 
-This folder holds small, precise models of instancy's progress accounting, written in [TLA+](https://lamport.azurewebsites.net/tla/tla.html), and the scenarios that the TLC model checker runs against them.
+This folder holds small, precise models of instancy's progress accounting and of its cluster transport, written in [TLA+](https://lamport.azurewebsites.net/tla/tla.html), and the scenarios that the TLC model checker runs against them.
 
 - **Design:** [progress-accounting-design.md](../progress-accounting-design.md).
 
@@ -13,10 +13,11 @@ There are three kinds of scenario:
 - **Bug scenarios** use today's rules, or the design with one rule removed. Each must break in the named way. That shows the model is detailed enough to catch the real bug, and that the rule is needed.
 - **Sanity scenarios** show that the interesting outcomes actually happen, for example that a run with real traffic, including a loop, can finish. Without them a "pass" could be empty.
 
-There are three specs:
+There are four specs:
 - **[`PortCountedProgress.tla`](./PortCountedProgress.tla)** is generic over small graphs. It covers acyclic dataflows, and loops folded into the outer book as instancy tracks them today, with and without the guard edge an earlier plan proposed. That loop handling is no longer planned (design doc §5.1.7). The model is kept because, without the guard, it reproduces today's "probe after a loop" bug (H11).
 - **[`LoopScopes.tla`](./LoopScopes.tla)** is a focused model of nested loop scopes, the end state built in step 3 of the plan, with timestamps of the form (minute, lap).
 - **[`NestedScopes.tla`](./NestedScopes.tla)** puts one loop on another loop's feedback path, three levels deep, and keeps the links between levels cached as an incremental tracker does (decision log O1).
+- **[`ClusterTransport.tla`](./ClusterTransport.tla)** models the cluster transport and teardown after PR9 (#300): pooled connections with pinned lanes, faults, clean closes, linger, `Cancel` and `DataflowId` reuse (decision log O16). It has its own section below.
 
 **Old labels in the files.** Comments in the specs, MC modules and `make-models.ps1` still use the earlier plan's labels: "PR4c", "PR5", "PR6a" and "interim". All of them are now part of step 3 (design doc §5.7; label table in Appendix B), and "interim" means flattened loops. The comments were left unchanged so that the spec and config hashes recorded with the results still match.
 
@@ -256,6 +257,98 @@ Bounds: 2 workers, one epoch (two with the input held open), outer laps `0..1` a
 - **Larger systems.** Model checking covers only these bounds. It is strong evidence, not a proof for every size; that would need TLAPS or Isabelle (design doc §5.8).
 - **That the Rust code matches the model.** The conformance matrix, the debug checker and the planned code-level checks cover that.
 
+## The cluster transport model (`ClusterTransport.tla`, decision log O16)
+
+The progress models treat the network as one FIFO lane per sender. That hid this round's transport bugs:
+- frames lost on reconnect (C7);
+- a run taking a reused `DataflowId`'s frames;
+- a peer's clean close dropping our goodbye (3a77274);
+- a write error with split TLS halves hanging the peer (4be0e70).
+
+This model opens the lane up.
+- **Nodes and connections.** Two nodes share a pool of one or two connections. Each direction has a write half, a read half and a wire; FIN and resets follow the socket semantics listed in the spec's header, including "dropping a split write half sends nothing".
+- **Lanes.** A run's frames pass an outbox, a bridge that numbers them, and a writer queue. PR9 pins each lane to one connection, and a gap is fatal.
+- **Runs.** Port-counted progress is abstracted to one record, the progress counting it, the final progress, a goodbye and an ack. Runs can be one run, a retry (with a fresh or a reused id), or two concurrent dataflows on two connections.
+- **Teardown.** Link retirement, `Cancel` (forwarded failure or requested stop), pending controls and the release of a manager, with linger.
+
+### The rules checked
+
+| Property | Meaning |
+|---|---|
+| `NoLossOk` | A run whose workers succeeded consumed the record its peer sent. |
+| `NoCrossRun` | A run never takes another run's frame, payload or `Cancel`, as its own. |
+| `NoCorruptAccepted` | A corrupted record is never accepted. |
+| `NoNeedlessDrop` | The transport never drops a lane frame while it could still deliver it (writer up, connection healthy, peer reading). |
+| `NoSpuriousFail` | With no fault and no worker failure, no run fails. A requested stop drains to success. |
+| `NoCollateralFail` | A failed connection fails only the runs that used it, in either direction. |
+| `FreshRetryOk`, `ReuseRejected` | Safety only: on a healthy transport a retry with a fresh id never fails or is refused; one that reuses the id is never accepted. |
+| `Termination` | Every run ends and unregisters, and per job every connection closes, on both nodes: no failure leaves a node waiting forever. |
+| `RetryEventuallyOk` | The retry eventually succeeds on both nodes. |
+| `ReuseEventuallyRejected` | A retry that reuses the id is eventually refused on both nodes. |
+
+### Switches
+
+| Switch | PR9 | Earlier or broken |
+|---|---|---|
+| `Pin` | `TRUE`: lanes pinned, numbered, a gap fatal, the pool refilled on registration | `FALSE`: lanes spread over connections, a reorder buffer, a gap timer, background redial |
+| `WriteErrClose` | `TRUE`: a write error closes the whole connection (4be0e70) | `FALSE`: it drops only the write half |
+| `Split` | modelling option: split halves send no FIN when dropped | `FALSE`: owned halves |
+| `CleanEof` | `"keep"`: pinned lanes keep writing after the peer's clean close (3a77274) | `"fail"` |
+| `Linger` | `TRUE`: a release shuts the write halves and reads until the peer's FIN | `FALSE`: close at once |
+| `RunIds` | `"pr9"`: a finished id is refused, its late frames dropped, queued frames bound to their registration (52314fb) | `"old"` |
+| `RejectCancel` | `FALSE`: a refused spawn sends nothing under another run's id (R53) | `TRUE`: `a7c4b1c`, which still broadcasts `Cancel` |
+| `Crc` | `TRUE`: frame checksums, always on from protocol v6 | `FALSE` |
+| `Conns`, `Runs`, `Concurrent`, `Crosswise`, `Reuse`, `Faults`, `MaxFaults`, `FaultsRun1`, `MaxStops`, `MaxFails`, `PerJob` | bounds and modelling options | — |
+
+### Results
+
+Bounds: two nodes, one record per node and run, at most one fault, one requested stop and one worker failure. TLC 2.19, 4 threads.
+
+| Scenario | Expected | Result |
+|---|---|---|
+| `ct_pr9` | pass | **Pass**, 8,709 states: a healthy transport with a requested stop. |
+| `ct_pr9_faults` | pass | **Pass**, 235,147 states: one reset, write error or corrupted frame, and a stop. Never `Ok` with lost or corrupted data. |
+| `ct_pr9_concurrent` | pass | **Pass**, 26,648,737 states (about 15 minutes): two dataflows pinned alike to two connections and one fault of any kind; only the dataflow on the faulted connection fails. |
+| `ct_pr9_crosswise` | pass | **Pass**, 226,561,926 states (about 1 hour 45 minutes): the two dataflows pinned crosswise, as when the nodes registered them in opposite orders, so each connection carries both; one reset (every fault kind breaks the whole connection the same way), managers kept. A dataflow fails only if it used the reset connection in either direction. |
+| `ct_pr9_retry` | pass | **Pass**, 649,380 states: run 1 fails on one node; a retry with a fresh id never fails and never takes run 1's late frames. `live_ct_freshretry` shows it succeeds. |
+| `ct_pr9_reuse` | pass | **Pass**, 22,325 states, with R53's rule: a retry that reuses the id is never accepted, and nothing else fails or crosses. `live_ct_reuse` shows it is refused on both nodes. |
+| `live_ct` | pass | **Pass**, 235,147 states: with any one fault and a stop, every run ends and every connection closes. |
+| `live_ct_retry` | pass | **Pass**, 381,658 states: a reset during run 1 fails it; once each node noticed, its retry refills the pool and succeeds on both nodes. |
+| `live_ct_lostcancel` | pass | **Pass**, 445,807 states: the reset may hit a retry before its peer registered, so its `Cancel` is lost; the peer's retry ends by the handshake timeout, never hangs. |
+| `live_ct_freshretry` | pass | **Pass**, 649,380 states: run 1 may fail on one node; the retry with a fresh id eventually succeeds on both nodes. |
+| `live_ct_reuse` | pass | **Pass**, 22,325 states, with R53's rule: a retry that reuses the id is eventually refused on both nodes, and every run ends. |
+| `ct_old_healthy` | pass | **Pass**, 1,039 states: the earlier design with one connection and no fault loses nothing; the reconnect is what loses frames. |
+| `ct_writeerr_halfclose_owned` | pass | **Pass**, 12,064 states: a write error that drops only the write half is harmless with owned halves, whose drop sends FIN. |
+| `ct_reach_stop` | violated | A requested stop drains to success on both nodes. |
+| `ct_reach_retry` | violated | Run 1 fails on one node, and the retry succeeds on both. |
+| `ct_reach_contained` | violated | A fault fails the dataflow on one connection while the other succeeds on both nodes (8,332,069 states). |
+| `ct_c7` | `NoLossOk` | **Fails as expected** (C7). In the earlier design, frames the bridge accepted while a reset connection was being redialled are dropped without a number, and the peer completes without the record. |
+| `ct_c7_hang` | deadlock | **Fails as expected.** The same loss with nothing behind it to reveal a gap: both runs wait forever. |
+| `ct_h7` | `NoSpuriousFail` | **Fails as expected** (H7). With a healthy transport, the gap timer fails a run whose frames were only reordered across connections. |
+| `ct_writeerr_halfclose` | deadlock | **Fails as expected** (before 4be0e70). A write error drops only a split write half; the peer sees no FIN and its run waits forever. |
+| `ct_cleaneof_fails` | `NoNeedlessDrop` | **Fails as expected** (before 3a77274). A peer's clean close fails our pinned lanes, so our goodbye is dropped although the peer still reads. |
+| `ct_nolinger` | `NoSpuriousFail` | **Fails as expected.** A release that closes its sockets at once drops queued frames, and the peer loses the last frames it needed. |
+| `ct_reuse_old` | `NoCrossRun` | **Fails as expected** (before 52314fb). A retry that reuses the id takes run 1's late frames as its own. |
+| `ct_nocrc` | `NoCorruptAccepted` | **Fails as expected.** Without checksums, a corrupted record is accepted. |
+| `ct_reuse_cancel` | `NoSpuriousFail` | **Fails: open on `a7c4b1c`, fixed by R53.** Node a finishes run 1 on b's ack while b's last step is pending. a's retry reuses the id and is refused, but its spawn guard broadcasts a failing `Cancel` under that id, and b's run 1 fails. One run ends `Ok` on a and `Err` on b, with no fault and no worker failure. |
+
+### What it shows, and what it does not
+
+**It shows,** for two nodes and these bounds:
+- PR9's transport never reports success with lost, crossed or corrupted data, and never drops a frame it could still deliver.
+- A failed connection fails only the runs that used it in either direction, however each node pinned them, and no node is left waiting forever. A lost `Cancel` ends at the handshake timeout.
+- A retry with a fresh id eventually succeeds on both nodes; one that reuses the id is eventually refused on both, with R53's rule.
+- Each of these fixes is needed; removing it brings back its bug: closing the whole socket on a write error, keeping lanes after a clean EOF, linger, checksums and R53's rule. For pinning and id handling, the model switches whole historical designs (before PR9, before 52314fb), so it shows that each design was broken, not which of its parts mattered.
+
+**It does not show:**
+- **That a failed connection fails *every* run using it.** `NoCollateralFail` is one-way; a run on a failed connection may still succeed when it no longer needed the lost frames, and `NoLossOk` covers the case where it did.
+- **More than two nodes**, or link retirement through a third node (R47's three-node shapes).
+- **The lifecycle machine's soft failures.** A send failure the code settles later (`settle_unsent`) is decided at once here.
+- **Timing.** Linger has no deadline, where the code caps it at 10 s, and the handshake and ready barrier are one step whose timeout fires only when the peer's run already ended.
+- **Bounded id memory.** The model remembers every finished id; PR9 keeps the last 16,384.
+- **Data-channel close sentinels and real progress.** Completion is the abstract "record and progress received"; the progress models cover the rest.
+- **Dedicated mode,** where each dataflow has its own connections.
+
 ## Reviews
 
 GPT-6 Astra reviewed each model for fidelity. Neither review found a counterexample to the proposal.
@@ -295,6 +388,31 @@ GPT-6 Astra reviewed each model for fidelity. Neither review found a counterexam
 | Only one real outer lap | low | Added `nest_pcp_twolaps` |
 | Results lacked the new spec's hash | low | Added |
 
+**Fourth review, of `ClusterTransport.tla`'s first version** (a rubber-duck review). It found model defects, not PR9 bugs:
+
+| Finding | Severity | Resolution |
+|---|---|---|
+| `Termination` counted a failed run as done before it unregistered | high | Done now means every run ended and unregistered and, per job, every connection closed both ways |
+| A write failure was fatal even on a retired link, so `ct_cleaneof_fails` failed for the wrong reason | high | A retired link excuses it, as `settle_unsent` does; the clean-EOF bug is now caught by `NoNeedlessDrop` |
+| Registration never refilled the pool, pending controls were not tied to a connection, and the ready barrier was weak | high | Added `Refill`; pending controls are dropped with their connection; registration applies pending `Cancel`s in the same step; a barrier timeout ends a run whose peer's run already ended |
+| A write error could fire with nothing written | high | It needs a queued frame |
+| No corruption or checksums | high | Added `Corrupt` and `Crc`, and `ct_nocrc`. Close sentinels stay a limit. |
+| `CHOOSE` fixed routing; a close without linger kept the queue; `"old"` ids buffered payload; no concurrent lanes | lower | Routing is `\E`; an abrupt close drops the queue; fixed; added `Concurrent` and `NoCollateralFail` |
+
+After that review, checking the counterexamples led to three more changes:
+- the barrier timeout above, which `ct_writeerr_halfclose` then exposed as hiding its run hang behind the unbounded linger. That pair now runs without per-job managers, so its deadlock must be a run hang;
+- `live_ct_retry` retries only once each node noticed the reset, since a retry that registers on a connection not yet known to be dead fails loudly, which is correct. `live_ct_lostcancel` covers that race;
+- the `RejectCancel` switch, after `ct_pr9_reuse` showed R53's bug.
+
+**Fifth review, of `ClusterTransport.tla` as above** (a rubber-duck review). No high-severity finding; it confirmed `ct_reuse_cancel` against the code, and that each bug scenario fails by the mechanism it names.
+
+| Finding | Severity | Resolution |
+|---|---|---|
+| Concurrent runs were pinned alike on both nodes, but each node picks its least-loaded connection by its own registration order | medium | Added `Crosswise` and `ct_pr9_crosswise`: node b pins the two runs the other way round, so each connection carries both. `NoCollateralFail` already counts either direction. |
+| "A failed connection fails exactly the runs pinned to it, and both sides see it" was not asserted | medium | Claim narrowed to what is checked: only those runs fail, and no node waits forever |
+| `FreshRetryOk` and `ReuseRejected` are invariants, so a retry that never ran would pass | medium | Added `RetryEventuallyOk` and `ReuseEventuallyRejected` under fairness: `live_ct_freshretry`, `live_ct_reuse` |
+| `Pin` and `RunIds` switch several mechanisms at once, so they can't show each part is needed | medium | Claim narrowed: they show the earlier designs were broken. Splitting them is left as a limit. |
+
 ## Running it
 
 You need Java 11 or newer and `tla2tools.jar` from the [TLA+ releases](https://github.com/tlaplus/tlaplus/releases).
@@ -309,4 +427,4 @@ $env:TLA2TOOLS_JAR = 'C:\path\to\tla2tools.jar'
 
 `models/*.cfg` are generated from the scenario table and are not committed; `run.ps1` regenerates them on every run, so they always match the table. `run.ps1` prints one line per scenario and whether the result matched exactly. It appends results, with spec and config hashes, to `results.csv`, and keeps TLC's full output, including counterexample traces, in a temporary folder.
 
-The large scenarios take 10 to 30 minutes each on 6 threads: `chain_pcp`, `direct3_pcp`, `async_pcp` and `loop_interim`. `chain3_pcp` takes about an hour. Everything else finishes in seconds to a few minutes.
+The large scenarios take 10 to 30 minutes each on 6 threads: `chain_pcp`, `direct3_pcp`, `async_pcp` and `loop_interim`. `chain3_pcp` takes about an hour. Of the transport scenarios, `ct_pr9_crosswise` takes about 1 hour 45 minutes on 4 threads, `ct_pr9_concurrent` about 15 minutes and `ct_reach_contained` about 6. Everything else finishes in seconds to a few minutes.
