@@ -49,10 +49,17 @@
 //!   (its reader stops too), so the peer sees it end even when the write
 //!   half alone would tell it nothing (`tokio::io::split` halves, as with
 //!   TLS);
-//! - when its reader ends (EOF, an I/O error, a corrupt or oversize frame,
-//!   or the writer's failure), every dataflow whose frames from the peer
-//!   arrive on it, or whose lane is pinned to it, is told, and the channels
-//!   of a dataflow whose frames arrive on it close;
+//! - when its reader ends with an error (an I/O error, EOF mid-frame, a
+//!   corrupt or oversize frame, or the writer's failure), every dataflow
+//!   whose frames from the peer arrive on it, or whose lane is pinned to it,
+//!   is told, the channels of a dataflow whose frames arrive on it close,
+//!   and the connection leaves the pool;
+//! - when the peer closes its side cleanly (EOF at a frame boundary), the
+//!   same dataflows are told, but the lanes pinned to it keep writing until
+//!   a write fails: a released manager keeps reading for its peers' last
+//!   frames (goodbyes, acknowledgements, a `Cancel`), as in Dedicated mode.
+//!   The connection takes no new lanes and is closed once its last lane
+//!   unregisters;
 //! - a payload frame that cannot be sent (its connection failed, or it
 //!   exceeds the frame size limit) fails its dataflow and nobody else's.
 //!
@@ -402,6 +409,13 @@ struct PooledConnection {
     writer: tokio_mpsc::Sender<Frame>,
     /// Registered dataflows whose lane is pinned to this connection.
     pinned: usize,
+    /// The peer closed its side cleanly (EOF at a frame boundary): it sends
+    /// nothing more but may still be reading, as a released manager does
+    /// (see [`linger`]). The lanes pinned here keep writing until a write
+    /// fails; no new lane is pinned here, and the connection leaves the pool
+    /// (the next registration replaces it) and is closed once its last lane
+    /// unregisters.
+    peer_closed: bool,
 }
 
 /// Per-dataflow state tracked by the shared peer manager.
@@ -648,7 +662,11 @@ impl Inner {
     }
 
     fn live_connections(&self) -> usize {
-        self.state().connections.len()
+        self.state()
+            .connections
+            .values()
+            .filter(|conn| !conn.peer_closed)
+            .count()
     }
 
     /// Add an established connection to the pool and start its tasks.
@@ -666,6 +684,7 @@ impl Inner {
                     metrics: Arc::clone(&metrics),
                     writer: tx,
                     pinned: 0,
+                    peer_closed: false,
                 },
             );
             (conn_id, metrics)
@@ -776,11 +795,11 @@ impl Inner {
                     .get(&reg.conn)
                     .map(|conn| (reg.conn, conn.writer.clone())),
                 // A dataflow that failed before registering here, or has
-                // unregistered (a late Cancel): any connection will do.
+                // unregistered (a late Cancel): any pool connection will do.
                 None => state
                     .connections
                     .iter()
-                    .next()
+                    .find(|(_, conn)| !conn.peer_closed)
                     .map(|(id, conn)| (*id, conn.writer.clone())),
             }
         };
@@ -965,14 +984,29 @@ impl Inner {
     }
 
     /// Connection `conn_id`'s read side ended. Frames the peer sent on it
-    /// after the last one read are lost, and so (the connection is gone) are
-    /// the frames queued or in flight on it. Fail every dataflow whose frames
+    /// after the last one read are lost: fail every dataflow whose frames
     /// from the peer arrive on it (closing its channels once that was
-    /// reported) or whose lane is pinned to it.
+    /// reported).
+    ///
+    /// A read error (an I/O error, EOF mid-frame, a corrupt or oversize
+    /// frame, or the writer's failure) breaks the whole connection: the
+    /// frames queued on it may be lost too, so the dataflows whose lane is
+    /// pinned to it fail as well, and it leaves the pool. A clean EOF is the
+    /// peer closing its side only: it may still read (a released manager
+    /// lingers for the last frames of its peers, see [`linger`]), so the
+    /// lanes pinned here are told but keep writing until a write fails, and
+    /// the connection only stops taking new lanes (see
+    /// [`PooledConnection::peer_closed`]).
     fn fail_inbound(self: &Arc<Self>, conn_id: usize, end: InboundEnd) {
+        let clean = matches!(end, InboundEnd::Closed);
         let reports = {
             let mut state = self.state();
-            state.connections.remove(&conn_id);
+            match state.connections.get_mut(&conn_id) {
+                Some(conn) if clean && conn.pinned > 0 => conn.peer_closed = true,
+                _ => {
+                    state.connections.remove(&conn_id);
+                }
+            }
             state.pending_control.forget_connection(conn_id);
             let mut reports = Vec::new();
             for (&dataflow_id, reg) in state.registered.iter_mut() {
@@ -984,8 +1018,21 @@ impl Inner {
                         senders: reg.channel_senders.take(),
                         hold: Arc::clone(&reg.hold_channels),
                     });
+                    if clean {
+                        continue;
+                    }
                 }
-                if reg.conn == conn_id && !reg.outbound_failed {
+                if reg.conn != conn_id || reg.outbound_failed {
+                    continue;
+                }
+                if clean {
+                    // Told once (above if its frames from the peer arrive
+                    // here too); its frames still go out.
+                    reports.push(Report::Event {
+                        events: reg.events.clone(),
+                        event: PeerIoEvent::Closed,
+                    });
+                } else {
                     reg.outbound_failed = true;
                     reports.push(Report::Event {
                         events: reg.events.clone(),
@@ -1069,8 +1116,13 @@ impl Inner {
             Some(reg) if token.is_none_or(|token| token == reg.token) => {
                 let conn = reg.conn;
                 registered.remove(dataflow_id);
-                if let Some(conn) = connections.get_mut(&conn) {
-                    conn.pinned = conn.pinned.saturating_sub(1);
+                if let Some(pooled) = connections.get_mut(&conn) {
+                    pooled.pinned = pooled.pinned.saturating_sub(1);
+                    // The peer closed its side and the last lane on it is
+                    // done: close ours (the writer finishes what is queued).
+                    if pooled.peer_closed && pooled.pinned == 0 {
+                        connections.remove(&conn);
+                    }
                 }
                 completed.insert(*dataflow_id);
             }
@@ -1220,6 +1272,7 @@ async fn probe_loop(inner: Arc<Inner>) {
             .state()
             .connections
             .values()
+            .filter(|conn| !conn.peer_closed)
             .map(|conn| conn.writer.clone())
             .collect();
         for writer in writers {
@@ -1454,10 +1507,12 @@ impl SharedPeerManager {
             pending_control,
             ..
         } = &mut *state;
-        // Pin the lane to the connection with the fewest lanes (a connection
-        // may have failed since the pool was filled).
+        // Pin the lane to the pool connection with the fewest lanes (a
+        // connection may have failed, or its peer closed it, since the pool
+        // was filled).
         let Some((&conn_id, conn)) = connections
             .iter_mut()
+            .filter(|(_, conn)| !conn.peer_closed)
             .min_by_key(|(id, conn)| (conn.pinned, **id))
         else {
             return Err(TransportError::Io(std::io::Error::new(
@@ -1632,7 +1687,8 @@ impl SharedPeerManager {
         &self.inner.peer_node_id
     }
 
-    /// Number of live pooled connections.
+    /// Number of live pooled connections (not counting one whose peer closed
+    /// its side while lanes pinned to it finish writing).
     pub fn connection_count(&self) -> usize {
         self.inner.live_connections()
     }
@@ -1643,6 +1699,7 @@ impl SharedPeerManager {
             .state()
             .connections
             .values()
+            .filter(|conn| !conn.peer_closed)
             .map(|conn| ConnectionSnapshot {
                 id: conn.metrics.id,
                 queued_frames: conn.writer.max_capacity() - conn.writer.capacity(),
@@ -2557,31 +2614,27 @@ mod tests {
         assert_eq!(recv(ra.get_mut(&1).unwrap()).await.unwrap(), b"z");
 
         relays[0].abort();
-        // Both sides: the inbound side ended, and the lane's frames may be lost.
-        let mut seen_a = Vec::new();
-        let mut seen_b = Vec::new();
-        for _ in 0..2 {
-            seen_a.push(next_event(&mut ea).await);
-            seen_b.push(next_event(&mut eb).await);
-        }
-        for seen in [&seen_a, &seen_b] {
+        // Both sides: the inbound side ended.
+        for events in [&mut ea, &mut eb] {
+            let event = next_event(events).await;
             assert!(
-                seen.iter()
-                    .any(|e| matches!(e, PeerIoEvent::Closed | PeerIoEvent::ReadFailed(_))),
-                "{seen:?}"
-            );
-            assert!(
-                seen.iter()
-                    .any(|e| matches!(e, PeerIoEvent::WriteFailed(_))),
-                "{seen:?}"
+                matches!(event, PeerIoEvent::Closed | PeerIoEvent::ReadFailed(_)),
+                "{event:?}"
             );
         }
         // The peer's channels closed after the report.
         assert_eq!(recv(rb.get_mut(&1).unwrap()).await, None);
         assert_eq!(a.connection_count(), 0);
-        // Frames sent now go nowhere, and are not reported again: the
-        // dataflow already failed.
+        // The connection is gone both ways: the next write fails, and is
+        // reported (its frame is lost) ...
         send(&a, df, 1, b"b".to_vec()).await;
+        assert!(matches!(
+            next_event(&mut ea).await,
+            PeerIoEvent::WriteFailed(_)
+        ));
+        // ... once: frames sent now go nowhere, and the dataflow already
+        // failed.
+        send(&a, df, 1, b"c".to_vec()).await;
         assert!(
             event_within(&mut ea, Duration::from_millis(100))
                 .await
@@ -2660,7 +2713,7 @@ mod tests {
         }
     }
 
-    /// A local write error closes the whole connection, not just its write
+    /// A write error closes the whole connection, not just its write
     /// half (which, split from a stream, tells the peer nothing): the peer
     /// sees the end and fails the same dataflows, and the dataflows reading
     /// from the connection here fail too, so the two pools stay paired.
@@ -2719,6 +2772,84 @@ mod tests {
             "{end:?}"
         );
         assert_eq!(manager.connection_count(), 0);
+    }
+
+    /// The peer closing its side cleanly (a released manager, which keeps
+    /// reading for its peers' last frames) is not a broken connection: the
+    /// dataflows using it are told, but a lane pinned to it keeps writing,
+    /// so a goodbye queued after the peer's EOF still reaches the peer. The
+    /// connection takes no new lanes, and closes once its last lane
+    /// unregisters.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peers_clean_close_lets_pinned_lanes_finish_writing() {
+        let (ours, theirs) = duplex(1 << 20);
+        let (ours_2, _theirs_2) = duplex(1 << 20);
+        let manager = SharedPeerManager::new(
+            "peer".into(),
+            config(1),
+            Pre::factory([ours, ours_2]),
+            &tokio::runtime::Handle::current(),
+            health_tx(),
+        )
+        .unwrap();
+        let (outbound_only, both) = (DataflowId::new(), DataflowId::new());
+        let (_rx_o, mut events_o) = manager
+            .register_dataflow(outbound_only, &[1], 4)
+            .await
+            .unwrap();
+        let (mut rx_b, mut events_b) = manager.register_dataflow(both, &[1], 4).await.unwrap();
+        let (peer_read, peer_write) = tokio::io::split(theirs);
+        let mut peer_reader = FramedReader::new(peer_read);
+        let mut peer_writer = FramedWriter::new(peer_write);
+        peer_writer
+            .write_frame(&sequenced(both, 1, 0, b"in"))
+            .await
+            .unwrap();
+        assert_eq!(recv(rx_b.get_mut(&1).unwrap()).await.unwrap(), b"in");
+        // The peer releases its side: it sends nothing more, but reads on.
+        peer_writer.into_inner().shutdown().await.unwrap();
+        assert!(matches!(
+            next_event(&mut events_b).await,
+            PeerIoEvent::Closed
+        ));
+        assert!(matches!(
+            next_event(&mut events_o).await,
+            PeerIoEvent::Closed
+        ));
+        assert_eq!(recv(rx_b.get_mut(&1).unwrap()).await, None);
+        for df in [outbound_only, both] {
+            send(&manager, df, 1, b"goodbye".to_vec()).await;
+        }
+        for df in [outbound_only, both] {
+            let frame = peer_reader.read_frame().await.unwrap();
+            assert_eq!(frame.dataflow_id, df);
+            assert_eq!(frame.payload[SEQUENCE_PREFIX..], *b"goodbye");
+        }
+        for events in [&mut events_o, &mut events_b] {
+            assert!(
+                event_within(events, Duration::from_millis(100))
+                    .await
+                    .is_none(),
+                "a write after the peer's clean close must not fail"
+            );
+        }
+        // No new lane goes to it: the next registration fills the pool anew.
+        assert_eq!(manager.connection_count(), 0);
+        let (_rx_n, _events_n) = manager
+            .register_dataflow(DataflowId::new(), &[1], 4)
+            .await
+            .unwrap();
+        assert_eq!(manager.connection_count(), 1);
+        // Once its last lane unregisters, our side closes too.
+        manager.unregister_dataflow(&outbound_only).await;
+        manager.unregister_dataflow(&both).await;
+        let end = tokio::time::timeout(Duration::from_secs(5), peer_reader.read_frame())
+            .await
+            .expect("our side never closed");
+        assert!(
+            matches!(end, Err(TransportError::ConnectionClosed)),
+            "{end:?}"
+        );
     }
 
     /// A failed connection fails exactly the dataflows that used it, on both
