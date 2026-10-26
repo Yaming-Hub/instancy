@@ -788,6 +788,8 @@ impl<T: Timestamp> SubgraphBuilder<T> {
             probes: Vec::new(),
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             check: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: TraceState::default(),
         })
     }
 }
@@ -933,6 +935,27 @@ pub struct ProgressTracker<T: Timestamp> {
     /// frontiers that changed.
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     check: Option<crate::progress::check::TrackerCheck<T>>,
+    /// The flight recorder's positions (see
+    /// [`trace`](crate::progress::trace)); the root tracker's.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    trace: TraceState,
+}
+
+/// What the flight recorder needs to number a worker's commits and the
+/// batches it applies, so that a receiver's lane position maps to the
+/// sender's commit (the sequence is derived on both sides, never sent).
+#[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+#[derive(Debug, Default)]
+struct TraceState {
+    /// Non-empty commits sent so far (the last commit's sequence number).
+    commits: u64,
+    /// Frames sent on each network lane before the next commit: a commit
+    /// over the batch cap is split, and every fragment is its own batch at
+    /// the receiver.
+    frames: u64,
+    /// Per peer (by worker index): batches applied from its lane, and the
+    /// lane's state as last recorded.
+    lanes: Vec<(u64, LaneState)>,
 }
 
 /// Per-operator frontier state tracked by the progress tracker.
@@ -1588,16 +1611,84 @@ impl<T: Timestamp> ProgressTracker<T> {
         let root = self.take_section();
         let mut scopes = Vec::new();
         self.take_child_sections(&mut scopes);
+        #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+        let commit = self.trace_commit(&root, &scopes);
         let Some(channels) = &self.progress_channels else {
+            traced! {
+                if let Some(commit) = commit {
+                    self.trace_sent(commit, 0);
+                }
+            }
             return;
         };
         let batch = ProgressBatch { root, scopes };
         if batch.is_empty() {
             return;
         }
+        traced! {
+            crate::progress::trace::begin_sends(commit.as_ref().map_or(0, |c| c.0));
+        }
         for sender in channels.senders.iter().flatten() {
             sender.send_batch(batch.clone());
         }
+        traced! {
+            let lanes = channels.senders.iter().flatten().count() as u64;
+            if let Some(commit) = commit {
+                self.trace_sent(commit, lanes);
+            }
+        }
+    }
+
+    /// Number this worker's commit and record its changes (every scope's).
+    /// Returns `(sequence number, changes, sections)` for a non-empty
+    /// commit.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn trace_commit(
+        &mut self,
+        root: &[ProgressChange<T>],
+        scopes: &[(usize, Arc<dyn Any + Send + Sync>)],
+    ) -> Option<(u64, usize, usize)> {
+        use crate::progress::trace::{self, Kind, Site};
+        if root.is_empty() && scopes.is_empty() {
+            return None;
+        }
+        self.trace.commits += 1;
+        let seq = self.trace.commits;
+        let mut changes = 0;
+        trace::with(Site::Tracker, |recorder| {
+            changes = trace_batch(
+                recorder,
+                Kind::CommitChange,
+                self.scope_id,
+                root,
+                scopes,
+                &self.children,
+                0,
+                seq,
+            );
+        });
+        Some((seq, changes, scopes.len() + usize::from(!root.is_empty())))
+    }
+
+    /// Record a commit once it was sent on `lanes` lanes, with the frames
+    /// each network lane got (see [`TraceState::frames`]).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn trace_sent(&mut self, (seq, changes, sections): (u64, usize, usize), lanes: u64) {
+        use crate::progress::trace::{self, Ev, Kind, Site};
+        let (frames, network) = trace::end_sends();
+        let before = self.trace.frames;
+        self.trace.frames += frames;
+        trace::with(Site::Tracker, |recorder| {
+            recorder.record(
+                Ev::new(Kind::Commit)
+                    .a(sections)
+                    .b(changes)
+                    .w(0, seq)
+                    .w(1, frames)
+                    .w(2, before)
+                    .w(3, lanes.saturating_sub(network) << 32 | network),
+            );
+        });
     }
 
     /// Receives and applies peer workers' batches: every section to its
@@ -1613,6 +1704,16 @@ impl<T: Timestamp> ProgressTracker<T> {
         for (worker, receiver) in channels.receivers.iter().enumerate() {
             if let Some(receiver) = receiver {
                 let (drained, state) = receiver.drain_with_state()?;
+                traced! {
+                    trace_lane(
+                        &mut self.trace,
+                        self.scope_id,
+                        &self.children,
+                        worker,
+                        &drained,
+                        state,
+                    );
+                }
                 batches.extend(drained);
                 lanes.push((worker, state));
             }
@@ -1658,6 +1759,17 @@ impl<T: Timestamp> ProgressTracker<T> {
             for sender in channels.senders.iter().flatten() {
                 sender.seal();
             }
+        }
+        traced! {
+            use crate::progress::trace::{self, Ev, Kind, Site};
+            let lanes = self
+                .progress_channels
+                .as_ref()
+                .map_or(0, |c| c.senders.iter().flatten().count());
+            let commits = self.trace.commits;
+            trace::with(Site::Tracker, |recorder| {
+                recorder.record(Ev::new(Kind::SealSent).b(lanes).w(0, commits));
+            });
         }
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         self.check_sealed();
@@ -2220,6 +2332,191 @@ impl<T: Timestamp> ProgressTracker<T> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The flight recorder (see `progress::trace`)
+// ---------------------------------------------------------------------------
+
+/// Record every change of a batch (the root scope's and each nested
+/// section's) as `kind`; returns how many.
+#[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+#[allow(clippy::too_many_arguments)]
+fn trace_batch<T: Timestamp>(
+    recorder: &crate::progress::trace::Recorder,
+    kind: crate::progress::trace::Kind,
+    root_scope: usize,
+    root: &[ProgressChange<T>],
+    scopes: &[(usize, Arc<dyn Any + Send + Sync>)],
+    children: &[Box<dyn ChildScope<T>>],
+    from: usize,
+    reference: u64,
+) -> usize {
+    use crate::progress::trace::Change;
+    let mut n = 0;
+    for c in root {
+        recorder.change(
+            kind,
+            &Change::of(root_scope, c.kind, c.node, c.port, &c.time, c.diff),
+            from,
+            reference,
+        );
+        n += 1;
+    }
+    for (scope, section) in scopes {
+        children.iter().any(|child| {
+            child.trace_section(*scope, section.as_ref(), &mut |change| {
+                recorder.change(kind, &change, from, reference);
+                n += 1;
+            })
+        });
+    }
+    n
+}
+
+/// Record the batches drained from `worker`'s lane (every change, with the
+/// lane position), and the lane's state if it changed.
+#[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+fn trace_lane<T: Timestamp>(
+    trace: &mut TraceState,
+    root_scope: usize,
+    children: &[Box<dyn ChildScope<T>>],
+    worker: usize,
+    drained: &[ProgressBatch<T>],
+    state: LaneState,
+) {
+    use crate::progress::trace::{self, Ev, Kind, Site};
+    if trace.lanes.len() <= worker {
+        trace.lanes.resize(worker + 1, (0, LaneState::default()));
+    }
+    let lane = &mut trace.lanes[worker];
+    let first = lane.0;
+    lane.0 += drained.len() as u64;
+    let changed = lane.1 != state;
+    lane.1 = state;
+    let batches = lane.0;
+    if drained.is_empty() && !changed {
+        return;
+    }
+    trace::with(Site::Tracker, |recorder| {
+        for (i, batch) in drained.iter().enumerate() {
+            let position = first + i as u64 + 1;
+            let changes = trace_batch(
+                recorder,
+                Kind::BatchChange,
+                root_scope,
+                &batch.root,
+                &batch.scopes,
+                children,
+                worker,
+                position,
+            );
+            recorder.record(
+                Ev::new(Kind::BatchApplied)
+                    .a(batch.scopes.len() + usize::from(!batch.root.is_empty()))
+                    .b(worker)
+                    .w(0, position)
+                    .w(1, changes as u64),
+            );
+        }
+        if changed {
+            recorder.record(
+                Ev::new(Kind::LaneState)
+                    .a(usize::from(state.sealed) | usize::from(state.closed) << 1)
+                    .b(worker)
+                    .w(0, batches),
+            );
+        }
+    });
+}
+
+#[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+impl<T: Timestamp> ProgressTracker<T> {
+    /// Commits and peer batches applied so far (any change to the view).
+    pub(crate) fn trace_activity(&self) -> u64 {
+        self.activity
+    }
+
+    /// Commits this worker sent so far.
+    pub(crate) fn trace_commits(&self) -> u64 {
+        self.trace.commits
+    }
+
+    /// Every non-zero raw count in the worker's scope, in every scope (what
+    /// exact zero judges).
+    pub(crate) fn trace_nonzero(&self, f: &mut dyn FnMut(crate::progress::trace::Change)) {
+        for (location, time, count) in self.tracker.nonzero_counts() {
+            if !self.in_scope(&location) || self.derived.contains(&location) {
+                continue;
+            }
+            let (kind, node, port) = match location {
+                Location::Source { node, port } => (ProgressKind::Source, node, port),
+                Location::Target { node, port } => (ProgressKind::Target, node, port),
+            };
+            f(crate::progress::trace::Change::of(
+                self.scope_id,
+                kind,
+                node,
+                port,
+                &time,
+                count,
+            ));
+        }
+        for child in &self.children {
+            child.trace_nonzero(f);
+        }
+    }
+
+    /// Every peer lane: `(worker, batches applied, state)`.
+    pub(crate) fn trace_lanes(&self) -> Vec<(usize, u64, LaneState)> {
+        let Some(channels) = &self.progress_channels else {
+            return Vec::new();
+        };
+        channels
+            .receivers
+            .iter()
+            .enumerate()
+            .filter(|(_, receiver)| receiver.is_some())
+            .map(|(worker, _)| {
+                let batches = self.trace.lanes.get(worker).map_or(0, |lane| lane.0);
+                let state = self
+                    .peer_lanes
+                    .get(worker)
+                    .copied()
+                    .flatten()
+                    .unwrap_or_default();
+                (worker, batches, state)
+            })
+            .collect()
+    }
+
+    /// Record the changes of a section of scope `scope` (this one or a
+    /// nested one; see [`apply_section`](Self::apply_section)). Returns
+    /// whether some scope took it.
+    fn trace_section(
+        &self,
+        scope: usize,
+        section: &(dyn Any + Send + Sync),
+        f: &mut dyn FnMut(crate::progress::trace::Change),
+    ) -> bool {
+        if scope == self.scope_id {
+            match section.downcast_ref::<Vec<ProgressChange<T>>>() {
+                Some(changes) => {
+                    for c in changes {
+                        f(crate::progress::trace::Change::of(
+                            scope, c.kind, c.node, c.port, &c.time, c.diff,
+                        ));
+                    }
+                    true
+                }
+                None => false,
+            }
+        } else {
+            self.children
+                .iter()
+                .any(|child| child.trace_section(scope, section, f))
+        }
+    }
+}
+
 impl<T: Timestamp> fmt::Debug for ProgressTracker<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProgressTracker")
@@ -2321,6 +2618,20 @@ pub(crate) trait ChildScope<TP: Timestamp>: Send {
     fn check_finish(&mut self, ok: bool, proven: bool, report_worker: bool);
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     fn check_sealed(&self);
+
+    /// The flight recorder: record a peer's section (see
+    /// [`ProgressTracker::trace_section`]).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn trace_section(
+        &self,
+        scope: usize,
+        section: &(dyn Any + Send + Sync),
+        f: &mut dyn FnMut(crate::progress::trace::Change),
+    ) -> bool;
+    /// The flight recorder: this scope's non-zero raw counts in the
+    /// worker's scope (see [`ProgressTracker::trace_nonzero`]).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn trace_nonzero(&self, f: &mut dyn FnMut(crate::progress::trace::Change));
 }
 
 /// The builder of an `iterate` loop's scope, in `Product<TP, TI>` time.
@@ -2600,6 +2911,21 @@ impl<TP: Timestamp, TI: Timestamp> ChildScope<TP> for LoopScope<TP, TI> {
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     fn check_sealed(&self) {
         self.tracker.check_sealed();
+    }
+
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn trace_section(
+        &self,
+        scope: usize,
+        section: &(dyn Any + Send + Sync),
+        f: &mut dyn FnMut(crate::progress::trace::Change),
+    ) -> bool {
+        self.tracker.trace_section(scope, section, f)
+    }
+
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn trace_nonzero(&self, f: &mut dyn FnMut(crate::progress::trace::Change)) {
+        self.tracker.trace_nonzero(f);
     }
 }
 

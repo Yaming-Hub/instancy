@@ -596,6 +596,23 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     /// Deadline for the drain phase. If `Some`, the executor entered drain
     /// mode and will return `Err(Cancelled)` if this deadline is exceeded.
     drain_deadline: Option<Instant>,
+    /// The flight recorder (see [`trace`](crate::progress::trace)).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    trace: ExecutorTrace,
+}
+
+/// The executor's part of the flight recorder: its worker's recorder, the
+/// path its run is ending on, and the last decision recorded.
+#[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+#[derive(Default)]
+struct ExecutorTrace {
+    recorder: Option<Arc<crate::progress::trace::Recorder>>,
+    /// The path that produced the result being returned.
+    exit: Option<crate::progress::trace::ExitSource>,
+    /// The last decision recorded: `(outcome, flags, activity)`.
+    last: Option<(usize, u64, u64)>,
+    /// Decisions identical to the last one recorded, not recorded.
+    repeats: u64,
 }
 
 impl<T: Timestamp> DataflowExecutor<T> {
@@ -899,6 +916,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         })
     }
 
@@ -1020,6 +1039,143 @@ impl<T: Timestamp> DataflowExecutor<T> {
     pub(crate) fn set_peer_names(&mut self, names: Vec<String>) {
         if let Some(tracker) = &mut self.progress_tracker {
             tracker.set_peer_names(names);
+        }
+    }
+
+    /// Record this worker into `recorder`: the flight recorder (see
+    /// [`trace`](crate::progress::trace)).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    pub(crate) fn set_trace(&mut self, recorder: Option<Arc<crate::progress::trace::Recorder>>) {
+        self.trace.recorder = recorder;
+    }
+
+    /// This worker's flight recorder, if it records.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[cfg_attr(not(feature = "transport"), allow(dead_code))]
+    pub(crate) fn trace_recorder(&self) -> Option<Arc<crate::progress::trace::Recorder>> {
+        self.trace.recorder.clone()
+    }
+
+    /// The flight recorder: this run ends on `source`'s path.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn trace_ending(&mut self, source: crate::progress::trace::ExitSource) {
+        self.trace.exit = Some(source);
+    }
+
+    /// The flight recorder: the executor returns `result`.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn trace_result(&mut self, result: &Result<bool>) {
+        match result {
+            Ok(ok) => self.trace_exit(Some(*ok), None, false),
+            Err(error) => self.trace_exit(None, Some(error.to_string()), false),
+        }
+    }
+
+    /// The flight recorder: the executor returns `Ok(ok)`, or fails with
+    /// `error` (`panicked`: an operator panic unwound out of it).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn trace_exit(&mut self, ok: Option<bool>, error: Option<String>, panicked: bool) {
+        use crate::progress::trace::{Ev, ExitSource, Kind, Note};
+        let tagged = self.trace.exit.take();
+        let Some(recorder) = &self.trace.recorder else {
+            return;
+        };
+        let (code, source) = match ok {
+            _ if panicked => (3, ExitSource::Panic),
+            Some(true) => (1, tagged.unwrap_or(ExitSource::Unknown)),
+            Some(false) => (0, tagged.unwrap_or(ExitSource::Unknown)),
+            None => (2, tagged.unwrap_or(ExitSource::Error)),
+        };
+        let sealed = self
+            .progress_tracker
+            .as_ref()
+            .is_some_and(ProgressTracker::is_sealed);
+        recorder.record(
+            Ev::new(Kind::Exit)
+                .a(code)
+                .b(source as usize)
+                .w(0, u64::from(sealed) | u64::from(self.draining) << 1),
+        );
+        if let Some(error) = error {
+            recorder.note(Note::ExitError, &error);
+        }
+    }
+
+    /// The flight recorder: a decision (`outcome`, see
+    /// `trace::decision`). Not-ready and shut-down decisions are recorded
+    /// only when the view or the outcome changed since the last one
+    /// recorded; repeats are counted.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn trace_decision(&mut self, outcome: usize, all_exhausted: bool, uncollected: bool) {
+        use crate::progress::trace::{Ev, Kind, decision};
+        let Some(recorder) = self.trace.recorder.clone() else {
+            return;
+        };
+        let mut flags = 0;
+        if self.done.iter().all(|&d| d) {
+            flags |= decision::ALL_DONE;
+        }
+        if all_exhausted {
+            flags |= decision::ALL_EXHAUSTED;
+        }
+        if uncollected {
+            flags |= decision::UNCOLLECTED;
+        }
+        let (mut activity, mut stopped, mut commits) = (0, 0, 0);
+        match &self.progress_tracker {
+            Some(tracker) => {
+                for (on, flag) in [
+                    (tracker.is_completed(), decision::SCOPE_ZERO),
+                    (tracker.is_sealed(), decision::SEALED),
+                    (tracker.all_sealed(), decision::ALL_SEALED),
+                    (tracker.peer_lanes_final(), decision::LANES_FINAL),
+                ] {
+                    if on {
+                        flags |= flag;
+                    }
+                }
+                activity = tracker.trace_activity();
+                stopped = tracker.stopped_peers().len() as u64;
+                commits = tracker.trace_commits();
+            }
+            None => flags |= decision::SCOPE_ZERO,
+        }
+        let key = (outcome, flags, activity);
+        let always = !matches!(outcome, decision::NOT_READY | decision::SHUT_DOWN);
+        if !always && self.trace.last == Some(key) {
+            self.trace.repeats += 1;
+            return;
+        }
+        self.trace.last = Some(key);
+        let repeats = std::mem::take(&mut self.trace.repeats);
+        let mut counts = Vec::new();
+        let mut lanes = Vec::new();
+        if let Some(tracker) = &self.progress_tracker {
+            tracker.trace_nonzero(&mut |change| counts.push(change));
+            if always {
+                lanes = tracker.trace_lanes();
+            }
+        }
+        recorder.record(
+            Ev::new(Kind::Decision)
+                .a(outcome)
+                .b(counts.len())
+                .w(0, flags)
+                .w(1, activity)
+                .w(2, repeats)
+                .w(3, stopped)
+                .w(4, commits),
+        );
+        for change in &counts {
+            recorder.change(Kind::DecisionCount, change, 0, 0);
+        }
+        for (worker, batches, state) in lanes {
+            recorder.record(
+                Ev::new(Kind::DecisionLane)
+                    .a(usize::from(state.sealed) | usize::from(state.closed) << 1)
+                    .b(worker)
+                    .w(0, batches),
+            );
         }
     }
 
@@ -1381,6 +1537,14 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 self.async_waiting[pos] = false;
                 self.propagate_completion(pos);
                 shut_down = true;
+                traced! {
+                    if let Some(recorder) = &self.trace.recorder {
+                        recorder.record(
+                            crate::progress::trace::Ev::new(crate::progress::trace::Kind::ShutDown)
+                                .b(self.operators[pos].index()),
+                        );
+                    }
+                }
             }
         }
 
@@ -1392,10 +1556,15 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // the next commit, which carries it.
         let all_exhausted =
             (0..self.operators.len()).all(|pos| self.done[pos] || self.operators[pos].exhausted());
+        #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+        let mut uncollected = false;
         if let Some(tracker) = &mut self.progress_tracker {
             if all_exhausted && !tracker.is_sealed() {
                 if tracker.uncollected() {
                     shut_down = true;
+                    traced! {
+                        uncollected = true;
+                    }
                 } else {
                     tracker.seal();
                 }
@@ -1420,10 +1589,30 @@ impl<T: Timestamp> DataflowExecutor<T> {
                     if more > 0 {
                         residual.push(format!("... and {more} more"));
                     }
-                    return Err(Error::Progress(ProgressError::Residual {
+                    let error = Error::Progress(ProgressError::Residual {
                         residual: format!("worker {}: {}", self.worker_index, residual.join(", ")),
-                    }));
+                    });
+                    traced! {
+                        use crate::progress::trace::{ExitSource, Trigger, decision};
+                        self.trace_decision(decision::RESIDUAL, all_exhausted, uncollected);
+                        self.trace_ending(ExitSource::Residual);
+                        if let Some(recorder) = &self.trace.recorder {
+                            recorder.trigger(Trigger::Residual, &error.to_string());
+                        }
+                    }
+                    return Err(error);
                 }
+            }
+            traced! {
+                self.trace_decision(
+                    if shut_down {
+                        crate::progress::trace::decision::SHUT_DOWN
+                    } else {
+                        crate::progress::trace::decision::NOT_READY
+                    },
+                    all_exhausted,
+                    uncollected,
+                );
             }
             return Ok(if shut_down {
                 Decision::ShutDown
@@ -1432,11 +1621,22 @@ impl<T: Timestamp> DataflowExecutor<T> {
             });
         }
         // S3: nothing may have reached a shut-down operator.
-        for op in &mut self.operators {
+        let worker_index = self.worker_index;
+        let checked = self.operators.iter_mut().try_for_each(|op| {
             let name = op.name().to_string();
             op.check_after_shutdown()
-                .map_err(|e| e.with_operator_context(name, self.worker_index))?;
+                .map_err(|e| e.with_operator_context(name, worker_index))
+        });
+        traced! {
+            use crate::progress::trace::{ExitSource, decision};
+            if checked.is_err() {
+                self.trace_decision(decision::S3_FAILED, all_exhausted, uncollected);
+                self.trace_ending(ExitSource::S3);
+            } else {
+                self.trace_decision(decision::SUCCEEDED, all_exhausted, uncollected);
+            }
         }
+        checked?;
         Ok(Decision::Succeeded)
     }
 
@@ -1455,6 +1655,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// executor this way.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn run(&mut self) -> Result<bool> {
+        #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+        let _trace = crate::progress::trace::enter(&self.trace.recorder);
         // With catch_panics disabled an operator panic propagates to the
         // caller unchanged (minus the executor's internal operator tag).
         let result =
@@ -1463,6 +1665,9 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 Err(payload) => std::panic::resume_unwind(original_panic_payload(payload)),
             };
         self.update_wall_time_metric();
+        traced! {
+            self.trace_result(&result);
+        }
         result
     }
 
@@ -1876,13 +2081,21 @@ impl<T: Timestamp> DataflowExecutor<T> {
                             op.close_external_input();
                         }
                     }
-                    _ => self.cancel.check()?,
+                    _ => {
+                        traced! {
+                            self.trace.exit = Some(crate::progress::trace::ExitSource::Cancelled);
+                        }
+                        self.cancel.check()?
+                    }
                 }
             }
             if self.draining {
                 // A failure arrived after the requested stop (a peer's
                 // forwarded failure, a lost link): the drain cannot complete.
                 if let Some(reason) = self.cancel.escalation() {
+                    traced! {
+                        self.trace.exit = Some(crate::progress::trace::ExitSource::Escalation);
+                    }
                     return Err(crate::error::Error::Cancelled {
                         reason: Some(reason),
                     });
@@ -1893,6 +2106,9 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 .is_some_and(|deadline| Instant::now() >= deadline)
             {
                 // Drain timed out (or was aborted) — propagate the cancellation.
+                traced! {
+                    self.trace.exit = Some(crate::progress::trace::ExitSource::DrainDeadline);
+                }
                 self.cancel.check()?;
             }
         }
@@ -1921,7 +2137,12 @@ impl<T: Timestamp> DataflowExecutor<T> {
 
         // Only now, on committed state, decide.
         match self.decide()? {
-            Decision::Succeeded => return Ok(SweepOutcome::Completed),
+            Decision::Succeeded => {
+                traced! {
+                    self.trace.exit = Some(crate::progress::trace::ExitSource::S2b);
+                }
+                return Ok(SweepOutcome::Completed);
+            }
             Decision::ShutDown => self.consecutive_idle = 0,
             Decision::NotReady => {}
         }
@@ -1949,6 +2170,10 @@ impl<T: Timestamp> DataflowExecutor<T> {
                         // A failure forwarded during this sweep explains
                         // the stop better.
                         if let Some(reason) = self.cancel.escalation() {
+                            traced! {
+                                self.trace.exit =
+                                    Some(crate::progress::trace::ExitSource::Escalation);
+                            }
                             return Err(Error::Cancelled {
                                 reason: Some(reason),
                             });
@@ -1956,6 +2181,9 @@ impl<T: Timestamp> DataflowExecutor<T> {
                         let mut peers: Vec<String> =
                             stopped.iter().map(|&w| tracker.peer_name(w)).collect();
                         peers.dedup();
+                        traced! {
+                            self.trace.exit = Some(crate::progress::trace::ExitSource::StoppedPeer);
+                        }
                         return Err(Error::Cancelled {
                             reason: Some(crate::cancellation::CancellationReason::NetworkError {
                                 detail: format!(
@@ -1986,6 +2214,9 @@ impl<T: Timestamp> DataflowExecutor<T> {
             }
             // A single worker with nothing that can wake it: it cannot make
             // progress any more.
+            traced! {
+                self.trace.exit = Some(crate::progress::trace::ExitSource::Quiescent);
+            }
             return Ok(SweepOutcome::Quiescent);
         }
 
@@ -2025,6 +2256,21 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// Returns `Poll::Ready(Ok(true))` on completion, `Poll::Ready(Ok(false))`
     /// on quiescence, or `Poll::Ready(Err(...))` on error/cancellation.
     pub fn poll_run(&mut self, cx: &mut Context<'_>) -> Poll<Result<bool>> {
+        // Every event this worker records while it runs goes to its ring
+        // (only for this synchronous call: never across an `.await`).
+        #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+        let _trace = crate::progress::trace::enter(&self.trace.recorder);
+        let poll = self.poll_sweeps(cx);
+        traced! {
+            if let Poll::Ready(result) = &poll {
+                self.trace_result(result);
+            }
+        }
+        poll
+    }
+
+    /// [`poll_run`](Self::poll_run)'s sweeps.
+    fn poll_sweeps(&mut self, cx: &mut Context<'_>) -> Poll<Result<bool>> {
         let budget = self.config.max_sweeps_per_poll;
         let mut sweeps_this_poll: usize = 0;
 
@@ -2201,6 +2447,9 @@ impl<T: Timestamp> Future for DataflowExecutor<T> {
             Err(payload) => {
                 this.wake_handle.clear_waker();
                 let error = operator_panic_error(payload, Some(this.worker_index));
+                traced! {
+                    this.trace_exit(None, Some(error.to_string()), true);
+                }
                 if let (Some(ctrl), Error::OperatorPanic { operator, .. }) =
                     (this.control_sender.as_ref(), &error)
                 {
@@ -2272,6 +2521,8 @@ mod tests {
                 _phantom: PhantomData,
                 draining: false,
                 drain_deadline: None,
+                #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+                trace: ExecutorTrace::default(),
             }
         }
     }
@@ -2386,6 +2637,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         let result = executor.run();
@@ -2435,6 +2688,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         let result = executor.run();
@@ -2488,6 +2743,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         let result = executor.run();
@@ -2529,6 +2786,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         let result = executor.run();
@@ -2604,6 +2863,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         // Should terminate via quiescence, not infinite loop.
@@ -2684,6 +2945,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         let result = executor.run();
@@ -2751,6 +3014,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         // Attach progress tracker
@@ -2804,6 +3069,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         // Request notification at time 5
@@ -2870,6 +3137,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         // Request notification at time 3 — frontier already past, fires immediately
@@ -2929,6 +3198,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         // Poll the Future — should complete in one poll since all operators finish.
@@ -3010,6 +3281,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         // IdleOperator always returns Idle → hits idle threshold → WaitingForInput.
@@ -3104,6 +3377,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         let wake = executor.wake_handle();
@@ -3172,6 +3447,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         let result = Pin::new(&mut executor).poll(&mut cx);
@@ -3613,6 +3890,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         // First poll: should yield after `budget` sweeps (Pending, not Ready)
@@ -3693,6 +3972,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         // Should run to completion without yielding
@@ -3748,6 +4029,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         // Enable fusion with topological order.
@@ -3815,6 +4098,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         // Topological order: source → transform → sink
@@ -3871,6 +4156,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         executor.enable_fusion(FusedActivationOrder::new(vec![0]));
@@ -3926,6 +4213,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         executor.enable_fusion(FusedActivationOrder::new(vec![0]));
@@ -3981,6 +4270,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         executor.enable_fusion(FusedActivationOrder::new(vec![0]));
@@ -4071,6 +4362,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         // Should succeed and enable fusion.
@@ -4139,6 +4432,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         // Should return error, not panic.
@@ -4205,6 +4500,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         executor.enable_fusion(FusedActivationOrder::new(vec![0, 1, 2]));
@@ -4274,6 +4571,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         // Create stage info for two stages.
@@ -4357,6 +4656,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         use crate::dataflow::stage::{FusedActivationOrder, StageId, StageInfo};
@@ -4413,6 +4714,8 @@ mod tests {
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace: ExecutorTrace::default(),
         };
 
         use crate::dataflow::stage::{FusedActivationOrder, StageId, StageInfo};

@@ -256,6 +256,11 @@ pub fn set_mode(mode: Mode) {
     MODE.store(encode_mode(mode), Ordering::Relaxed);
 }
 
+/// Dump the progress trace of a dataflow (see the
+/// [flight recorder](crate::progress::trace)): for test harnesses, on any
+/// unexpected outcome.
+pub use crate::progress::trace::dump_traces;
+
 /// Whether any checking is enabled.
 pub(crate) fn enabled() -> bool {
     mode() != Mode::Off
@@ -447,6 +452,10 @@ pub(crate) fn record(
         }
     }
     let message = panics.then(|| violation.to_string());
+    let dump = match dataflow {
+        Some(id) if crate::progress::trace::enabled() => Some((id, violation.to_string())),
+        _ => None,
+    };
     {
         let mut log = log();
         if log.entries.len() >= LOG_CAPACITY {
@@ -456,6 +465,10 @@ pub(crate) fn record(
             }
         }
         log.entries.push_back(violation);
+    }
+    // The flight recorder's dump, before a panic can end the process.
+    if let Some((id, text)) = dump {
+        crate::progress::trace::trigger(id, crate::progress::trace::Trigger::Checker, &text);
     }
     if let Some(message) = message {
         panic!("instancy progress check failed: {message}");

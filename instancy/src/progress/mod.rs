@@ -80,6 +80,7 @@
 //! | `progress_channel` | Cross-worker progress message transport |
 //! | `network_progress` | Serializable progress messages for cluster mode |
 //! | `subgraph` | Nested scope progress tracking |
+//! | `trace` | Flight recorder for progress failures (debug, `progress-check` and `test-utils` builds) |
 
 pub mod capability;
 pub mod change_batch;
@@ -100,6 +101,8 @@ pub(crate) mod reachability;
 #[allow(dead_code)]
 pub(crate) mod subgraph;
 pub mod timestamp;
+#[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+pub mod trace;
 
 /// An operator's output retry queue. With the progress checker compiled in
 /// it is measured by the checker's oracle; otherwise it is a plain

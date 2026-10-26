@@ -1835,6 +1835,9 @@ impl RuntimeHandle {
             dataflow.check =
                 crate::progress::check::oracle::<T>(dataflow_id, worker_context.num_workers());
         }
+        traced! {
+            dataflow.trace_site = Some((dataflow_id, LOCAL_NODE.into()));
+        }
         let (spawned, executor, mut notifier) = self.prepare_worker(
             &mut dataflow,
             plan,
@@ -2202,6 +2205,9 @@ impl RuntimeHandle {
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         {
             dataflow.check = crate::progress::check::oracle::<T>(dataflow_id, num_workers);
+        }
+        traced! {
+            dataflow.trace_site = Some((dataflow_id, LOCAL_NODE.into()));
         }
         let mut prepared = Vec::with_capacity(num_workers);
         let mut spawned_count = 0usize;
@@ -3150,6 +3156,9 @@ impl RuntimeHandle {
             {
                 dataflow.check = crate::progress::check::oracle::<T>(dataflow_id, total_workers);
             }
+            traced! {
+                dataflow.trace_site = Some((dataflow_id, local_node_id.to_string()));
+            }
             let pc = progress_channels_iter.next().map(Some).unwrap_or(None);
             let wh = wake_handles[global_idx].clone();
             let ctrl = control_pairs[local_idx].take();
@@ -3233,7 +3242,15 @@ impl RuntimeHandle {
         for (local_idx, (spawned, executor, mut notifier)) in prepared.into_iter().enumerate() {
             let worker = local_start + local_idx;
             let events = events_tx.clone();
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            let recorder = executor.trace_recorder();
             notifier.set_result_observer(Box::new(move |success, failure| {
+                traced! {
+                    use crate::progress::trace::{Ev, Kind};
+                    if let Some(recorder) = &recorder {
+                        recorder.record(Ev::new(Kind::Reported).a(usize::from(success)));
+                    }
+                }
                 let _ = events.send(LifecycleEvent::WorkerFinished { success, failure });
             }));
             let executor = MarkCompleted {
@@ -3476,9 +3493,14 @@ impl SimpleRuntime {
         let wake_handle = WakeHandle::new();
         self.cancel.register_wake_handle_weak(&wake_handle);
         let mut dataflow = dataflow;
+        #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+        let dataflow_id = DataflowId::new();
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         {
-            dataflow.check = crate::progress::check::oracle::<T>(DataflowId::new(), 1);
+            dataflow.check = crate::progress::check::oracle::<T>(dataflow_id, 1);
+        }
+        traced! {
+            dataflow.trace_site = Some((dataflow_id, LOCAL_NODE.into()));
         }
         let plan = PhysicalPlan::single(&dataflow.graph, &dataflow.stages)?;
         let mut executor = materialize_executor(
@@ -3526,9 +3548,14 @@ impl SimpleRuntime {
 
         let wake_handle = WakeHandle::new();
         self.cancel.register_wake_handle_weak(&wake_handle);
+        #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+        let dataflow_id = DataflowId::new();
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         {
-            dataflow.check = crate::progress::check::oracle::<T>(DataflowId::new(), 1);
+            dataflow.check = crate::progress::check::oracle::<T>(dataflow_id, 1);
+        }
+        traced! {
+            dataflow.trace_site = Some((dataflow_id, LOCAL_NODE.into()));
         }
         let plan = PhysicalPlan::single(&dataflow.graph, &dataflow.stages)?;
         let mut executor = materialize_executor(
@@ -3683,12 +3710,17 @@ impl SimpleRuntime {
         }
 
         // --- Materialize and run on background thread ---
+        #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+        let dataflow_id = DataflowId::new();
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         if dataflow.check.is_none() {
-            dataflow.check = crate::progress::check::oracle::<T>(
-                DataflowId::new(),
-                worker_context.num_workers(),
-            );
+            dataflow.check =
+                crate::progress::check::oracle::<T>(dataflow_id, worker_context.num_workers());
+        }
+        traced! {
+            if dataflow.trace_site.is_none() {
+                dataflow.trace_site = Some((dataflow_id, LOCAL_NODE.into()));
+            }
         }
         let mut executor = materialize_executor(
             &mut dataflow,
@@ -3834,8 +3866,10 @@ impl SimpleRuntime {
         } else {
             vec![None]
         };
+        #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+        let dataflow_id = DataflowId::new();
         #[cfg(any(debug_assertions, feature = "progress-check"))]
-        let check_oracle = crate::progress::check::oracle::<T>(DataflowId::new(), num_workers);
+        let check_oracle = crate::progress::check::oracle::<T>(dataflow_id, num_workers);
 
         for (worker_idx, dataflow) in dataflows.into_iter().enumerate() {
             let ctx = WorkerContext::new(worker_idx, num_workers)?;
@@ -3843,6 +3877,12 @@ impl SimpleRuntime {
             let dataflow = {
                 let mut dataflow = dataflow;
                 dataflow.check = check_oracle.clone();
+                dataflow
+            };
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            let dataflow = {
+                let mut dataflow = dataflow;
+                dataflow.trace_site = Some((dataflow_id, LOCAL_NODE.into()));
                 dataflow
             };
             match self.spawn_with_context(
@@ -5599,6 +5639,11 @@ fn validate_stage_parallelism<T: Timestamp>(
     Ok(())
 }
 
+/// The node name of a dataflow that runs in this process only, in the
+/// flight recorder's dumps.
+#[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+const LOCAL_NODE: &str = "local";
+
 /// Materialize a LogicalDataflow into a ready-to-run DataflowExecutor.
 ///
 /// If `wake_handle` is provided, the executor uses it (shared with InputSenders
@@ -5678,6 +5723,23 @@ fn materialize_executor<T: Timestamp>(
         progress_reporters,
         check,
     )?;
+    traced! {
+        if let Some((id, node)) = &dataflow.trace_site {
+            executor.set_trace(crate::progress::trace::worker(
+                *id,
+                node,
+                worker_context.worker_index(),
+                worker_context.num_workers(),
+            ));
+            crate::progress::trace::name_operators(
+                *id,
+                dataflow
+                    .graph
+                    .operators()
+                    .map(|op| (op.index, op.name.clone())),
+            );
+        }
+    }
 
     // Enable stage-task scheduling if stages were inferred.
     // This groups operators by stage and activates them in fused topological
@@ -5725,7 +5787,11 @@ fn materialize_executor<T: Timestamp>(
     }
     // A4: every initial capability is seeded once per worker running its
     // operator; nothing initial is broadcast.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    let recording = crate::progress::trace::enter(&executor.trace_recorder());
     tracker.initialize_for_plan(plan, Some(&dataflow.graph), worker_context.worker_index())?;
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    drop(recording);
     // Injected accounting faults (a test knob): committed with this worker's
     // first commit, as if the operator had consumed records no channel
     // delivered.

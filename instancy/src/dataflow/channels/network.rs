@@ -462,6 +462,24 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkPush<T, D> {
         }
     }
 
+    /// The flight recorder (see `progress::trace`): what a push sent, and a
+    /// dump when its records were lost to a retired link. The dump is in
+    /// addition to the error, which the push still returns.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn trace_sent(&self, envelope: &Envelope<T, D, ()>, sent: &std::result::Result<(), Error>) {
+        let _ = envelope;
+        if let Err(
+            error @ Error::Communication(crate::error::CommunicationError::DataLoss { .. }),
+        ) = sent
+        {
+            crate::progress::trace::trigger(
+                self.dataflow_id,
+                crate::progress::trace::Trigger::DataLost,
+                &error.to_string(),
+            );
+        }
+    }
+
     /// Queue the close sentinel behind this push's data.
     fn send_close(&mut self) {
         self.closed = true;
@@ -534,7 +552,11 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()> for NetworkPus
         }
         let is_data = carries_records(&envelope);
         let bytes = self.encode(&envelope)?;
-        self.send_frame(bytes, is_data)
+        let sent = self.send_frame(bytes, is_data);
+        traced! {
+            self.trace_sent(&envelope, &sent);
+        }
+        sent
     }
 
     fn try_push(
@@ -549,7 +571,11 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()> for NetworkPus
             Ok(b) => b,
             Err(e) => return Err((e, envelope)),
         };
-        match self.send_frame(bytes, is_data) {
+        let sent = self.send_frame(bytes, is_data);
+        traced! {
+            self.trace_sent(&envelope, &sent);
+        }
+        match sent {
             Ok(()) => Ok(()),
             Err(e) => Err((e, envelope)),
         }

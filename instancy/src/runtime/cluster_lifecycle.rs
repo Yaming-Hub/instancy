@@ -1474,6 +1474,13 @@ impl ClusterLifecycle {
                 peer,
                 event: LinkEvent::InboundDataLost(detail),
             } => {
+                traced! {
+                    crate::progress::trace::trigger(
+                        self.dataflow_id,
+                        crate::progress::trace::Trigger::InboundDataLost,
+                        &format!("records from peer {peer} were lost: {detail}"),
+                    );
+                }
                 let cancelled = self.dataflow_cancel.is_cancelled();
                 self.machine.on_inbound_data_lost(peer, detail, cancelled)
             }

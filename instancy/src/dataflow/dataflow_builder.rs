@@ -1137,6 +1137,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
             max_timeline_events: 0,
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             check: None,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace_site: None,
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             check_activation: state.check_activation,
             #[cfg(any(debug_assertions, feature = "progress-check"))]
@@ -5208,6 +5210,10 @@ pub struct LogicalDataflow<T: Timestamp> {
     /// The progress checker's oracle for this dataflow, set at spawn.
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     pub(crate) check: Option<std::sync::Arc<crate::progress::check::Oracle<T>>>,
+    /// Where this dataflow's workers record for the flight recorder
+    /// (`progress::trace`): its id and this node's name, set at spawn.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    pub(crate) trace_site: Option<(crate::dataflow::id::DataflowId, String)>,
     /// Forces an operator activation strategy (test knob of the progress
     /// checker's conformance matrix); `None` keeps the runtime's choice.
     #[cfg(any(debug_assertions, feature = "progress-check"))]

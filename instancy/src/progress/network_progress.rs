@@ -1099,6 +1099,9 @@ pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                     // A retired peer has finished or already holds everything
                     // it needs from us; deltas to it are irrelevant.
                     if outbox.is_retired() {
+                        traced! {
+                            trace_lane_dropped(0, remote_w, 1);
+                        }
                         return;
                     }
                     let mut bufs = Vec::new();
@@ -1111,10 +1114,22 @@ pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                             channel_id = ch_id,
                             "progress send: encode error {e}"
                         );
+                        traced! {
+                            trace_lane_dropped(0, remote_w, 2);
+                        }
                         outbox.report(LinkEvent::OutboundFailed(LinkFailure::Encode(
                             e.to_string(),
                         )));
                         return;
+                    }
+                    // The receiver queues every frame that carries a change
+                    // as its own batch.
+                    traced! {
+                        crate::progress::trace::note_frames(
+                            bufs.iter()
+                                .filter(|b| b.get(..4) != Some(&[0u8; 4][..]))
+                                .count() as u64,
+                        );
                     }
                     for buf in bufs {
                         let frame = Frame {
@@ -1125,6 +1140,9 @@ pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                         // The lane only closes after its forwarder reported a
                         // transport failure, or after teardown.
                         if outbox.send(frame).is_err() {
+                            traced! {
+                                trace_lane_dropped(0, remote_w, 3);
+                            }
                             return;
                         }
                     }
@@ -1134,6 +1152,9 @@ pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                 let abandon_outbox = seal_outbox.clone();
                 let seal = move || {
                     if seal_outbox.is_retired() {
+                        traced! {
+                            trace_lane_dropped(1, remote_w, 1);
+                        }
                         return;
                     }
                     let _ = seal_outbox.send(Frame {
@@ -1146,6 +1167,9 @@ pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                 // cancelled without draining) says so on the same lane.
                 let abandon = move || {
                     if abandon_outbox.is_retired() {
+                        traced! {
+                            trace_lane_dropped(2, remote_w, 1);
+                        }
                         return;
                     }
                     let _ = abandon_outbox.send(Frame {
@@ -1227,6 +1251,26 @@ pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
 // ---------------------------------------------------------------------------
 // ProgressSender::network constructor (cfg-gated)
 // ---------------------------------------------------------------------------
+
+/// The flight recorder: a network lane to worker `to` dropped what (0: a
+/// commit, 1: the seal, 2: the abandon marker), why (1: the link is
+/// retired, 2: it did not encode, 3: the outbox closed).
+#[cfg(all(
+    feature = "transport",
+    any(debug_assertions, feature = "progress-check", feature = "test-utils")
+))]
+fn trace_lane_dropped(what: usize, to: usize, why: u64) {
+    use crate::progress::trace::{self, Ev, Kind, Site};
+    trace::with(Site::ProgressSend, |recorder| {
+        recorder.lane_dropped(
+            Ev::new(Kind::LaneDropped)
+                .a(what)
+                .b(to)
+                .w(0, trace::sending())
+                .w(1, why),
+        );
+    });
+}
 
 #[cfg(feature = "transport")]
 impl<T: Timestamp> ProgressSender<T> {
