@@ -756,9 +756,9 @@ impl Model {
                 ));
             }
             let worker = &self.workers[w];
-            let mut residual = worker.view.nonzero_pointstamps();
+            let mut residual = worker.view.nonzero_counts();
             if let Some(child) = &worker.child {
-                residual.extend(child.nonzero_pointstamps());
+                residual.extend(child.nonzero_counts());
             }
             if !residual.is_empty() {
                 return Err(format!("worker {w} ends with residual counts {residual:?}"));
