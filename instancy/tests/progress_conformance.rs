@@ -56,11 +56,22 @@
 //! refuses blind runs and failures no table entry explains. Every commit that
 //! changes the golden file must cite, in its message, the audit finding that
 //! explains each change.
+//!
+//! # Traces of unexpected outcomes
+//!
+//! With `INSTANCY_TRACE_DIR` set, every run records the progress flight
+//! recorder ([`instancy::progress::trace`]), and a case whose outcome does
+//! not match the golden file dumps the traces of its dataflows there. The
+//! failure message names the dump directory and the analyser's verdict
+//! (`tests/support/trace_verdict.rs`).
 #![cfg(all(
     feature = "transport",
     feature = "test-utils",
     any(debug_assertions, feature = "progress-check")
 ))]
+
+#[path = "support/trace_verdict.rs"]
+mod trace_verdict;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
@@ -2127,8 +2138,9 @@ fn timeout_for(case: &Case, expected: &Golden) -> Duration {
     }
 }
 
-/// Run `case` once and classify what it showed.
-fn observe_case(case: &Case, timeout: Duration) -> (Outcome, Duration) {
+/// Run `case` once and classify what it showed; also returns the ids of the
+/// dataflows it ran (for their traces).
+fn observe_case(case: &Case, timeout: Duration) -> (Outcome, Duration, Vec<DataflowId>) {
     let _guard = case_lock();
     check::set_mode(Mode::Report);
     probe_slots().clear();
@@ -2147,7 +2159,38 @@ fn observe_case(case: &Case, timeout: Duration) -> (Outcome, Duration) {
         split: split_after.split - split_before.split,
         across_sections: split_after.across_sections - split_before.across_sections,
     };
-    (classify(case, &observed, mark, split), started.elapsed())
+    let elapsed = started.elapsed();
+    let ids: BTreeSet<DataflowId> = check::oracles_since(mark)
+        .into_iter()
+        .filter_map(|oracle| oracle.dataflow)
+        .collect();
+    (
+        classify(case, &observed, mark, split),
+        elapsed,
+        ids.into_iter().collect(),
+    )
+}
+
+/// Dump the flight recorder's traces of `ids` (an unexpected outcome of
+/// `case`), and describe them for the failure message: where each dump is
+/// and what the analyser reads from it.
+fn dump_traces(case: &Case, ids: &[DataflowId], why: &str) -> String {
+    let mut out = Vec::new();
+    for id in ids {
+        match check::dump_traces(*id, &format!("conformance case {case}: {why}")) {
+            Some(dir) => {
+                let verdict = trace_verdict::trace_verdict(&dir);
+                out.push(format!("trace dump: {}\n    {}", dir.display(), {
+                    let text = verdict.to_string();
+                    text.trim_end().replace('\n', "\n    ")
+                }));
+            }
+            None => out.push(format!(
+                "no trace dump of dataflow {id} (set INSTANCY_TRACE_DIR to record one)"
+            )),
+        }
+    }
+    out.join("\n    ")
 }
 
 /// The result of running one case against the golden file.
@@ -2160,7 +2203,7 @@ fn run_case(case: Case) -> Verdict {
     let expected = golden_for(&case);
     let timeout = timeout_for(&case, &expected);
     if let Some(path) = recording() {
-        let (outcome, elapsed) = observe_case(&case, timeout);
+        let (outcome, elapsed, _) = observe_case(&case, timeout);
         record_observation(&path, &case, &outcome.failures);
         return Verdict {
             ok: true,
@@ -2173,12 +2216,29 @@ fn run_case(case: Case) -> Verdict {
     }
     let mut mismatches = Vec::new();
     for attempt in 1..=ATTEMPTS {
-        let (outcome, elapsed) = observe_case(&case, timeout);
+        let (outcome, elapsed, ids) = observe_case(&case, timeout);
         let unexpected = expected.unexpected(&outcome.failures);
         let missing = expected.missing(&outcome.failures);
         let ok = unexpected.is_empty() && missing.is_empty();
+        // Every unexpected outcome leaves its traces (when recording).
+        let traces = if ok {
+            String::new()
+        } else {
+            format!(
+                "\n    {}",
+                dump_traces(
+                    &case,
+                    &ids,
+                    &format!(
+                        "got [{}], golden [{}] (attempt {attempt})",
+                        join(&outcome.failures),
+                        join(&expected.always)
+                    )
+                )
+            )
+        };
         let message = format!(
-            "{case}: got [{}]; golden [{}]{}{}{}{} [{:.1}s]\n    {}",
+            "{case}: got [{}]; golden [{}]{}{}{}{} [{:.1}s]\n    {}{traces}",
             join(&outcome.failures),
             join(&expected.always),
             if expected.sometimes.is_empty() {

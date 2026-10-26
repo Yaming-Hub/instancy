@@ -30,6 +30,10 @@ jobs:
       # code used only there must not leave dead code behind.
       - name: cargo check (release, default features)
         run: cargo check -p instancy --release
+      # The progress flight recorder is compiled out of release builds: the
+      # test checks its own release binary.
+      - name: Flight recorder absent from release builds
+        run: cargo test -p instancy --release --test trace_release
 
   no-default-features:
     name: No default features
@@ -49,6 +53,10 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    env:
+      # Every run records the progress flight recorder; a progress failure
+      # dumps its traces here (uploaded below when the job fails).
+      INSTANCY_TRACE_DIR: ${{ github.workspace }}/trace-dumps
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -66,10 +74,23 @@ jobs:
         env:
           AUDIT_REPROS_JOBS: 2
           AUDIT_REPROS_REPORT: 1
+      - name: Upload progress traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: progress-traces-test
+          path: ${{ github.workspace }}/trace-dumps
+          if-no-files-found: ignore
+          retention-days: 14
 
   conformance:
     name: Full conformance matrix
     runs-on: ubuntu-latest
+    env:
+      # A case with an unexpected outcome dumps its traces here, including
+      # one that passes on a later attempt (reported as flaky, and the job
+      # passes): the dumps are uploaded whenever there are any.
+      INSTANCY_TRACE_DIR: ${{ github.workspace }}/trace-dumps
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -78,6 +99,14 @@ jobs:
       # the other jobs.
       - name: Progress conformance matrix (full)
         run: cargo test -p instancy --all-features --test progress_conformance -- --ignored --exact --test-threads=1 full_conformance_matrix
+      - name: Upload progress traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: progress-traces-conformance
+          path: ${{ github.workspace }}/trace-dumps
+          if-no-files-found: ignore
+          retention-days: 14
 
   doc:
     name: Documentation
