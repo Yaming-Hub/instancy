@@ -85,14 +85,8 @@ pub enum ClusterTransport {
     /// Dedicated mode: one `TransportSession` per dataflow, one connection per peer.
     Dedicated(Arc<TransportSession>),
     /// Shared mode: lightweight handle into `SharedPeerManager`s shared across dataflows.
-    ///
-    /// Error receivers are stored separately (not behind the Arc) so they can be
-    /// taken even after the transport Arc is cloned to materializers.
     Shared {
         session: Arc<SharedTransportSession>,
-        error_receivers: Option<
-            HashMap<String, tokio_mpsc::Receiver<crate::communication::transport::TransportError>>,
-        >,
     },
 }
 
@@ -157,28 +151,6 @@ impl ClusterTransport {
         match self {
             Self::Dedicated(_) => MAX_MESSAGE_SIZE,
             Self::Shared { .. } => MAX_MESSAGE_SIZE - 8,
-        }
-    }
-
-    /// Take per-peer error receivers (shared mode only).
-    ///
-    /// Returns `None` for dedicated mode: a dedicated session reports its
-    /// per-peer connection events (EOF, read and write failures, dropped
-    /// oversize frames) through `TransportSession::take_io_events`, which
-    /// `spawn_cluster` forwards to the dataflow's lifecycle coordinator.
-    /// For shared mode, returns error receivers that emit `TransportError` on
-    /// connection failures or reorder timeouts. Can only be called once — subsequent
-    /// calls return `None`.
-    pub fn take_error_receivers(
-        &mut self,
-    ) -> Option<
-        HashMap<String, tokio_mpsc::Receiver<crate::communication::transport::TransportError>>,
-    > {
-        match self {
-            Self::Dedicated(_) => None,
-            Self::Shared {
-                error_receivers, ..
-            } => error_receivers.take(),
         }
     }
 }

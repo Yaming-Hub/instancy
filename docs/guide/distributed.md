@@ -136,6 +136,7 @@ let mut cluster_handle = rt.spawn_cluster(
 
 **Key points:**
 - Every node must call `spawn_cluster` with the same `DataflowId` concurrently
+- A `DataflowId` identifies one run: a retry uses a fresh `DataflowId::new()` (Shared mode rejects an id that already ran with a peer, because the earlier run's late frames could otherwise be taken for the new run's)
 - The library performs a handshake to verify all nodes agree on the dataflow structure
 - Exchange operators automatically route data across nodes via the connections
 - `SpawnOptions` controls observability, cancellation, I/O mode, and priority
@@ -164,7 +165,7 @@ let managers = Arc::new(peer_managers);
 let transport = ClusterSpawnTransport::shared(managers, 1024);
 ```
 
-With shared transport, connection pooling, reconnection, and multiplexing are handled automatically. See `tests/cluster_shared_transport.rs` for a complete example.
+With shared transport, many dataflows share a fixed pool of connections to each peer (`SharedConnectionConfig::connections`, default 1, the same on both nodes). Each dataflow's frames to a peer are pinned to one pooled connection when it registers, so they stay in order. The pool is established through your `ConnectionFactory` when the first dataflow registers, and it does not resize itself. See `tests/cluster_shared_transport.rs` for a complete example.
 
 ### Testing Clusters Locally
 
@@ -221,33 +222,34 @@ runtime.report_node_join("node-3");
 
 Already-cancelled dataflows are **not** restarted — the application must re-spawn them if desired.
 
-### Connection Failure & Reconnection
+### Transport Contract
 
-When using `SharedTransport` for cluster networking, connection failures are handled automatically if a **connection factory** is provided.
+instancy does not open or own the connections between nodes: your application provides them (a `ConnectionFactory` in Shared mode, `PeerConnection` reader/writer pairs in Dedicated mode). The responsibilities are split like this.
 
-**Automatic reconnection (with factory):**
+**Your application provides:**
 
-When a connection drops (reader/writer error), `SharedTransport`:
-1. Marks the connection as dead and removes it from the active pool
-2. Invokes the connection factory to establish a new connection
-3. Retries with exponential backoff: 100ms → 200ms → 400ms → 800ms (5 attempts total, 4 delays between them)
-4. On success, the new connection is added to the pool and future sends use it
-5. On permanent failure (all retries exhausted with no live connections remaining), affected dataflows receive `TransportError::ConnectionClosed`
+- **Reliable, ordered byte streams.** Any transport works (TCP, TLS, QUIC, pipes) as long as each stream delivers bytes in order, without loss or duplication, while it lives.
+- **Paired connections (Shared mode).** Both nodes of a pool establish their connections independently; your factory must pair each connection one node establishes with one the peer establishes (one side dials, the other accepts and hands the accepted stream to its factory, for example). Both nodes must use the same `SharedConnectionConfig::connections`.
+- **Liveness.** Detecting that a peer is dead, partitioned or unreachable is yours: make your streams fail when the peer is gone (TCP keepalive with short timers, a TLS or QUIC idle timeout), or tell instancy through `report_node_leave` (see above). instancy runs no heartbeat of its own. The bundled `TcpConnectionFactory` sets no keepalive.
 
-**No factory (pre-established connections only):**
+**instancy guarantees:**
 
-If `SharedTransport` is created with pre-established connections and no factory, a dropped connection is permanent — no reconnection is attempted. Remaining healthy connections continue serving traffic.
+- **Never a wrong result.** A dataflow never reports success with lost, duplicated, reordered or corrupted data. Every frame is checksummed (CRC32 of its header and of its payload), every Shared-mode lane is sequenced, a stream that ends before its close markers fails the dataflow, and a connection to the wrong peer is rejected at the handshake.
+- **Prompt, loud failure when told.** When a connection reports an error or EOF, or you report a node leaving, the affected dataflows fail (on every node) with an error you can inspect; they never hang waiting for frames that were lost.
+- **No hangs of its own.** With a healthy transport, a dataflow finishes or fails.
 
-**Data loss during reconnection:**
+**If your side isn't met:** a stream that silently stops delivering without ever failing (a network partition with no keepalive) makes the dataflows using it wait. They never report success; they wait until the stream fails or you report the node leaving.
 
-Payload frames sent while no live connection exists are **dropped immediately** — `SharedTransport` does not buffer or replay them. Additionally, frames that were assigned a sequence number before the connection failed can create an unrecoverable gap in the receiver's reorder buffer. When the gap times out, the affected dataflow receives `TransportError::ReorderTimeout`.
+### Connection Failures
 
-In summary, a successful reconnect restores connectivity but does **not** guarantee seamless delivery. Applications that require exactly-once or reliable delivery should implement their own acknowledgment/retry protocol at the operator level.
+Both modes are **fail-stop**, like timely: frames on a connection that fails may be lost, and nothing resends them, so a failed connection fails the dataflows that used it.
 
-**`PeerConnection` and `TransportSession`:**
+- **Dedicated:** each dataflow has its own connection to each peer; if it fails while the dataflow runs, the dataflow fails on every node.
+- **Shared:** a pooled connection that fails (a write error, or its read side ending) fails exactly the dataflows pinned to it, on both nodes. Other dataflows on the pool's other connections are unaffected. With the default pool of one connection, a failure fails every dataflow running between the two nodes.
 
-These lower-level types represent pre-established connections with no built-in reconnection. Reconnection is handled at the `SharedTransport` layer, which wraps these into a managed, pooled transport.
+The failed connection leaves the pool. instancy does not redial in the background: the next dataflow that registers re-establishes the missing connections through your factory, bounded by `SharedConnectionConfig::connect_timeout` (and the spawn by its handshake timeout). Re-run failed dataflows from your application if you want them retried, each retry with a fresh `DataflowId`.
 
+A dataflow whose own frame cannot be sent (one larger than the frame size limit) fails alone; the shared connection and the other dataflows are untouched.
 ## In-Process Cluster Recipes
 
 ### Spawn a two-node cluster with duplex streams

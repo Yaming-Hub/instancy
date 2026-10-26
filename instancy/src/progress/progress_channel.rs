@@ -97,7 +97,7 @@ impl<T> ProgressChange<T> {
     }
 
     /// An in-flight message change at an operator input port.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "transport"))]
     pub fn target(node: usize, port: usize, time: T, diff: i64) -> Self {
         Self {
             kind: ProgressKind::Target,

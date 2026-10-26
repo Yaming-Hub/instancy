@@ -63,55 +63,77 @@ use crate::communication::transport::{
 #[cfg(feature = "transport")]
 use crate::dataflow::id::DataflowId;
 
-/// Something that happened to the connection to one peer of a
-/// [`TransportSession`].
+/// Something that happened to a dataflow's link with one peer: its
+/// connection in Dedicated mode, or a pooled connection it uses in Shared
+/// mode ([`SharedTransportSession::take_io_events`](super::shared_transport::SharedTransportSession::take_io_events)).
 #[cfg(feature = "transport")]
 #[derive(Debug)]
-pub(crate) enum PeerIoEvent {
+pub enum PeerIoEvent {
     /// The peer closed the connection (EOF at a frame boundary).
     Closed,
-    /// Reading failed: I/O error, EOF mid-frame, corrupt or oversize frame.
-    /// Every channel from the peer closes.
+    /// Reading failed: an I/O error, EOF mid-frame, a corrupt or oversize
+    /// frame, or (Shared mode) a frame out of sequence. Every channel from
+    /// the peer closes.
     ReadFailed(TransportError),
-    /// Writing failed; the writer stopped and the peer will see EOF.
+    /// Writing failed: frames sent to the peer may be lost.
     WriteFailed(TransportError),
-    /// An outbound frame exceeded the frame size limit and was dropped; the
-    /// connection itself is intact.
-    OversizeDropped(TransportError),
+    /// An outbound frame was rejected before reaching the connection (it
+    /// exceeded the frame size limit, or used a reserved channel) and was
+    /// dropped; the connection itself is intact.
+    FrameRejected(TransportError),
 }
 
-/// A [`PeerIoEvent`] as delivered by [`TransportSession::take_io_events`].
+/// A [`PeerIoEvent`] as delivered to a dataflow.
 ///
-/// For the end of the read side (`Closed`, `ReadFailed`), the session keeps
-/// every channel from the peer open until the notice is dropped: whoever
-/// hands the event on before dropping the notice is guaranteed to have done
-/// so before any receiver observes those channels close. (A corrupt frame
-/// must not look like a clean disconnect because the channel closures were
-/// processed first.)
+/// For the end of the read side (`Closed`, `ReadFailed`), the transport
+/// keeps every channel from the peer open until the notice is dropped
+/// (once the session was told the events are consumed): whoever hands the
+/// event on before dropping the notice is guaranteed to have done so before
+/// any receiver observes those channels close. (A corrupt frame must not
+/// look like a clean disconnect because the channel closures were processed
+/// first.)
 #[cfg(feature = "transport")]
 #[derive(Debug)]
-pub(crate) struct PeerIoNotice {
+pub struct PeerIoNotice {
     pub(crate) event: PeerIoEvent,
     delivered: Delivery,
 }
 
-/// Dropping it tells the session that a [`PeerIoNotice`]'s event was handed
-/// on, so the peer's channels may close.
+/// Dropping it tells the transport that a [`PeerIoNotice`]'s event was
+/// handed on, so the peer's channels may close.
 #[cfg(feature = "transport")]
 #[derive(Debug)]
-pub(crate) struct Delivery(#[allow(dead_code)] Option<tokio::sync::oneshot::Sender<()>>);
+pub struct Delivery(#[allow(dead_code)] Option<tokio::sync::oneshot::Sender<()>>);
 
 #[cfg(feature = "transport")]
 impl PeerIoNotice {
-    fn new(event: PeerIoEvent) -> Self {
+    /// A notice nothing waits for.
+    pub(crate) fn new(event: PeerIoEvent) -> Self {
         Self {
             event,
             delivered: Delivery(None),
         }
     }
 
+    /// A notice, and what resolves once it was handed on (dropped).
+    pub(crate) fn held(event: PeerIoEvent) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let (delivered, handed_on) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                event,
+                delivered: Delivery(Some(delivered)),
+            },
+            handed_on,
+        )
+    }
+
+    /// The event.
+    pub fn event(&self) -> &PeerIoEvent {
+        &self.event
+    }
+
     /// The event, and the guard to drop once it was handed on.
-    pub(crate) fn into_parts(self) -> (PeerIoEvent, Delivery) {
+    pub fn into_parts(self) -> (PeerIoEvent, Delivery) {
         (self.event, self.delivered)
     }
 }
@@ -126,9 +148,10 @@ impl PeerIoNotice {
 /// or direct TCP). The transport session wraps them with priority bridge
 /// tasks and Demuxer.
 ///
-/// **Reconnection:** `PeerConnection` itself has no reconnection logic.
-/// For automatic reconnection on failure, use `SharedPeerManager` with a
-/// connection factory — it manages retry with exponential backoff.
+/// **Failures:** a `PeerConnection` is used by one dataflow; if it fails while
+/// the dataflow runs, the dataflow fails (fail-stop). The application owns
+/// its liveness: a stream must fail (error or EOF) when the peer is gone, or
+/// the application reports the node leaving.
 ///
 /// [`ConnectionManager`]: crate::communication::connection::ConnectionManager
 #[cfg(feature = "transport")]
@@ -164,9 +187,8 @@ pub struct ChannelRegistration {
 
 /// A transport session managing multiplexed communication with remote peers.
 ///
-/// **Reconnection:** `TransportSession` does not handle connection failure
-/// or reconnection. For managed reconnection, use `SharedPeerManager` which
-/// wraps connections with automatic retry and exponential backoff.
+/// **Failures:** `TransportSession` does not reconnect: it reports a
+/// connection's end or failure (see [`PeerIoEvent`]) and the dataflow fails.
 ///
 /// See [module-level documentation](self) for details on priority and ownership.
 #[cfg(feature = "transport")]
@@ -406,11 +428,7 @@ impl TransportSession {
                 if io_taken.load(std::sync::atomic::Ordering::Acquire) {
                     // Hand the event on before the channels close (see
                     // `PeerIoNotice`). A dropped receiver resolves both waits.
-                    let (delivered, handed_on) = tokio::sync::oneshot::channel();
-                    let notice = PeerIoNotice {
-                        event,
-                        delivered: Delivery(Some(delivered)),
-                    };
+                    let (notice, handed_on) = PeerIoNotice::held(event);
                     if io_tx.send(notice).await.is_ok() {
                         let _ = handed_on.await;
                     }
@@ -553,7 +571,7 @@ impl TransportSession {
                         _peer_id,
                         frame.channel_id
                     );
-                    let _ = events.try_send(PeerIoNotice::new(PeerIoEvent::OversizeDropped(e)));
+                    let _ = events.try_send(PeerIoNotice::new(PeerIoEvent::FrameRejected(e)));
                 }
                 Err(e) => {
                     #[cfg(feature = "tracing")]
@@ -1595,6 +1613,15 @@ mod tests {
         .map(|notice| notice.event)
     }
 
+    /// A frame header (with a valid header checksum) announcing a payload far
+    /// beyond the frame limit.
+    fn oversize_header() -> Vec<u8> {
+        let mut header = [0u8; 28];
+        header[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut wire = header.to_vec();
+        wire.extend_from_slice(&crc32fast::hash(&header).to_le_bytes());
+        wire
+    }
     #[tokio::test]
     async fn session_reports_peer_eof() {
         let (local_read, remote_write) = tokio::io::duplex(1024);
@@ -1614,10 +1641,7 @@ mod tests {
         let (local_read, mut remote_write) = tokio::io::duplex(1024);
         let (_remote_read, local_write) = tokio::io::duplex(1024);
         let (_session, mut events, _rx) = session_with(local_read, local_write);
-        // A header announcing a payload far beyond the frame limit.
-        let mut header = [0u8; 28];
-        header[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
-        remote_write.write_all(&header).await.unwrap();
+        remote_write.write_all(&oversize_header()).await.unwrap();
         assert!(matches!(
             next_event(&mut events).await,
             Some(PeerIoEvent::ReadFailed(
@@ -1635,9 +1659,7 @@ mod tests {
         let (_remote_read, local_write) = tokio::io::duplex(1024);
         let (_session, mut events, mut receivers) = session_with(local_read, local_write);
         _session.hold_channels_for_io_events();
-        let mut header = [0u8; 28];
-        header[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
-        remote_write.write_all(&header).await.unwrap();
+        remote_write.write_all(&oversize_header()).await.unwrap();
         let notice = poll_recv(
             events.get_mut("b").unwrap(),
             std::time::Duration::from_secs(5),
@@ -1691,7 +1713,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             next_event(&mut events).await,
-            Some(PeerIoEvent::OversizeDropped(
+            Some(PeerIoEvent::FrameRejected(
                 TransportError::PayloadTooLarge { .. }
             ))
         ));

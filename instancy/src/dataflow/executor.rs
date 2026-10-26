@@ -1016,6 +1016,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
 
     /// Name each worker's peer for errors (by worker index; on a cluster,
     /// its node's id). Unnamed workers are reported as `worker N`.
+    #[cfg_attr(not(feature = "transport"), allow(dead_code))]
     pub(crate) fn set_peer_names(&mut self, names: Vec<String>) {
         if let Some(tracker) = &mut self.progress_tracker {
             tracker.set_peer_names(names);

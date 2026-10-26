@@ -90,8 +90,11 @@ impl Valve {
 }
 
 /// The transport's frame header: `[..16]` (unused here), the channel id
-/// `[16..24]`, the payload length `[24..28]`.
+/// `[16..24]`, the length of the payload and its trailing checksum
+/// `[24..28]`. A checksum of the header follows it.
 const FRAME_HEADER: usize = 28;
+/// Size of each frame checksum.
+const FRAME_CRC: usize = 4;
 
 /// Whether a frame is a shutdown-handshake frame: an end-of-stream marker or
 /// an acknowledgement on a progress channel (count `u32::MAX` or
@@ -116,11 +119,14 @@ fn before_handshake(bytes: &[u8]) -> (usize, bool) {
     while at + FRAME_HEADER <= bytes.len() {
         let channel = u64::from_le_bytes(bytes[at + 16..at + 24].try_into().unwrap());
         let len = u32::from_le_bytes(bytes[at + 24..at + 28].try_into().unwrap()) as usize;
-        let end = at + FRAME_HEADER + len;
+        let end = at + FRAME_HEADER + FRAME_CRC + len;
         if end > bytes.len() {
             break;
         }
-        if is_handshake_frame(channel, &bytes[at + FRAME_HEADER..end]) {
+        if is_handshake_frame(
+            channel,
+            &bytes[at + FRAME_HEADER + FRAME_CRC..end - FRAME_CRC],
+        ) {
             return (at, true);
         }
         at = end;
@@ -383,6 +389,24 @@ impl Mesh {
         ClusterSpawnTransport::dedicated(conns, capacity)
     }
 
+    /// Shared-mode transport for `node` when `shared`, otherwise
+    /// [`dedicated`](Self::dedicated), over the same links.
+    pub fn transport(
+        &mut self,
+        node: &str,
+        shared: bool,
+        capacity: usize,
+    ) -> ClusterSpawnTransport<ReadHalf<DuplexStream>, WriteHalf<DuplexStream>> {
+        if shared {
+            ClusterSpawnTransport::Shared {
+                peer_managers: self.managers(node),
+                capacity,
+            }
+        } else {
+            self.dedicated(node, capacity)
+        }
+    }
+
     /// [`dedicated`](Self::dedicated) whose writers fail once `broken` is
     /// set, while the readers and the peers' ends stay open. This is a local
     /// write error on split stream halves (as with TLS): dropping the failed
@@ -410,6 +434,53 @@ impl Mesh {
             })
             .collect();
         ClusterSpawnTransport::dedicated(conns, capacity)
+    }
+
+    /// Shared-mode counterpart of [`dedicated_breakable`](Self::dedicated_breakable):
+    /// `node`'s pooled connection writers fail once `broken` is set, while
+    /// the readers and the peers' ends stay open. Also returns the managers,
+    /// so the test can keep them alive (as long-lived managers are) after
+    /// the dataflow ends.
+    pub fn shared_breakable(
+        &mut self,
+        node: &str,
+        capacity: usize,
+        broken: Arc<AtomicBool>,
+    ) -> (
+        ClusterSpawnTransport<ReadHalf<DuplexStream>, BreakableWriter<WriteHalf<DuplexStream>>>,
+        Managers,
+    ) {
+        let handle = tokio::runtime::Handle::current();
+        let mut managers = HashMap::new();
+        for (peer, stream) in self.take_ends(node) {
+            let (reader, writer) = tokio::io::split(stream);
+            let writer = BreakableWriter {
+                inner: writer,
+                broken: Arc::clone(&broken),
+            };
+            let factory: Arc<dyn DynConnectionFactory> = Arc::new(PreEstablished(Mutex::new(
+                VecDeque::from([(reader, writer)]),
+            )));
+            managers.insert(
+                peer.clone(),
+                SharedPeerManager::new(
+                    peer,
+                    shared_config(1),
+                    factory,
+                    &handle,
+                    tokio::sync::broadcast::channel(16).0,
+                )
+                .unwrap(),
+            );
+        }
+        let managers = Arc::new(managers);
+        (
+            ClusterSpawnTransport::Shared {
+                peer_managers: Arc::clone(&managers),
+                capacity,
+            },
+            managers,
+        )
     }
 
     /// Shared-mode peer managers for `node` whose factories hand out the
@@ -621,16 +692,10 @@ where
 /// Fixed-size pool without probing or scaling.
 pub fn shared_config(conns: usize) -> SharedConnectionConfig {
     SharedConnectionConfig {
-        min_connections: conns,
-        max_connections: conns,
+        connections: conns,
         probe_interval: Duration::from_secs(3600),
-        rtt_scale_up_threshold: Duration::from_secs(3600),
-        rtt_scale_down_threshold: Duration::from_secs(3600),
-        cooldown_period: Duration::from_secs(3600),
-        reorder_timeout: Duration::from_secs(20),
         rtt_ema_alpha: 0.2,
-        idle_timeout: None,
-        enable_frame_crc: false,
+        ..SharedConnectionConfig::default()
     }
 }
 

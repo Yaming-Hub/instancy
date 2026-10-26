@@ -356,6 +356,7 @@ impl CancellationToken {
     /// progress then stops (see [`escalation`](Self::escalation)).
     /// [`reason`](Self::reason) keeps the first reason. A reason that is
     /// not a failure only cancels.
+    #[cfg_attr(not(feature = "transport"), allow(dead_code))]
     pub(crate) fn escalate(&self, reason: CancellationReason) {
         self.cancel_with_reason(reason.clone());
         if !reason.is_failure() || self.reason().is_some_and(|first| first.is_failure()) {

@@ -40,18 +40,17 @@ pub use interprocess::{
 };
 pub use probing::{
     PROBE_MESSAGE_SIZE, PROBE_REPLY_TYPE, PROBE_REQUEST_TYPE, ProbeCounter, ProbeKind,
-    ProbeMessage, ProbeTimestamp, ScalingDriver, ScalingEvent,
+    ProbeMessage, ProbeTimestamp, RttProber,
 };
 pub use progress_exchange::{PeerProgressSender, ProgressExchange, ProgressExchangeConfig};
 pub use remote_push::{FrameReceiver, FrameSender, OutboundFrame, RemotePush, RemotePushConfig};
 pub use sequencing::{
-    BufferOverflow, InsertResult, ReorderBuffer, ReorderError, SEQUENCED_HEADER_SIZE,
-    SequenceCounter, SequencedFrame, decode_sequenced_header, encode_sequenced_header,
+    SEQUENCED_HEADER_SIZE, SequenceCounter, SequencedFrame, decode_sequenced_header,
+    encode_sequenced_header,
 };
 pub use session::{ChannelInfo, DataflowSession, DataflowSessionBuilder, SharedSession};
 pub use shared_pool::{
-    ConnectionMetrics, ConnectionMode, ConnectionSnapshot, PeerPool, RttTracker, ScalingDecision,
-    SharedConnectionConfig,
+    ConnectionMetrics, ConnectionMode, ConnectionSnapshot, RttTracker, SharedConnectionConfig,
 };
 pub use transport::{Frame, TransportError};
 
@@ -67,9 +66,9 @@ pub use transport::{
 
 #[cfg(feature = "transport")]
 pub use transport_session::{
-    CHANNEL_NAMESPACE_SIZE, CONTROL_CHANNEL_ID, ChannelRegistration, DATA_CHANNEL_BASE,
-    PROGRESS_CHANNEL_BASE, PeerConnection, RESERVED_CHANNEL_BASE, TransportSession,
-    data_channel_id, progress_channel_id,
+    CHANNEL_NAMESPACE_SIZE, CONTROL_CHANNEL_ID, ChannelRegistration, DATA_CHANNEL_BASE, Delivery,
+    PROGRESS_CHANNEL_BASE, PeerConnection, PeerIoEvent, PeerIoNotice, RESERVED_CHANNEL_BASE,
+    TransportSession, data_channel_id, progress_channel_id,
 };
 
 #[cfg(feature = "transport")]

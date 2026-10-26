@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 
 async fn crc_wire(frame: &Frame) -> Vec<u8> {
     let mut wire = Vec::new();
-    let mut w = FramedWriter::with_crc(&mut wire);
+    let mut w = FramedWriter::new(&mut wire);
     w.write_frame(frame).await.unwrap();
     wire
 }
@@ -32,7 +32,7 @@ async fn crc_detects_corrupted_channel_id() {
     };
     let mut wire = crc_wire(&frame).await;
     wire[16] ^= 0x02; // channel_id occupies header bytes 16..24
-    let got = FramedReader::with_crc(&wire[..]).read_frame().await;
+    let got = FramedReader::new(&wire[..]).read_frame().await;
     assert!(
         got.is_err(),
         "corrupted channel_id accepted: delivered on channel {:?}",
@@ -49,7 +49,7 @@ async fn crc_detects_corrupted_dataflow_id() {
     };
     let mut wire = crc_wire(&frame).await;
     wire[3] ^= 0x80; // dataflow_id occupies header bytes 0..16
-    let got = FramedReader::with_crc(&wire[..]).read_frame().await;
+    let got = FramedReader::new(&wire[..]).read_frame().await;
     assert!(got.is_err(), "corrupted dataflow_id accepted: {got:?}");
 }
 
@@ -68,7 +68,7 @@ async fn crc_detects_corrupted_length() {
     wire[24] ^= 0x01; // length occupies header bytes 24..28
     let got = tokio::time::timeout(
         Duration::from_secs(1),
-        FramedReader::with_crc(&wire[..]).read_frame(),
+        FramedReader::new(&wire[..]).read_frame(),
     )
     .await
     .expect("reader blocked on a corrupted length");
@@ -85,10 +85,7 @@ async fn crc_frames_round_trip() {
             payload,
         };
         let wire = crc_wire(&frame).await;
-        let got = FramedReader::with_crc(&wire[..])
-            .read_frame()
-            .await
-            .unwrap();
+        let got = FramedReader::new(&wire[..]).read_frame().await.unwrap();
         assert_eq!(got, frame);
     }
 }
@@ -124,9 +121,6 @@ impl ConnectionFactory for Echo {
 async fn payload_on_control_channel_does_not_break_sequenced_lane() {
     let cfg = SharedConnectionConfig {
         probe_interval: Duration::from_secs(3600),
-        rtt_scale_up_threshold: Duration::from_secs(3600),
-        idle_timeout: None,
-        reorder_timeout: Duration::from_secs(5),
         ..SharedConnectionConfig::default()
     };
     let f: Arc<dyn DynConnectionFactory> = Arc::new(Echo);
@@ -140,25 +134,19 @@ async fn payload_on_control_channel_does_not_break_sequenced_lane() {
     .unwrap();
     let df = DataflowId::new();
     let (mut rxs, _err) = mgr.register_dataflow(df, &[1], 16).await.unwrap();
-    let tx = mgr.payload_sender().clone();
+    let tx = mgr.dataflow_sender(&df).unwrap();
     let _ = tx
-        .send((
-            df,
-            Frame {
-                dataflow_id: df,
-                channel_id: 0,
-                payload: b"P".to_vec(),
-            },
-        ))
-        .await;
-    tx.send((
-        df,
-        Frame {
+        .send(Frame {
             dataflow_id: df,
-            channel_id: 1,
-            payload: b"D".to_vec(),
-        },
-    ))
+            channel_id: 0,
+            payload: b"P".to_vec(),
+        })
+        .await;
+    tx.send(Frame {
+        dataflow_id: df,
+        channel_id: 1,
+        payload: b"D".to_vec(),
+    })
     .await
     .unwrap();
     let ch1 = tokio::time::timeout(Duration::from_secs(2), rxs.get_mut(&1).unwrap().recv())

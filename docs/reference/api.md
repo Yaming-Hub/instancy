@@ -28,7 +28,7 @@ Key methods:
 - `pub fn health_tx(&self) -> tokio::sync::broadcast::Sender<RuntimeEvent>` — clone the health-event sender for shared transport components.
 - `pub fn spawn<T: Timestamp>(&self, dataflow: LogicalDataflow<T>, options: SpawnOptions) -> Result<SpawnedDataflow<T>>` — run one logical dataflow.
 - `pub fn spawn_multi<T, F>(&self, name: &str, num_workers: usize, build: F, options: SpawnOptions) -> Result<MultiSpawnedDataflow<T>> where F: Fn(&mut DataflowBuilder<T>) -> Result<()>` — build and run N replicated workers.
-- `#[cfg(feature = "transport")] pub fn spawn_cluster<T, F, R, W>(&self, name: &str, topology: ClusterTopology, local_node_id: &str, dataflow_id: DataflowId, transport_config: ClusterSpawnTransport<R, W>, handshake_timeout: Duration, build: F, runtime_handle: &tokio::runtime::Handle, options: SpawnOptions) -> Result<ClusterSpawnedDataflow<T>> where T: Timestamp + ExchangeData, F: Fn(&mut DataflowBuilder<T>) -> Result<()>, R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'static` — run a distributed dataflow across nodes.
+- `#[cfg(feature = "transport")] pub fn spawn_cluster<T, F, R, W>(&self, name: &str, topology: ClusterTopology, local_node_id: &str, dataflow_id: DataflowId, transport_config: ClusterSpawnTransport<R, W>, handshake_timeout: Duration, build: F, runtime_handle: &tokio::runtime::Handle, options: SpawnOptions) -> Result<ClusterSpawnedDataflow<T>> where T: Timestamp + ExchangeData, F: Fn(&mut DataflowBuilder<T>) -> Result<()>, R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'static` — run a distributed dataflow across nodes. Every node of one run passes the same `dataflow_id`; it identifies that run, so a retry uses a fresh `DataflowId::new()` (Shared mode rejects an id that already ran with a peer).
 - `#[cfg(feature = "transport")] pub fn report_node_leave(&self, node_id: &str) -> usize` — cancel dataflows that depend on a departed peer.
 - `#[cfg(feature = "transport")] pub fn report_node_join(&self, node_id: &str) -> bool` — clear the departed-peer flag for future cluster spawns.
 
@@ -630,9 +630,14 @@ Feature-gated shared-transport manager at `instancy::communication::SharedPeerMa
 Key methods:
 
 - `pub fn new(peer_node_id: String, config: SharedConnectionConfig, connection_factory: Arc<dyn DynConnectionFactory>, runtime_handle: &tokio::runtime::Handle, health_tx: broadcast::Sender<RuntimeEvent>) -> Result<Self>`
-- `pub async fn register_dataflow(&self, dataflow_id: DataflowId, channel_ids: &[u64], channel_capacity: usize) -> Result<(HashMap<u64, tokio::sync::mpsc::Receiver<Vec<u8>>>, tokio::sync::mpsc::Receiver<TransportError>), TransportError>` — fails with `TransportError::InvalidRegistration` for a zero capacity, a duplicate or probe channel id, or a dataflow id that is already registered
-- `pub async fn unregister_dataflow(&self, dataflow_id: &DataflowId)`
+- `pub async fn register_dataflow(&self, dataflow_id: DataflowId, channel_ids: &[u64], channel_capacity: usize) -> Result<(HashMap<u64, tokio::sync::mpsc::Receiver<Vec<u8>>>, tokio::sync::mpsc::Receiver<PeerIoNotice>), TransportError>` — fills the pool first (`SharedConnectionConfig::connections`, each connection bounded by `connect_timeout`) and pins the dataflow's lane to one pooled connection; fails with `TransportError::InvalidRegistration` for a zero capacity, a duplicate or probe channel id, or a dataflow id that is already registered or already ran with this peer (a `DataflowId` identifies one run: a retry needs a fresh id), and with `TransportError::Io` if the pool cannot be filled. The second receiver reports the dataflow's connection events (`PeerIoEvent`: a pooled connection it uses failed, a frame from the peer was out of sequence, or one of its frames was rejected).
+- `pub fn dataflow_sender(&self, dataflow_id: &DataflowId) -> Option<DataframeSender>` — sends the dataflow's payload frames (data and progress); bound to its current registration, so frames sent after it unregisters are dropped
+- `pub async fn unregister_dataflow(&self, dataflow_id: &DataflowId)` — drops the dataflow's payload frames still queued
 - `pub fn peer_node_id(&self) -> &str`
+- `pub fn connection_count(&self) -> usize`
+- `pub fn metrics_snapshot(&self) -> Vec<ConnectionSnapshot>` — per pooled connection: RTT, queued frames, pinned lanes, bytes and frames written
+
+`SharedConnectionConfig { connections, connect_timeout, probe_interval, rtt_ema_alpha }` configures a fixed pool (default one connection per peer). Shared mode is fail-stop: see the "Transport Contract" and "Connection Failures" sections of [Distributed Execution](../guide/distributed.md).
 
 See also: [Distributed Execution](../guide/distributed.md).
 

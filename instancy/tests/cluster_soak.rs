@@ -53,21 +53,10 @@ enum Shape {
     Pipeline,
 }
 
-/// The default shared configuration (probing every 100 ms) with a fixed pool
-/// of two connections. The test pool is pre-established, so it cannot scale
-/// beyond what it was given.
-///
-/// The reorder timeout is raised from the default 50 ms: with two or more
-/// pooled connections, a starved reader (one CPU core, a loaded CI runner)
-/// times out on a gap that is still in flight on the other connection, and
-/// every node fails with `reorder buffer gap timeout` (audit T5/H7, owned by
-/// PR9; see `pooled_soak_with_the_default_reorder_timeout`). These soaks look
-/// for false failures of the cluster lifecycle, not of the reorder buffer.
+/// The default shared configuration with a pool of two connections.
 fn pooled_config() -> SharedConnectionConfig {
     SharedConnectionConfig {
-        min_connections: 2,
-        max_connections: 2,
-        reorder_timeout: Duration::from_secs(20),
+        connections: 2,
         ..SharedConnectionConfig::default()
     }
 }
@@ -342,18 +331,18 @@ async fn healthy_soak_every_mode_and_size() {
     healthy_soak(&MODES, pooled_config()).await;
 }
 
-/// Reproduces audit T5/H7 for PR9: the pooled soak with the *default* 50 ms
-/// reorder timeout on a starved machine. The shared readers time out on a gap
-/// that is still in flight on the other pooled connection, and healthy
-/// dataflows fail with `reorder buffer gap timeout`. Run it pinned to one
-/// core (`start /affinity 1 <test exe> --ignored ...` on Windows,
-/// `taskset -c 0 ...` on Linux): 2 of 3 such runs failed when it was added.
+/// Regression for audit T5/H7: the pooled soak with the default shared
+/// configuration. A reader used to time out (after 50 ms) on a sequence gap
+/// that was still in flight on the other pooled connection, failing healthy
+/// dataflows with `reorder buffer gap timeout`, mostly on a starved machine
+/// (2 of 3 runs pinned to one core). A dataflow's frames now travel on one
+/// connection and nothing times out. To starve it, run it pinned to one core
+/// (`start /affinity 1 <test exe> ...` on Windows, `taskset -c 0 ...` on
+/// Linux).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "H7/T5 spurious ReorderTimeout under CPU starvation; PR9"]
-async fn pooled_soak_with_the_default_reorder_timeout() {
+async fn pooled_soak_with_the_default_config() {
     let config = SharedConnectionConfig {
-        min_connections: 2,
-        max_connections: 2,
+        connections: 2,
         ..SharedConnectionConfig::default()
     };
     healthy_soak(&[Mode::SharedPooled], config).await;

@@ -9,25 +9,25 @@
 //! Each frame on the wire has the following layout:
 //!
 //! ```text
-//! ┌─────────────────┬────────────────┬────────────┬───────────────┬────────────────────┬────────────────┐
-//! │ dataflow_id:UUID│ channel_id: u64│ length: u32│ header_crc?:u32│ payload: [u8; ...] │ frame_crc?: u32│
-//! └─────────────────┴────────────────┴────────────┴───────────────┴────────────────────┴────────────────┘
+//! ┌─────────────────┬────────────────┬────────────┬────────────────┬────────────────────┬────────────────┐
+//! │ dataflow_id:UUID│ channel_id: u64│ length: u32│ header_crc: u32│ payload: [u8; ...] │ frame_crc: u32 │
+//! └─────────────────┴────────────────┴────────────┴────────────────┴────────────────────┴────────────────┘
 //! ```
 //!
 //! - `dataflow_id` (16 bytes, UUID): identifies the dataflow
 //! - `channel_id` (8 bytes, little-endian): identifies the logical channel
-//! - `length` (4 bytes, little-endian): byte length of payload + optional `frame_crc`
-//! - `header_crc` (4 bytes, little-endian, **optional**): CRC32 of the 28 header
+//! - `length` (4 bytes, little-endian): byte length of payload + `frame_crc`
+//! - `header_crc` (4 bytes, little-endian): CRC32 of the 28 header
 //!   bytes, verified before the payload is read so a corrupted `length`,
 //!   `channel_id` or `dataflow_id` is rejected instead of misrouting the frame
 //!   or desynchronising the stream.
 //! - `payload` (variable): serialized message data
-//! - `frame_crc` (4 bytes, little-endian, **optional**): CRC32 of the header
-//!   followed by the payload.
+//! - `frame_crc` (4 bytes, little-endian): CRC32 of the header followed by
+//!   the payload.
 //!
-//! The two checksums are present only when CRC is enabled via
-//! [`FramedWriter::with_crc`] / [`FramedReader::with_crc`]. Both sides must
-//! agree on the CRC setting.
+//! Every frame carries both checksums (cluster protocol version 6 onwards):
+//! a corrupted frame is rejected with [`TransportError::ChecksumMismatch`]
+//! instead of being delivered.
 //!
 //! # Components
 //!
@@ -39,8 +39,10 @@
 
 use std::io;
 
+#[cfg(any(test, feature = "transport"))]
 use crate::communication::codec::MAX_MESSAGE_SIZE;
 use crate::dataflow::id::DataflowId;
+#[cfg(feature = "transport")]
 use crate::wire;
 
 /// A single frame in the wire protocol.
@@ -58,6 +60,7 @@ pub struct Frame {
 }
 
 /// Header size: 16 (dataflow_id UUID) + 8 (channel_id) + 4 (length) = 28 bytes.
+#[cfg(feature = "transport")]
 const HEADER_SIZE: usize = 28;
 
 /// Size of each optional CRC32 field (header checksum and frame checksum).
@@ -105,13 +108,24 @@ pub enum TransportError {
     #[error("muxer shut down")]
     MuxerShutdown,
 
-    /// A reorder buffer gap exceeded the configured timeout.
-    ///
-    /// This indicates that one or more sequenced frames were lost in transit
-    /// (e.g., due to a connection failure mid-write). The affected dataflow
-    /// cannot continue receiving ordered data from this peer.
-    #[error("reorder buffer gap timeout")]
-    ReorderTimeout,
+    /// A frame of a sequenced lane (Shared mode) did not carry the next
+    /// sequence number: frames were lost or duplicated in transit. The
+    /// dataflow cannot trust what it receives from this peer.
+    #[error(
+        "frame {received} of a sequenced lane arrived where {expected} was expected: frames were lost or duplicated"
+    )]
+    OutOfSequence {
+        /// The sequence number the receiver expected.
+        expected: u64,
+        /// The sequence number the frame carried.
+        received: u64,
+    },
+
+    /// A sequenced lane (Shared mode) broke its contract: its frames arrived
+    /// on two connections (their order is lost), or a frame was addressed to
+    /// a channel the dataflow never registered.
+    #[error("sequenced lane violated: {detail}")]
+    LaneViolation { detail: String },
 
     /// CRC32 checksum mismatch — the frame payload was corrupted in transit.
     ///
@@ -143,6 +157,46 @@ pub enum TransportError {
     ReservedChannel { channel_id: u64 },
 }
 
+#[cfg(feature = "transport")]
+impl TransportError {
+    /// A copy of this error, for reporting one failure to several dataflows
+    /// (an I/O error keeps its kind and message).
+    pub(crate) fn duplicate(&self) -> Self {
+        match self {
+            Self::Io(e) => Self::Io(io::Error::new(e.kind(), e.to_string())),
+            Self::PayloadTooLarge { size, max } => Self::PayloadTooLarge {
+                size: *size,
+                max: *max,
+            },
+            Self::ConnectionClosed => Self::ConnectionClosed,
+            Self::ChannelDropped { channel_id } => Self::ChannelDropped {
+                channel_id: *channel_id,
+            },
+            Self::MuxerShutdown => Self::MuxerShutdown,
+            Self::OutOfSequence { expected, received } => Self::OutOfSequence {
+                expected: *expected,
+                received: *received,
+            },
+            Self::LaneViolation { detail } => Self::LaneViolation {
+                detail: detail.clone(),
+            },
+            Self::ChecksumMismatch { expected, actual } => Self::ChecksumMismatch {
+                expected: *expected,
+                actual: *actual,
+            },
+            Self::LockPoisoned { detail } => Self::LockPoisoned {
+                detail: detail.clone(),
+            },
+            Self::InvalidRegistration { reason } => Self::InvalidRegistration {
+                reason: reason.clone(),
+            },
+            Self::ReservedChannel { channel_id } => Self::ReservedChannel {
+                channel_id: *channel_id,
+            },
+        }
+    }
+}
+
 // ─── Feature-gated implementations using tokio ───────────────────────────────
 
 #[cfg(feature = "transport")]
@@ -155,35 +209,18 @@ mod tokio_impl {
     /// Writes [`Frame`]s to an `AsyncWrite` stream.
     ///
     /// Frames are written with the wire header (dataflow_id + channel_id +
-    /// length) followed by the payload. When CRC is enabled, a CRC32 of the
-    /// header follows the header and a CRC32 of header + payload follows the
+    /// length), a CRC32 of the header, the payload, and a CRC32 of header +
     /// payload (see the [module documentation](super) for the layout).
     ///
     /// Writes are flushed after each frame for low latency.
     pub struct FramedWriter<W> {
         writer: W,
-        crc_enabled: bool,
     }
 
     impl<W: AsyncWrite + Unpin> FramedWriter<W> {
         /// Create a new framed writer wrapping the given stream.
         pub fn new(writer: W) -> Self {
-            Self {
-                writer,
-                crc_enabled: false,
-            }
-        }
-
-        /// Create a new framed writer with CRC32 checksums enabled.
-        ///
-        /// When enabled, each frame carries a header checksum and a frame
-        /// checksum covering header and payload. The reader must also have CRC
-        /// enabled to verify and strip them.
-        pub fn with_crc(writer: W) -> Self {
-            Self {
-                writer,
-                crc_enabled: true,
-            }
+            Self { writer }
         }
 
         /// Write a single frame to the stream.
@@ -207,27 +244,18 @@ mod tokio_impl {
 
         /// Write one frame (already size-checked) without flushing.
         async fn write_unflushed(&mut self, frame: &Frame) -> Result<(), TransportError> {
-            let len = frame.payload.len();
-            // Wire length includes the frame CRC trailer when enabled.
-            let wire_len = if self.crc_enabled {
-                len + CRC_SIZE
-            } else {
-                len
-            };
+            // The wire length includes the frame CRC trailer.
+            let wire_len = frame.payload.len() + CRC_SIZE;
             let header = encode_header(frame, wire_len as u32);
 
             self.writer.write_all(&header).await?;
-            if self.crc_enabled {
-                self.writer
-                    .write_all(&crc32fast::hash(&header).to_le_bytes())
-                    .await?;
-            }
+            self.writer
+                .write_all(&crc32fast::hash(&header).to_le_bytes())
+                .await?;
             self.writer.write_all(&frame.payload).await?;
-            if self.crc_enabled {
-                self.writer
-                    .write_all(&frame_crc(&header, &frame.payload).to_le_bytes())
-                    .await?;
-            }
+            self.writer
+                .write_all(&frame_crc(&header, &frame.payload).to_le_bytes())
+                .await?;
             Ok(())
         }
 
@@ -263,13 +291,15 @@ mod tokio_impl {
 
     /// Reads [`Frame`]s from an `AsyncRead` stream.
     ///
-    /// Reads the wire header to determine payload size, then reads the full payload.
-    /// When CRC is enabled, the header checksum is verified before the payload
-    /// is read, and the trailing frame checksum is verified against header and
-    /// payload.
+    /// Reads the wire header to determine payload size, then reads the full
+    /// payload. The header checksum is verified before the payload is read,
+    /// and the trailing frame checksum is verified against header and payload;
+    /// both are stripped from the returned frame.
     pub struct FramedReader<R> {
         reader: R,
-        crc_enabled: bool,
+        /// The dataflow of the frame being read, once its header checksum
+        /// was verified (see [`Self::verified_dataflow`]).
+        verified_dataflow: Option<DataflowId>,
     }
 
     impl<R: AsyncRead + Unpin> FramedReader<R> {
@@ -277,20 +307,17 @@ mod tokio_impl {
         pub fn new(reader: R) -> Self {
             Self {
                 reader,
-                crc_enabled: false,
+                verified_dataflow: None,
             }
         }
 
-        /// Create a new framed reader with CRC32 verification enabled.
-        ///
-        /// When enabled, each frame is expected to carry the header and frame
-        /// checksums written by [`FramedWriter::with_crc`]. The reader verifies
-        /// both and strips them before returning the frame.
-        pub fn with_crc(reader: R) -> Self {
-            Self {
-                reader,
-                crc_enabled: true,
-            }
+        /// The dataflow of the last frame [`Self::read_frame`] read or failed
+        /// to read, if its header checksum was verified: a frame whose
+        /// payload fails its checksum, or that announces a payload over the
+        /// limit, belongs to that dataflow. `None` if the header itself
+        /// could not be read or verified.
+        pub fn verified_dataflow(&self) -> Option<DataflowId> {
+            self.verified_dataflow
         }
 
         /// Read a single frame from the stream.
@@ -299,9 +326,10 @@ mod tokio_impl {
         ///
         /// - [`TransportError::ConnectionClosed`] if EOF is reached cleanly at a frame boundary
         /// - [`TransportError::PayloadTooLarge`] if the declared length exceeds max
-        /// - [`TransportError::ChecksumMismatch`] if CRC is enabled and verification fails
+        /// - [`TransportError::ChecksumMismatch`] if a checksum does not match
         /// - [`TransportError::Io`] on read failure (including unexpected EOF mid-frame)
         pub async fn read_frame(&mut self) -> Result<Frame, TransportError> {
+            self.verified_dataflow = None;
             // Read header byte-by-byte to distinguish clean EOF from mid-header disconnect.
             // A clean close is when we get 0 bytes before reading any header data.
             // A partial header read indicates a protocol error or peer crash.
@@ -338,24 +366,23 @@ mod tokio_impl {
             // Verify the header before trusting `length`: a corrupted length
             // would otherwise make the reader consume the wrong number of bytes
             // (or wait for bytes that never arrive).
-            if self.crc_enabled {
-                let mut crc_bytes = [0u8; CRC_SIZE];
-                self.reader.read_exact(&mut crc_bytes).await.map_err(|e| {
-                    if e.kind() == io::ErrorKind::UnexpectedEof {
-                        TransportError::Io(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "connection closed mid-header",
-                        ))
-                    } else {
-                        TransportError::Io(e)
-                    }
-                })?;
-                let expected = u32::from_le_bytes(crc_bytes);
-                let actual = crc32fast::hash(&header);
-                if actual != expected {
-                    return Err(TransportError::ChecksumMismatch { expected, actual });
+            let mut crc_bytes = [0u8; CRC_SIZE];
+            self.reader.read_exact(&mut crc_bytes).await.map_err(|e| {
+                if e.kind() == io::ErrorKind::UnexpectedEof {
+                    TransportError::Io(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "connection closed mid-header",
+                    ))
+                } else {
+                    TransportError::Io(e)
                 }
+            })?;
+            let expected = u32::from_le_bytes(crc_bytes);
+            let actual = crc32fast::hash(&header);
+            if actual != expected {
+                return Err(TransportError::ChecksumMismatch { expected, actual });
             }
+            self.verified_dataflow = Some(dataflow_id);
 
             if wire_length > MAX_MESSAGE_SIZE + CRC_SIZE {
                 return Err(TransportError::PayloadTooLarge {
@@ -364,7 +391,7 @@ mod tokio_impl {
                 });
             }
 
-            // Read the full wire payload (includes CRC trailer when enabled)
+            // Read the full wire payload (includes the CRC trailer)
             let mut wire_data = vec![0u8; wire_length];
             self.reader.read_exact(&mut wire_data).await.map_err(|e| {
                 if e.kind() == io::ErrorKind::UnexpectedEof {
@@ -377,29 +404,25 @@ mod tokio_impl {
                 }
             })?;
 
-            let payload = if self.crc_enabled {
-                if wire_length < CRC_SIZE {
-                    return Err(TransportError::Io(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "frame too short for CRC32 trailer",
-                    )));
-                }
-                let payload_len = wire_length - CRC_SIZE;
-                let expected = u32::from_le_bytes([
-                    wire_data[payload_len],
-                    wire_data[payload_len + 1],
-                    wire_data[payload_len + 2],
-                    wire_data[payload_len + 3],
-                ]);
-                let actual = frame_crc(&header, &wire_data[..payload_len]);
-                if actual != expected {
-                    return Err(TransportError::ChecksumMismatch { expected, actual });
-                }
-                wire_data.truncate(payload_len);
-                wire_data
-            } else {
-                wire_data
-            };
+            if wire_length < CRC_SIZE {
+                return Err(TransportError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "frame too short for CRC32 trailer",
+                )));
+            }
+            let payload_len = wire_length - CRC_SIZE;
+            let expected = u32::from_le_bytes([
+                wire_data[payload_len],
+                wire_data[payload_len + 1],
+                wire_data[payload_len + 2],
+                wire_data[payload_len + 3],
+            ]);
+            let actual = frame_crc(&header, &wire_data[..payload_len]);
+            if actual != expected {
+                return Err(TransportError::ChecksumMismatch { expected, actual });
+            }
+            wire_data.truncate(payload_len);
+            let payload = wire_data;
 
             Ok(Frame {
                 dataflow_id,
@@ -693,14 +716,24 @@ mod tokio_impl {
         ///
         /// The sender can be cloned and shared across tasks. Each clone can
         /// submit frames for any channel_id.
-        pub fn new(writer: W, config: MuxConfig) -> (Self, MuxerSender) {
+        ///
+        /// # Errors
+        ///
+        /// [`TransportError::InvalidRegistration`] if
+        /// [`MuxConfig::buffer_size`] is 0.
+        pub fn new(writer: W, config: MuxConfig) -> Result<(Self, MuxerSender), TransportError> {
+            if config.buffer_size == 0 {
+                return Err(TransportError::InvalidRegistration {
+                    reason: "MuxConfig::buffer_size must be at least 1".into(),
+                });
+            }
             let (tx, rx) = mpsc::channel(config.buffer_size);
             let muxer = Self {
                 writer: FramedWriter::new(writer),
                 receiver: rx,
             };
             let sender = MuxerSender { sender: tx };
-            (muxer, sender)
+            Ok((muxer, sender))
         }
 
         /// Run the muxer, writing frames until all senders are dropped or an error occurs.
@@ -1129,7 +1162,7 @@ mod transport_tests {
         let mut reader = FramedReader::new(server);
 
         let config = MuxConfig { buffer_size: 16 };
-        let (muxer, sender) = Muxer::new(client, config);
+        let (muxer, sender) = Muxer::new(client, config).unwrap();
 
         let muxer_handle = tokio::spawn(async move { muxer.run().await });
 
@@ -1160,7 +1193,7 @@ mod transport_tests {
         let mut reader = FramedReader::new(server);
 
         let config = MuxConfig { buffer_size: 64 };
-        let (muxer, sender) = Muxer::new(client, config);
+        let (muxer, sender) = Muxer::new(client, config).unwrap();
 
         let muxer_handle = tokio::spawn(async move { muxer.run_batched().await });
 
@@ -1191,7 +1224,7 @@ mod transport_tests {
         let mut reader = FramedReader::new(server);
 
         let config = MuxConfig::default();
-        let (muxer, sender) = Muxer::new(client, config);
+        let (muxer, sender) = Muxer::new(client, config).unwrap();
         let sender2 = sender.clone();
 
         let muxer_handle = tokio::spawn(async move { muxer.run().await });
@@ -1217,12 +1250,22 @@ mod transport_tests {
         assert_eq!(ids, vec![1, 2]);
     }
 
+    /// A zero-capacity queue used to panic inside `mpsc::channel(0)`.
+    #[tokio::test]
+    async fn muxer_rejects_zero_buffer() {
+        let (client, _server) = duplex(64);
+        assert!(matches!(
+            Muxer::new(client, MuxConfig { buffer_size: 0 }),
+            Err(TransportError::InvalidRegistration { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn muxer_send_after_shutdown() {
         let (client, _server) = duplex(8192);
 
         let config = MuxConfig { buffer_size: 4 };
-        let (muxer, sender) = Muxer::new(client, config);
+        let (muxer, sender) = Muxer::new(client, config).unwrap();
 
         // Drop muxer immediately (simulates shutdown)
         drop(muxer);
@@ -1242,7 +1285,7 @@ mod transport_tests {
 
         // Peer A: muxer on a_write, demuxer on a_read
         let mux_config = MuxConfig { buffer_size: 32 };
-        let (muxer_a, sender_a) = Muxer::new(a_write, mux_config.clone());
+        let (muxer_a, sender_a) = Muxer::new(a_write, mux_config.clone()).unwrap();
         let demux_config = DemuxConfig { channel_buffer: 32 };
         let mut demuxer_a = Demuxer::new(a_read, demux_config.clone());
         let mut rx_a = demuxer_a
@@ -1250,7 +1293,7 @@ mod transport_tests {
             .unwrap();
 
         // Peer B: muxer on b_write, demuxer on b_read
-        let (muxer_b, sender_b) = Muxer::new(b_write, mux_config);
+        let (muxer_b, sender_b) = Muxer::new(b_write, mux_config).unwrap();
         let mut demuxer_b = Demuxer::new(b_read, demux_config);
         let mut rx_b = demuxer_b
             .register_channel(DataflowId::from_bytes([1u8; 16]), 200)
@@ -1380,11 +1423,11 @@ mod transport_tests {
 
             let frame_clone = frame.clone();
             let write_handle = tokio::spawn(async move {
-                let mut writer = FramedWriter::with_crc(client);
+                let mut writer = FramedWriter::new(client);
                 writer.write_frame(&frame_clone).await.unwrap();
             });
 
-            let mut reader = FramedReader::with_crc(server);
+            let mut reader = FramedReader::new(server);
             let received = reader.read_frame().await.unwrap();
 
             assert_eq!(received.channel_id, frame.channel_id);
@@ -1414,7 +1457,7 @@ mod transport_tests {
             wire[HEADER_SIZE + CRC_SIZE] ^= 0xFF;
 
             let cursor = std::io::Cursor::new(wire);
-            let mut reader = FramedReader::with_crc(cursor);
+            let mut reader = FramedReader::new(cursor);
             let result = reader.read_frame().await;
 
             match result {
@@ -1434,7 +1477,7 @@ mod transport_tests {
                 payload: b"payload".to_vec(),
             };
             let mut wire = Vec::new();
-            FramedWriter::with_crc(&mut wire)
+            FramedWriter::new(&mut wire)
                 .write_frame(&frame)
                 .await
                 .unwrap();
@@ -1442,7 +1485,7 @@ mod transport_tests {
                 for bit in 0..8 {
                     let mut corrupted = wire.clone();
                     corrupted[byte] ^= 1 << bit;
-                    let result = FramedReader::with_crc(&corrupted[..]).read_frame().await;
+                    let result = FramedReader::new(&corrupted[..]).read_frame().await;
                     assert!(
                         matches!(result, Err(TransportError::ChecksumMismatch { .. })),
                         "bit {bit} of byte {byte}: {result:?}"
@@ -1466,11 +1509,11 @@ mod transport_tests {
 
             let frames_clone = frames.clone();
             let write_handle = tokio::spawn(async move {
-                let mut writer = FramedWriter::with_crc(client);
+                let mut writer = FramedWriter::new(client);
                 writer.write_frames(&frames_clone).await.unwrap();
             });
 
-            let mut reader = FramedReader::with_crc(server);
+            let mut reader = FramedReader::new(server);
             for expected in &frames {
                 let received = reader.read_frame().await.unwrap();
                 assert_eq!(received, *expected);
@@ -1479,27 +1522,65 @@ mod transport_tests {
             write_handle.await.unwrap();
         }
 
+        /// After a payload checksum failure the reader still knows (from the
+        /// verified header) whose frame it was; after a header failure it
+        /// does not.
         #[tokio::test]
-        async fn no_crc_is_default() {
-            let (client, server) = tokio::io::duplex(65536);
+        async fn reader_reports_the_dataflow_of_a_frame_that_failed_after_its_header() {
+            let df = DataflowId::new();
+            let frame = Frame {
+                dataflow_id: df,
+                channel_id: 3,
+                payload: b"payload".to_vec(),
+            };
+            let mut wire = Vec::new();
+            FramedWriter::new(&mut wire)
+                .write_frame(&frame)
+                .await
+                .unwrap();
 
+            let mut payload_flip = wire.clone();
+            payload_flip[HEADER_SIZE + CRC_SIZE] ^= 0x01;
+            let mut reader = FramedReader::new(&payload_flip[..]);
+            assert!(reader.read_frame().await.is_err());
+            assert_eq!(reader.verified_dataflow(), Some(df));
+
+            let mut header_flip = wire.clone();
+            header_flip[20] ^= 0x01;
+            let mut reader = FramedReader::new(&header_flip[..]);
+            assert!(reader.read_frame().await.is_err());
+            assert_eq!(reader.verified_dataflow(), None);
+        }
+        /// Checksums are not optional: every frame carries both of them.
+        #[tokio::test]
+        async fn every_frame_carries_both_checksums() {
             let frame = Frame {
                 dataflow_id: DataflowId::new(),
                 channel_id: 1,
-                payload: b"no crc".to_vec(),
+                payload: b"checked".to_vec(),
             };
-
-            let frame_clone = frame.clone();
-            let write_handle = tokio::spawn(async move {
-                let mut writer = FramedWriter::new(client);
-                writer.write_frame(&frame_clone).await.unwrap();
-            });
-
-            let mut reader = FramedReader::new(server);
-            let received = reader.read_frame().await.unwrap();
-            assert_eq!(received, frame);
-
-            write_handle.await.unwrap();
+            let mut wire = Vec::new();
+            FramedWriter::new(&mut wire)
+                .write_frame(&frame)
+                .await
+                .unwrap();
+            assert_eq!(
+                wire.len(),
+                HEADER_SIZE + CRC_SIZE + frame.payload.len() + CRC_SIZE
+            );
+            let header: [u8; HEADER_SIZE] = wire[..HEADER_SIZE].try_into().unwrap();
+            assert_eq!(
+                wire[HEADER_SIZE..HEADER_SIZE + CRC_SIZE],
+                crc32fast::hash(&header).to_le_bytes()
+            );
+            assert_eq!(
+                wire[wire.len() - CRC_SIZE..],
+                frame_crc(&header, &frame.payload).to_le_bytes()
+            );
+            assert_eq!(
+                FramedReader::new(&wire[..]).read_frame().await.unwrap(),
+                frame
+            );
         }
     }
 }

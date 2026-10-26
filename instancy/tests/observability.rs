@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use instancy::metrics::{
-    DataflowMetrics, DataflowResult, OperatorMetricsCollector,
+    DataflowMetrics, DataflowResult,
     activation::ActivationGuard,
     tracing_integration::{self, TracingConfig},
 };
@@ -268,7 +268,10 @@ mod tracing_tests {
     #[test]
     fn trace_operator_activation() {
         let logs = with_captured_logs(|| {
-            let collector = Arc::new(OperatorMetricsCollector::new("traced_op", 0));
+            let collector = Arc::new(instancy::metrics::OperatorMetricsCollector::new(
+                "traced_op",
+                0,
+            ));
             let guard = ActivationGuard::new(collector.clone());
             guard.finish(42);
         });

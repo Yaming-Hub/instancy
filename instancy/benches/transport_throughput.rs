@@ -41,16 +41,10 @@ fn make_frame(dataflow_id: DataflowId, payload: &[u8]) -> Frame {
 
 fn shared_config(num_connections: usize) -> SharedConnectionConfig {
     SharedConnectionConfig {
-        min_connections: num_connections,
-        max_connections: num_connections,
+        connections: num_connections,
         probe_interval: Duration::from_secs(3600), // disable probing during bench
-        rtt_scale_up_threshold: Duration::from_secs(3600),
-        rtt_scale_down_threshold: Duration::from_secs(3600),
-        cooldown_period: Duration::from_secs(3600),
-        reorder_timeout: Duration::from_secs(60),
         rtt_ema_alpha: 0.2,
-        idle_timeout: None, // disable idle cleanup during bench
-        enable_frame_crc: false,
+        ..SharedConnectionConfig::default()
     }
 }
 
@@ -276,7 +270,7 @@ fn bench_shared_single_dataflow(c: &mut Criterion) {
                         .unwrap();
 
                     let mut data_rx = receivers.remove(&CHANNEL_ID).unwrap();
-                    let payload_tx = manager.payload_sender().clone();
+                    let payload_tx = manager.dataflow_sender(&dataflow_id).unwrap();
 
                     let payload = make_payload(PAYLOAD_SIZE);
 
@@ -284,7 +278,7 @@ fn bench_shared_single_dataflow(c: &mut Criterion) {
                     let send_task = tokio::spawn(async move {
                         for _ in 0..count {
                             let frame = make_frame(dataflow_id, &payload);
-                            payload_tx.send((dataflow_id, frame)).await.unwrap();
+                            payload_tx.send(frame).await.unwrap();
                         }
                     });
 
@@ -519,13 +513,13 @@ fn bench_shared_multi_dataflow(c: &mut Criterion) {
                             .await
                             .unwrap();
                         let mut data_rx = receivers.remove(&CHANNEL_ID).unwrap();
-                        let payload_tx = manager.payload_sender().clone();
+                        let payload_tx = manager.dataflow_sender(&dataflow_id).unwrap();
                         let payload = make_payload(PAYLOAD_SIZE);
 
                         send_tasks.push(tokio::spawn(async move {
                             for _ in 0..msgs_per_df {
                                 let frame = make_frame(dataflow_id, &payload);
-                                payload_tx.send((dataflow_id, frame)).await.unwrap();
+                                payload_tx.send(frame).await.unwrap();
                             }
                         }));
 
@@ -631,13 +625,13 @@ fn bench_shared_scaling_connections(c: &mut Criterion) {
                         .await
                         .unwrap();
                     let mut data_rx = receivers.remove(&CHANNEL_ID).unwrap();
-                    let payload_tx = manager.payload_sender().clone();
+                    let payload_tx = manager.dataflow_sender(&dataflow_id).unwrap();
                     let payload = make_payload(PAYLOAD_SIZE);
 
                     let send_task = tokio::spawn(async move {
                         for _ in 0..msg_count {
                             let frame = make_frame(dataflow_id, &payload);
-                            payload_tx.send((dataflow_id, frame)).await.unwrap();
+                            payload_tx.send(frame).await.unwrap();
                         }
                     });
 

@@ -330,14 +330,25 @@ impl<M: ConnectionManager> ConnectionPool<M> {
                     local_id: self.local_id,
                     request_id,
                 };
-                match self.manager.establish(request).await {
-                    Ok(c) => {
+                let established = tokio::time::timeout(
+                    self.config.connect_timeout,
+                    self.manager.establish(request),
+                )
+                .await;
+                match established {
+                    Ok(Ok(c)) => {
                         reservation.commit();
                         c
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         // reservation drops here and rolls back counters
                         return Err(PoolError::ConnectionFailed(e));
+                    }
+                    Err(_) => {
+                        return Err(PoolError::ConnectTimeout {
+                            peer_id,
+                            timeout: self.config.connect_timeout,
+                        });
                     }
                 }
             }
@@ -512,6 +523,14 @@ pub enum PoolError<E: fmt::Debug + fmt::Display> {
     },
     /// Failed to establish a new connection.
     ConnectionFailed(E),
+    /// Establishing a new connection took longer than
+    /// [`PoolConfig::connect_timeout`].
+    ConnectTimeout {
+        /// The peer that could not be reached in time.
+        peer_id: PeerId,
+        /// The configured timeout.
+        timeout: Duration,
+    },
 }
 
 impl<E: fmt::Debug + fmt::Display> fmt::Display for PoolError<E> {
@@ -521,6 +540,9 @@ impl<E: fmt::Debug + fmt::Display> fmt::Display for PoolError<E> {
                 write!(f, "connection pool at capacity for {peer_id} (max: {max})")
             }
             Self::ConnectionFailed(e) => write!(f, "connection failed: {e}"),
+            Self::ConnectTimeout { peer_id, timeout } => {
+                write!(f, "connecting to {peer_id} took longer than {timeout:?}")
+            }
         }
     }
 }
@@ -649,6 +671,46 @@ mod tests {
     }
 
     // --- PoolConfig validation tests ---
+
+    /// `connect_timeout` bounds `acquire`: a peer that never answers fails
+    /// the call, and its slot is released.
+    #[tokio::test(start_paused = true)]
+    async fn acquire_gives_up_at_the_connect_timeout() {
+        struct Hanging;
+        impl ConnectionManager for Hanging {
+            type Connection = ();
+            type Error = MockError;
+            async fn establish(&self, _request: ConnectionRequest) -> Result<(), MockError> {
+                std::future::pending().await
+            }
+            async fn is_healthy(&self, _conn: &()) -> bool {
+                true
+            }
+        }
+        let pool = ConnectionPool::new(
+            Hanging,
+            PoolConfig {
+                max_connections_per_peer: 1,
+                connect_timeout: Duration::from_millis(50),
+                ..PoolConfig::default()
+            },
+            PeerId(0),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let result = pool.acquire(PeerId(1)).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(PoolError::ConnectTimeout {
+                        peer_id: PeerId(1),
+                        ..
+                    })
+                ),
+                "the slot must be released for the next attempt"
+            );
+        }
+    }
 
     #[test]
     fn pool_config_default_is_valid() {

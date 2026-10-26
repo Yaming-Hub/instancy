@@ -1581,16 +1581,10 @@ impl ConnectionFactory for PreEstablished {
 
 fn peer_manager(peer: &str, halves: Halves) -> Arc<HashMap<String, SharedPeerManager>> {
     let config = SharedConnectionConfig {
-        min_connections: 1,
-        max_connections: 1,
+        connections: 1,
         probe_interval: Duration::from_secs(3600),
-        rtt_scale_up_threshold: Duration::from_secs(3600),
-        rtt_scale_down_threshold: Duration::from_secs(3600),
-        cooldown_period: Duration::from_secs(3600),
-        reorder_timeout: Duration::from_secs(10),
         rtt_ema_alpha: 0.2,
-        idle_timeout: None,
-        enable_frame_crc: false,
+        ..SharedConnectionConfig::default()
     };
     let factory: Arc<dyn DynConnectionFactory> =
         Arc::new(PreEstablished(Mutex::new(VecDeque::from([halves]))));

@@ -638,9 +638,7 @@ mod tests {
 
         let handle = tokio::runtime::Handle::current();
         let config = SharedConnectionConfig {
-            max_connections: 1,
             probe_interval: Duration::from_secs(3600),
-            idle_timeout: None,
             ..Default::default()
         };
         let manager = |peer: &str, stream| {

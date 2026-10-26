@@ -382,8 +382,21 @@ fn outbound_loss_detail(failure: &LinkFailure) -> String {
 fn is_inbound_corruption(failure: &LinkFailure, received: bool) -> bool {
     match failure {
         LinkFailure::Decode(_) | LinkFailure::ProtocolViolation(_) => true,
-        LinkFailure::Transport(TransportError::ChecksumMismatch { .. }) => true,
-        LinkFailure::Transport(TransportError::PayloadTooLarge { .. }) => received,
+        LinkFailure::Transport(error) => is_corrupt_transport(error, received),
+        _ => false,
+    }
+}
+
+/// A transport error that only corrupt traffic causes: a checksum mismatch,
+/// a frame of a sequenced lane out of sequence or off its lane (frames were
+/// lost or duplicated while the connection stayed up), or (`received`) a
+/// frame from the peer over the size limit.
+fn is_corrupt_transport(error: &TransportError, received: bool) -> bool {
+    match error {
+        TransportError::ChecksumMismatch { .. }
+        | TransportError::OutOfSequence { .. }
+        | TransportError::LaneViolation { .. } => true,
+        TransportError::PayloadTooLarge { .. } => received,
         _ => false,
     }
 }
@@ -395,13 +408,7 @@ fn is_corruption_event(event: &LinkEvent) -> bool {
             is_inbound_corruption(failure, true)
         }
         LinkEvent::ControlUndecodable(_) => true,
-        LinkEvent::ConnectionFailed(error) => matches!(
-            error,
-            TransportError::ChecksumMismatch { .. } | TransportError::PayloadTooLarge { .. }
-        ),
-        LinkEvent::TransportError(error) => {
-            matches!(error, TransportError::ChecksumMismatch { .. })
-        }
+        LinkEvent::ConnectionFailed(error) => is_corrupt_transport(error, true),
         _ => false,
     }
 }
@@ -926,14 +933,7 @@ impl LifecycleMachine {
                 let hard = !(phase == Phase::Running && matches!(failure, LinkFailure::SendFailed));
                 actions.extend(self.on_link_failure(peer_id, failure, hard));
             }
-            LinkEvent::TransportError(error) => {
-                let failure = LinkFailure::Transport(error);
-                if is_inbound_corruption(&failure, false) {
-                    actions.extend(self.on_corruption(peer_id, failure));
-                } else {
-                    actions.extend(self.on_link_failure(peer_id, failure, true));
-                }
-            }
+
             LinkEvent::InboundDataLost(_) => unreachable!("handled above"),
         }
         actions.extend(self.finish_if_resolved());
@@ -1381,6 +1381,8 @@ pub(crate) struct ClusterLifecycle {
     pub(crate) peer_registry: Arc<super::PeerRegistry>,
     pub(crate) peer_registration: Option<u64>,
     pub(crate) shared_managers: Option<Arc<HashMap<String, SharedPeerManager>>>,
+    /// The token of this dataflow's registrations with `shared_managers`.
+    pub(crate) shared_registration: Option<u64>,
     pub(crate) transport: Arc<ClusterTransport>,
     /// A `Cancel` describing a failure went out.
     pub(crate) failure_announced: bool,
@@ -1649,14 +1651,13 @@ impl ClusterLifecycle {
             // those frames before unregistering, which would drop them.
             // One task per peer, all bounded together, so an unreachable peer
             // does not hold up the others.
-            let dataflow_id = self.dataflow_id;
             let mut flushes = tokio::task::JoinSet::new();
             for (peer, forwarder) in forwarders {
                 let managers = managers.clone();
                 flushes.spawn(async move {
                     let _ = forwarder.await;
                     if let Some(manager) = managers.as_ref().and_then(|m| m.get(&peer)) {
-                        manager.flush_dataflow(&dataflow_id).await;
+                        manager.flush().await;
                     }
                 });
             }
@@ -1705,7 +1706,14 @@ impl ClusterLifecycle {
         }
         if let Some(managers) = managers {
             for manager in managers.values() {
-                manager.unregister_dataflow(&self.dataflow_id).await;
+                match self.shared_registration {
+                    Some(token) => {
+                        manager
+                            .unregister_registration(&self.dataflow_id, token)
+                            .await
+                    }
+                    None => manager.unregister_dataflow(&self.dataflow_id).await,
+                }
             }
             // If this dataflow holds the last reference (per-job managers),
             // releasing it closes the connections. Wait (bounded) until what
@@ -1973,7 +1981,11 @@ mod tests {
             || LinkEvent::ProgressChannelEnded(LinkFailure::Decode("crc".into())),
             || LinkEvent::OutboundFailed(LinkFailure::Encode("x".into())),
             || LinkEvent::ProgressChannelEnded(LinkFailure::LockPoisoned),
-            || LinkEvent::TransportError(TransportError::ReorderTimeout),
+            || {
+                LinkEvent::OutboundFailed(LinkFailure::Transport(TransportError::LockPoisoned {
+                    detail: "lock".into(),
+                }))
+            },
             || LinkEvent::ControlUndecodable("crc".into()),
         ];
         for failure in failures {
@@ -2001,7 +2013,7 @@ mod tests {
         let (mut m, _) = machine(1, &[("b", 1), ("c", 1)]);
         m.on_event(link_event(
             "b",
-            LinkEvent::TransportError(TransportError::ConnectionClosed),
+            LinkEvent::OutboundFailed(LinkFailure::Transport(TransportError::ConnectionClosed)),
         ));
         let actions = m.on_event(done(true));
         assert!(matches!(
@@ -2423,7 +2435,7 @@ mod tests {
                     actual: 2,
                 }),
                 LinkEvent::ConnectionFailed(TransportError::PayloadTooLarge { size: 2, max: 1 }),
-                LinkEvent::TransportError(TransportError::ChecksumMismatch {
+                LinkEvent::ConnectionFailed(TransportError::ChecksumMismatch {
                     expected: 1,
                     actual: 2,
                 }),
@@ -2481,9 +2493,13 @@ mod tests {
     fn losses_are_never_durable_after_success_or_on_retired_links() {
         let losses = || {
             [
-                LinkEvent::TransportError(TransportError::ReorderTimeout),
-                LinkEvent::TransportError(TransportError::ConnectionClosed),
-                LinkEvent::TransportError(TransportError::PayloadTooLarge { size: 2, max: 1 }),
+                LinkEvent::OutboundFailed(LinkFailure::Transport(TransportError::LockPoisoned {
+                    detail: "lock".into(),
+                })),
+                LinkEvent::OutboundFailed(LinkFailure::Transport(TransportError::ConnectionClosed)),
+                LinkEvent::OutboundFailed(LinkFailure::Transport(
+                    TransportError::PayloadTooLarge { size: 2, max: 1 },
+                )),
                 LinkEvent::ConnectionFailed(TransportError::ConnectionClosed),
                 LinkEvent::ConnectionFailed(TransportError::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -2504,11 +2520,13 @@ mod tests {
             assert!(m.on_event(link_event("b", event)).is_empty());
             assert!(m.data_loss().is_none());
         }
-        // A reorder timeout while running stays fatal, but not durable.
+        // A transport failure while running stays fatal, but not durable.
         let (mut m, _) = machine(1, &[("b", 1)]);
         let actions = m.on_event(link_event(
             "b",
-            LinkEvent::TransportError(TransportError::ReorderTimeout),
+            LinkEvent::OutboundFailed(LinkFailure::Transport(TransportError::LockPoisoned {
+                detail: "lock".into(),
+            })),
         ));
         assert!(has_cancel_everywhere(&actions), "{actions:?}");
         assert!(m.data_loss().is_none());
@@ -2691,7 +2709,8 @@ mod tests {
     /// from the peer is left to complete.
     #[test]
     fn link_end_before_goodbye_during_a_cancellation_aborts_the_drain() {
-        let closed = || LinkEvent::TransportError(TransportError::ConnectionClosed);
+        let closed =
+            || LinkEvent::OutboundFailed(LinkFailure::Transport(TransportError::ConnectionClosed));
         let (mut m, links) = machine(1, &[("b", 1), ("c", 1)]);
         for link in &links {
             link.note_push_blocked();
@@ -3039,8 +3058,10 @@ mod tests {
     #[test]
     fn hard_failure_or_peer_cancel_during_draining_resolves_peer() {
         for event in [
-            LinkEvent::TransportError(TransportError::ConnectionClosed),
-            LinkEvent::TransportError(TransportError::ReorderTimeout),
+            LinkEvent::OutboundFailed(LinkFailure::Transport(TransportError::ConnectionClosed)),
+            LinkEvent::OutboundFailed(LinkFailure::Transport(TransportError::LockPoisoned {
+                detail: "lock".into(),
+            })),
             LinkEvent::CancelReceived,
         ] {
             let (mut m, _) = machine(1, &[("b", 1), ("c", 1)]);
@@ -3056,7 +3077,9 @@ mod tests {
         let (mut m, _) = machine(1, &[("b", 1)]);
         m.on_event(link_event("b", LinkEvent::ProgressEndOfStream));
         for event in [
-            LinkEvent::TransportError(TransportError::ReorderTimeout),
+            LinkEvent::OutboundFailed(LinkFailure::Transport(TransportError::LockPoisoned {
+                detail: "lock".into(),
+            })),
             LinkEvent::OutboundFailed(LinkFailure::SendFailed),
             LinkEvent::CancelReceived,
         ] {

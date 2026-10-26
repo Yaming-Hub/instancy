@@ -2,6 +2,8 @@
 //! the input source does not record the producer-side `+n` of the exchange
 //! in-flight accounting while the consumer records `-n`.
 
+#![cfg(feature = "transport")]
+
 use std::collections::HashMap;
 use std::time::Duration;
 

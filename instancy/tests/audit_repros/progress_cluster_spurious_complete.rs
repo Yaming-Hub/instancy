@@ -1,4 +1,12 @@
-//! Audit (cluster/TCP): spurious completion of an idle node via the zero-sum`n//! `total_counts` check, with the in-flight producer side CORRECTLY wired`n//! (`map -> exchange`). Node B consumes one record from node A before A's`n//! `+1` in-flight progress frame arrives; B's tracker then sums`n//! `+1 (A's open input cap) - 1 (consumed)` == 0 and, after `max_idle_sweeps`,`n//! B force-closes all operators. Later records from A to B are dropped.`n
+//! Audit (cluster/TCP): spurious completion of an idle node via the zero-sum
+//! `total_counts` check, with the in-flight producer side CORRECTLY wired
+//! (`map -> exchange`). Node B consumes one record from node A before A's
+//! `+1` in-flight progress frame arrives; B's tracker then sums
+//! `+1 (A's open input cap) - 1 (consumed)` == 0 and, after `max_idle_sweeps`,
+//! B force-closes all operators. Later records from A to B are dropped.
+
+#![cfg(feature = "transport")]
+
 use std::collections::HashMap;
 use std::time::Duration;
 

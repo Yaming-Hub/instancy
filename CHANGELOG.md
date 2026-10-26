@@ -7,6 +7,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Shared transport reliability
+
+- **Fixed silent data loss in Shared mode (audit C7).** A pooled connection
+  that failed and was redialled used to drop the frames queued on it, and
+  the frames sent while it was being redialled, without anyone noticing:
+  both nodes could report success with records missing, or hang. Shared mode
+  is now fail-stop on link loss, like Dedicated mode and like timely: a
+  pooled connection that fails (a write error, or the read side ending)
+  fails every dataflow that used it, on both nodes, and a frame that cannot
+  be sent fails its dataflow. A write error closes the whole connection, so
+  the peer sees it end even with split stream halves (TLS) whose write half
+  alone would tell it nothing. The failed connection leaves the pool; the
+  next dataflow that registers re-establishes it through the application's
+  `ConnectionFactory`. There is no background redial any more.
+- **Each dataflow's lane is pinned to one pooled connection.** A dataflow's
+  frames to a peer (data, progress and control) all use the connection it
+  was given when it registered, so TCP keeps them in order and a failed
+  connection fails only the dataflows that used it. The receiver checks
+  every payload frame's sequence number: a lost or duplicated frame
+  (`TransportError::OutOfSequence`), or a lane whose frames arrive on two
+  connections (`TransportError::LaneViolation`), fails the dataflow as
+  corrupt traffic instead of being delivered. The reorder buffer and its
+  gap timer are gone, which also removes the spurious `ReorderTimeout`
+  failures of healthy dataflows with 2 or more pooled connections (audit
+  H7).
+- **The pool has a fixed size.** It used to grow and shrink on its own,
+  from each node's own RTT probes, but the peer was never told: frames on a
+  connection only one side opened were lost, and a connection one side
+  closed looked like a failure to the other (audit H7). The pool now holds
+  exactly `SharedConnectionConfig::connections` connections. Coordinated
+  resizing, agreed by both nodes, may come later. RTT probes remain, as
+  metrics only (`SharedPeerManager::metrics_snapshot`).
+- One dataflow's oversized frame (or a payload frame on a reserved channel)
+  is rejected and fails only that dataflow; the shared connection and the
+  other dataflows are untouched (audit M4).
+- Establishing a pooled connection is bounded by the new
+  `SharedConnectionConfig::connect_timeout`, and a Shared-mode
+  `spawn_cluster` bounds registration by its handshake timeout, so an
+  unreachable peer fails the spawn instead of hanging it (audit M5).
+  `ConnectionPool::acquire` enforces `PoolConfig::connect_timeout`.
+- **Frame checksums are always on**, in both modes: every frame carries a
+  CRC32 of its header and one of header plus payload. Dedicated sessions
+  never checksummed their frames before, so a flipped payload bit was
+  accepted unless it broke decoding.
+- **A `DataflowId` identifies one run; a retry needs a fresh id.** Pooled
+  connections outlive dataflows and frames carry only the dataflow id, so a
+  run that reused an earlier run's id could take that run's late frames
+  (data, progress, its seal and end-of-stream) for its own. A
+  `SharedPeerManager` now refuses to register an id it remembers as
+  finished (the most recent 16,384), with
+  `TransportError::InvalidRegistration`, and drops the late frames of such
+  an id. Payload frames queued before a dataflow unregistered are dropped,
+  never numbered into another registration's lane, and a cleanup removes
+  only its own registration (so a reused id's late cleanup cannot
+  unregister the new run). The manager's per-dataflow bookkeeping is
+  bounded: control frames of dataflows that never register expire, the set
+  of finished dataflow ids is bounded, and the handles of finished
+  connection tasks are released. The runtime's set of departed nodes is
+  bounded too.
+- **BREAKING:** `SharedPeerManager::payload_sender()` is replaced by
+  `dataflow_sender(&id)`, a `DataframeSender` bound to the dataflow's
+  registration; flush barriers are internal queue entries, so channel
+  `u64::MAX - 1` is no longer reserved.
+- A corrupt frame on a pooled connection is corruption (fatal in every
+  phase) only for the dataflow it belongs to; the other dataflows reading
+  from the connection lose the connection, which is fatal only while they
+  still need the peer's frames.
+- `Muxer::new` returns an error instead of panicking when
+  `MuxConfig::buffer_size` is 0.
+- The transport contract is documented: the application provides the
+  connections and owns their liveness (detecting a dead or partitioned
+  peer, through keepalives or its membership layer and
+  `report_node_leave`); instancy never reports success with lost,
+  duplicated, reordered or corrupted data, and fails the affected
+  dataflows when a connection reports an error or EOF.
+- **Cluster protocol version 6** (frame checksums always present; pinned,
+  strictly sequenced Shared lanes). Nodes on version 5 are rejected at the
+  handshake.
+- **BREAKING:** `SharedConnectionConfig` is now `{ connections,
+  connect_timeout, probe_interval, rtt_ema_alpha }` (`min_connections`
+  became `connections`; `max_connections`, the RTT thresholds,
+  `cooldown_period`, `reorder_timeout`, `idle_timeout` and
+  `enable_frame_crc` are gone). `PeerPool`, `ScalingDecision`,
+  `ScalingDriver`, `ScalingEvent`, `ReorderBuffer` and its result types are
+  removed (`RttProber` replaces the probe bookkeeping).
+  `SharedPeerManager::register_dataflow` and
+  `SharedTransportSession::take_io_events` deliver `PeerIoEvent`
+  notices (now public, shared with Dedicated mode) instead of
+  `TransportError`s; `connection_count` returns a `usize` and
+  `live_connection_count` is gone. `FramedWriter::with_crc` and
+  `FramedReader::with_crc` are gone (`new` always checksums).
+  `TransportError::ReorderTimeout` is replaced by `OutOfSequence` and
+  `LaneViolation`. `Muxer::new` returns a `Result`.
+
+### CI
+
+- CI runs every audit repro (each in its own process), the full progress
+  conformance matrix (in its own job), a build and test run with
+  `--no-default-features`, and a release-mode check.
+- `--no-default-features` builds again, and release builds no longer
+  warn about code that only debug builds use.
+
 ### Port-counted progress (step 3 of the progress-accounting redesign)
 
 - Progress is now counted at operator ports, as in timely dataflow. Every

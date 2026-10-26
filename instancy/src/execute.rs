@@ -368,6 +368,7 @@ impl ClusterTopology {
     ///
     /// Returns `Some` on the first call; subsequent calls return `None`.
     /// This is called by the runtime during construction.
+    #[cfg_attr(not(feature = "transport"), allow(dead_code))]
     pub(crate) fn take_membership(&mut self) -> Option<Box<dyn ClusterMembership>> {
         self.membership.take()
     }
