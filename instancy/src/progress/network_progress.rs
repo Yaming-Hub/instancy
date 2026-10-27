@@ -726,7 +726,28 @@ async fn progress_recv_bridge<T: Timestamp + ExchangeData>(
     max_batch_size: usize,
     events: LifecycleEventSender,
     codecs: ProgressCodecs<T>,
+    #[cfg_attr(
+        not(any(debug_assertions, feature = "progress-check", feature = "test-utils")),
+        allow(unused_variables)
+    )]
+    trace: crate::progress::TraceHandle,
 ) {
+    // The flight recorder: every frame of this lane, with the lane position
+    // of each batch (see `trace::Kind::ProgressIn`).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    let mut lane_frames = 0u64;
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    let record = |frame: usize, changes: usize, lane_frames: u64| {
+        if let Some(recorder) = &trace {
+            recorder.record(
+                crate::progress::trace::Ev::new(crate::progress::trace::Kind::ProgressIn)
+                    .a(frame)
+                    .b(changes)
+                    .w(0, channel_id)
+                    .w(1, lane_frames),
+            );
+        }
+    };
     // Records how the lane ended for the worker (`LaneState`), after the
     // batches before it: a seal, then the end-of-stream or a failure.
     let mark = |sealed: bool| match buffer.lock().or_poison("progress buffer") {
@@ -776,9 +797,22 @@ async fn progress_recv_bridge<T: Timestamp + ExchangeData>(
                     match decode_progress_frame_with::<T>(&bytes, &codecs, max_batch_size) {
                         Ok(ProgressFrame::Batch(batch)) => {
                             if sealed {
+                                traced! {
+                                    record(crate::progress::trace::frame::VIOLATION, 0, lane_frames);
+                                }
                                 break LinkFailure::ProtocolViolation(format!(
                                     "progress batch on channel {channel_id} after the sender's seal"
                                 ));
+                            }
+                            traced! {
+                                let changes = bytes
+                                    .get(..4)
+                                    .and_then(|b| b.try_into().ok())
+                                    .map_or(0, u32::from_le_bytes) as usize;
+                                if !batch.is_empty() {
+                                    lane_frames += 1;
+                                }
+                                record(crate::progress::trace::frame::BATCH, changes, lane_frames);
                             }
                             if !batch.is_empty() {
                                 match buffer.lock().or_poison("progress buffer") {
@@ -789,6 +823,9 @@ async fn progress_recv_bridge<T: Timestamp + ExchangeData>(
                             }
                         }
                         Ok(ProgressFrame::Abandon) => {
+                            traced! {
+                                record(crate::progress::trace::frame::ABANDON, 0, lane_frames);
+                            }
                             // The peer's worker stopped unfinished: nothing more
                             // comes on this lane, and the lane was never sealed.
                             if !mark(false) {
@@ -796,6 +833,9 @@ async fn progress_recv_bridge<T: Timestamp + ExchangeData>(
                             }
                         }
                         Ok(ProgressFrame::Seal) => {
+                            traced! {
+                                record(crate::progress::trace::frame::SEAL, 0, lane_frames);
+                            }
                             if sealed {
                                 break LinkFailure::ProtocolViolation(format!(
                                     "second seal on progress channel {channel_id}"
@@ -807,6 +847,9 @@ async fn progress_recv_bridge<T: Timestamp + ExchangeData>(
                             }
                         }
                         Ok(ProgressFrame::EndOfStream) => {
+                            traced! {
+                                record(crate::progress::trace::frame::END_OF_STREAM, 0, lane_frames);
+                            }
                             mark(false);
                             report_link_event(&events, &peer_id, LinkEvent::ProgressEndOfStream);
                             watch_after_end_of_stream::<T>(
@@ -822,9 +865,15 @@ async fn progress_recv_bridge<T: Timestamp + ExchangeData>(
                             return;
                         }
                         Ok(ProgressFrame::Ack) => {
+                            traced! {
+                                record(crate::progress::trace::frame::ACK, 0, lane_frames);
+                            }
                             report_link_event(&events, &peer_id, LinkEvent::AckReceived);
                         }
                         Err(e) => {
+                            traced! {
+                                record(crate::progress::trace::frame::DECODE_ERROR, 0, lane_frames);
+                            }
                             #[cfg(feature = "tracing")]
                             tracing::error!(
                                 %peer_id,
@@ -839,6 +888,9 @@ async fn progress_recv_bridge<T: Timestamp + ExchangeData>(
             }
         }
     };
+    traced! {
+        record(crate::progress::trace::frame::ENDED, 0, lane_frames);
+    }
     mark(false);
     report_link_event(&events, &peer_id, LinkEvent::ProgressChannelEnded(failure));
 }
@@ -1099,6 +1151,9 @@ pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                     // A retired peer has finished or already holds everything
                     // it needs from us; deltas to it are irrelevant.
                     if outbox.is_retired() {
+                        traced! {
+                            trace_lane_dropped(0, remote_w, 1);
+                        }
                         return;
                     }
                     let mut bufs = Vec::new();
@@ -1111,10 +1166,22 @@ pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                             channel_id = ch_id,
                             "progress send: encode error {e}"
                         );
+                        traced! {
+                            trace_lane_dropped(0, remote_w, 2);
+                        }
                         outbox.report(LinkEvent::OutboundFailed(LinkFailure::Encode(
                             e.to_string(),
                         )));
                         return;
+                    }
+                    // The receiver queues every frame that carries a change
+                    // as its own batch.
+                    traced! {
+                        crate::progress::trace::note_frames(
+                            bufs.iter()
+                                .filter(|b| b.get(..4) != Some(&[0u8; 4][..]))
+                                .count() as u64,
+                        );
                     }
                     for buf in bufs {
                         let frame = Frame {
@@ -1125,6 +1192,9 @@ pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                         // The lane only closes after its forwarder reported a
                         // transport failure, or after teardown.
                         if outbox.send(frame).is_err() {
+                            traced! {
+                                trace_lane_dropped(0, remote_w, 3);
+                            }
                             return;
                         }
                     }
@@ -1134,6 +1204,9 @@ pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                 let abandon_outbox = seal_outbox.clone();
                 let seal = move || {
                     if seal_outbox.is_retired() {
+                        traced! {
+                            trace_lane_dropped(1, remote_w, 1);
+                        }
                         return;
                     }
                     let _ = seal_outbox.send(Frame {
@@ -1146,6 +1219,9 @@ pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                 // cancelled without draining) says so on the same lane.
                 let abandon = move || {
                     if abandon_outbox.is_retired() {
+                        traced! {
+                            trace_lane_dropped(2, remote_w, 1);
+                        }
                         return;
                     }
                     let _ = abandon_outbox.send(Frame {
@@ -1207,6 +1283,10 @@ pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                     max_batch_size,
                     events.clone(),
                     codecs.clone(),
+                    outboxes
+                        .get(peer_id.as_str())
+                        .map(|outbox| outbox.link().trace_handle())
+                        .unwrap_or_default(),
                 ));
                 recv_handles.push(handle);
 
@@ -1227,6 +1307,26 @@ pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
 // ---------------------------------------------------------------------------
 // ProgressSender::network constructor (cfg-gated)
 // ---------------------------------------------------------------------------
+
+/// The flight recorder: a network lane to worker `to` dropped what (0: a
+/// commit, 1: the seal, 2: the abandon marker), why (1: the link is
+/// retired, 2: it did not encode, 3: the outbox closed).
+#[cfg(all(
+    feature = "transport",
+    any(debug_assertions, feature = "progress-check", feature = "test-utils")
+))]
+fn trace_lane_dropped(what: usize, to: usize, why: u64) {
+    use crate::progress::trace::{self, Ev, Kind, Site};
+    trace::with(Site::ProgressSend, |recorder| {
+        recorder.lane_dropped(
+            Ev::new(Kind::LaneDropped)
+                .a(what)
+                .b(to)
+                .w(0, trace::sending())
+                .w(1, why),
+        );
+    });
+}
 
 #[cfg(feature = "transport")]
 impl<T: Timestamp> ProgressSender<T> {
@@ -1493,6 +1593,7 @@ mod tests {
             DEFAULT_MAX_BATCH_SIZE,
             events,
             ProgressCodecs::flat(),
+            Default::default(),
         ));
         (handle, events_rx)
     }
@@ -1743,6 +1844,7 @@ mod tests {
             DEFAULT_MAX_BATCH_SIZE,
             events,
             ProgressCodecs::flat(),
+            Default::default(),
         ));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -1787,6 +1889,7 @@ mod tests {
             DEFAULT_MAX_BATCH_SIZE,
             events,
             ProgressCodecs::flat(),
+            Default::default(),
         ));
 
         // Serialize a batch and send it, followed by the end-of-stream marker.

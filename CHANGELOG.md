@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Progress trace recorder
+
+- **A flight recorder for progress failures.** In debug builds and
+  builds with the `progress-check` or `test-utils` feature,
+  `progress::trace` keeps a bounded ring of recent progress events per
+  worker and per peer link:
+  - commits and applied batches, with every change;
+  - seals, decisions (S2a, S2b, residuals) and executor exits;
+  - pushes and receives, with their outcomes;
+  - link events, including what retired a link.
+  When `INSTANCY_TRACE_DIR` is set, a data-lost push, records that reach
+  a finished operator, a proven residual or a checker finding dumps every
+  ring of the dataflow to `$INSTANCY_TRACE_DIR/<dataflow-id>/`, in
+  addition to the failure. `progress::check::dump_traces` dumps on
+  request, and the conformance harness does so for every unexpected
+  outcome. `INSTANCY_TRACE_EVENTS` sizes the rings (default 16,384
+  events). Release builds without those features contain none of it.
+  See `docs/design/progress-tracking.md` §11.6.6.
+- CI's test and conformance jobs record, and upload the dumps when they
+  fail (retained 14 days).
+
 ### Shared transport reliability
 
 - **Fixed silent data loss in Shared mode (audit C7).** A pooled connection

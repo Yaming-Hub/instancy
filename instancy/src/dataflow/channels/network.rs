@@ -347,7 +347,26 @@ pub struct NetworkPush<T: Timestamp + ExchangeData, D: ExchangeData> {
     /// Standalone use (no outbox): the runtime on which the close sentinel
     /// waits for room in a full queue.
     close_runtime: Option<tokio::runtime::Handle>,
+    /// The flight recorder's count of data frames enqueued (`frame`).
+    #[cfg_attr(
+        not(any(debug_assertions, feature = "progress-check", feature = "test-utils")),
+        allow(dead_code)
+    )]
+    trace_frames: TraceFrames,
 }
+
+/// A network channel end's count of data frames, for the flight recorder
+/// (`progress::trace`); nothing without it.
+#[cfg(all(
+    feature = "transport",
+    any(debug_assertions, feature = "progress-check", feature = "test-utils")
+))]
+type TraceFrames = u32;
+#[cfg(all(
+    feature = "transport",
+    not(any(debug_assertions, feature = "progress-check", feature = "test-utils"))
+))]
+type TraceFrames = ();
 
 #[cfg(feature = "transport")]
 impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkPush<T, D> {
@@ -462,6 +481,46 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkPush<T, D> {
         }
     }
 
+    /// The flight recorder (see `progress::trace`): what a push sent, with
+    /// the data frame's number on the channel, and a dump when its records
+    /// were lost to a retired link. The dump is in addition to the error,
+    /// which the push still returns.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn trace_sent(&mut self, envelope: &Envelope<T, D, ()>, sent: &std::result::Result<(), Error>) {
+        use crate::progress::trace::{self, Ev, Kind, Outcome, Site};
+        if let Payload::Data { time, data } = &envelope.payload {
+            let channel = self.channel_id;
+            let outcome = Outcome::of(sent);
+            if matches!(outcome, Outcome::Accepted | Outcome::LostWhileFinishing) {
+                self.trace_frames = self.trace_frames.wrapping_add(1);
+            }
+            let frame = self.trace_frames as usize;
+            trace::with(Site::NetworkPush, |recorder| {
+                recorder.record(
+                    Ev::new(Kind::NetSend)
+                        .b(frame)
+                        .time(trace::time(time))
+                        .w(2, data.len() as u64)
+                        .w(3, outcome as u64)
+                        .w(4, channel),
+                );
+            });
+        }
+        if let Err(
+            error @ Error::Communication(crate::error::CommunicationError::DataLoss { .. }),
+        ) = sent
+        {
+            // Dumped once the worker has returned this error (outside a
+            // traced worker: now).
+            if trace::active() || trace::enabled() {
+                let reason = error.to_string();
+                if !trace::defer_current(self.dataflow_id, trace::Trigger::DataLost, &reason) {
+                    trace::trigger(self.dataflow_id, trace::Trigger::DataLost, &reason);
+                }
+            }
+        }
+    }
+
     /// Queue the close sentinel behind this push's data.
     fn send_close(&mut self) {
         self.closed = true;
@@ -534,7 +593,11 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()> for NetworkPus
         }
         let is_data = carries_records(&envelope);
         let bytes = self.encode(&envelope)?;
-        self.send_frame(bytes, is_data)
+        let sent = self.send_frame(bytes, is_data);
+        traced! {
+            self.trace_sent(&envelope, &sent);
+        }
+        sent
     }
 
     fn try_push(
@@ -549,7 +612,11 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()> for NetworkPus
             Ok(b) => b,
             Err(e) => return Err((e, envelope)),
         };
-        match self.send_frame(bytes, is_data) {
+        let sent = self.send_frame(bytes, is_data);
+        traced! {
+            self.trace_sent(&envelope, &sent);
+        }
+        match sent {
             Ok(()) => Ok(()),
             Err(e) => Err((e, envelope)),
         }
@@ -706,7 +773,25 @@ struct InboundChannel<'a> {
 impl InboundChannel<'_> {
     fn deliver(&mut self, bytes: Vec<u8>) {
         let records = frame_carries_records(&bytes);
+        #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+        let (channel, size, close) = (self.channel_id, bytes.len(), is_close_sentinel(&bytes));
+        // How the frame went (see `trace::Kind::FrameIn`).
+        #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+        let trace_frame = |peer: &crate::communication::peer_link::PeerMonitor, outcome: u64| {
+            if let Some(recorder) = peer.recorder() {
+                recorder.record(
+                    crate::progress::trace::Ev::new(crate::progress::trace::Kind::FrameIn)
+                        .a(usize::from(records) | usize::from(close) << 1)
+                        .w(0, channel)
+                        .w(1, size as u64)
+                        .w(2, outcome),
+                );
+            }
+        };
         if self.closed {
+            traced! {
+                trace_frame(self.peer, 3);
+            }
             // Nothing follows a close sentinel (one sender per channel): the
             // sender broke the protocol (a failed sender never closes its
             // channels). Fatal at once, whatever our workers are doing.
@@ -739,7 +824,14 @@ impl InboundChannel<'_> {
                     // The pull may be dropping right now: it may already have
                     // drained its receiver, and this frame would vanish with it.
                     if records && self.pull_dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                        traced! {
+                            trace_frame(self.peer, 2);
+                        }
                         self.lost("records arrived as the receiving operator finished");
+                    } else {
+                        traced! {
+                            trace_frame(self.peer, 0);
+                        }
                     }
                     self.wake_handle.notify();
                     return;
@@ -751,6 +843,9 @@ impl InboundChannel<'_> {
                     }
                 }
             }
+        }
+        traced! {
+            trace_frame(self.peer, if records { 1 } else { 4 });
         }
         if records {
             self.lost("records arrived after the receiving operator finished");
@@ -787,10 +882,17 @@ impl InboundChannel<'_> {
     fn lost(&mut self, why: &str) {
         if !self.reported {
             self.reported = true;
+            let detail = format!("channel {}: {why}", self.channel_id);
+            // The report first: a dump must never delay the failure.
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            let traced = detail.clone();
             self.peer
                 .report(crate::communication::peer_link::LinkEvent::InboundDataLost(
-                    format!("channel {}: {why}", self.channel_id),
+                    detail,
                 ));
+            traced! {
+                self.peer.trace_lost(&traced);
+            }
         }
     }
 }
@@ -832,10 +934,37 @@ pub struct NetworkPull<T: Timestamp + ExchangeData, D: ExchangeData> {
     monitor: Option<PullMonitor>,
     /// Keeps transport alive (background tasks survive as long as this exists).
     _transport: Option<Arc<crate::communication::cluster_transport::ClusterTransport>>,
+    /// The flight recorder's count of data frames received (`frame`).
+    #[cfg_attr(
+        not(any(debug_assertions, feature = "progress-check", feature = "test-utils")),
+        allow(dead_code)
+    )]
+    trace_frames: TraceFrames,
 }
 
 #[cfg(feature = "transport")]
 impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkPull<T, D> {
+    /// The flight recorder (`progress::trace`): what this pull received
+    /// (`what`: 0 records, 1 the close sentinel, 2 an undecodable frame, 3
+    /// the channel closed without its sentinel), with the data frame's
+    /// number on the channel.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn trace_received(&mut self, what: usize, records: Option<(&T, usize)>) {
+        use crate::progress::trace::{self, Ev, Kind, Site};
+        let channel = self.channel_id;
+        if what == 0 {
+            self.trace_frames = self.trace_frames.wrapping_add(1);
+        }
+        let frame = self.trace_frames as usize;
+        trace::with(Site::NetworkPull, |recorder| {
+            let mut ev = Ev::new(Kind::NetRecv).a(what).b(frame).w(4, channel);
+            if let Some((time, n)) = records {
+                ev = ev.time(trace::time(time)).w(2, n as u64);
+            }
+            recorder.record(ev);
+        });
+    }
+
     fn fail(&mut self, failure: crate::communication::peer_link::LinkFailure) {
         self.failed = true;
         match &self.monitor {
@@ -903,15 +1032,22 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Drop for NetworkPull<T, D> {
             );
         }
         if unconsumed > 0 {
+            let detail = format!(
+                "channel {}: {unconsumed} frame(s) of records were received but never \
+                 consumed",
+                monitor.channel_id
+            );
+            // The report first: a dump must never delay the failure.
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            let traced = detail.clone();
             monitor
                 .peer
                 .report(crate::communication::peer_link::LinkEvent::InboundDataLost(
-                    format!(
-                        "channel {}: {unconsumed} frame(s) of records were received but never \
-                         consumed",
-                        monitor.channel_id
-                    ),
+                    detail,
                 ));
+            traced! {
+                monitor.peer.trace_lost(&traced);
+            }
         }
     }
 }
@@ -935,6 +1071,9 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Pull<T, D, ()> for NetworkPul
                 // already reported it). Not an end of stream: data may be
                 // missing.
                 self.failed = true;
+                traced! {
+                    self.trace_received(3, None);
+                }
                 #[cfg(feature = "tracing")]
                 tracing::error!(
                     channel_id = self.channel_id,
@@ -944,14 +1083,27 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Pull<T, D, ()> for NetworkPul
             }
         };
         match decode_envelope(&self.time_codec, &self.data_codec, &bytes) {
-            Ok(Some(env)) => Some(env),
+            Ok(Some(env)) => {
+                traced! {
+                    if let Payload::Data { time, data } = &env.payload {
+                        self.trace_received(0, Some((time, data.len())));
+                    }
+                }
+                Some(env)
+            }
             Ok(None) => {
                 // Close sentinel — single sender per channel, FIFO order,
                 // so no more data follows.
                 self.exhausted = true;
+                traced! {
+                    self.trace_received(1, None);
+                }
                 None
             }
             Err(e) => {
+                traced! {
+                    self.trace_received(2, None);
+                }
                 self.fail(crate::communication::peer_link::LinkFailure::Decode(
                     format!("data channel {}: {e}", self.channel_id),
                 ));
@@ -1366,6 +1518,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                     closed: false,
                     close_runtime: (!self.peer_outboxes.contains_key(dst_node))
                         .then(|| self.runtime_handle.clone()),
+                    trace_frames: Default::default(),
                 }));
             }
         }
@@ -1465,6 +1618,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                         dropped: pull_dropped,
                     }),
                     _transport: Some(self.transport.clone()),
+                    trace_frames: Default::default(),
                 }));
             }
         }
@@ -1911,6 +2065,7 @@ mod tests {
                 max_payload: usize::MAX,
                 worker_completed: None,
                 closed: false,
+                trace_frames: Default::default(),
             }
         }
 
@@ -1941,6 +2096,78 @@ mod tests {
             // Control signals and empty batches for a finished peer are irrelevant.
             push.push(Envelope::watermark(4)).unwrap();
             push.push(Envelope::data(5, Vec::new())).unwrap();
+        }
+
+        /// The flight recorder (`progress::trace`): records pushed to a
+        /// retired link fail the push and write a dump at once, which names
+        /// the data loss and shows what retired the link.
+        #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+        #[tokio::test]
+        async fn data_lost_to_a_retired_link_is_dumped() {
+            use crate::progress::trace;
+            let dir = std::env::temp_dir().join(format!(
+                "instancy-trace-data-lost-{}",
+                DataflowId::new().as_uuid()
+            ));
+            let id = DataflowId::new();
+            let worker = trace::recorder_for_test(id, "node-a", Some(0), "", 2, &dir);
+            let link = trace::recorder_for_test(id, "node-a", None, "node-b", 2, &dir);
+            let (outbox, _events, _sink) = monitored_outbox("node-b");
+            outbox.link().attach_trace(Some(link));
+            let (tx, _rx) = tokio_mpsc::channel(4);
+            let mut push = push_to(&outbox, tx);
+            push.dataflow_id = id;
+            let recording = trace::enter(&Some(Arc::clone(&worker)));
+            push.push(Envelope::data(1, vec![1, 2])).unwrap();
+            // The test hook: the link retires (as on the peer's goodbye).
+            outbox.link().retire();
+            let error = push.push(Envelope::data(2, vec![3])).unwrap_err();
+            drop(recording);
+            assert!(error.to_string().contains("data lost"), "{error}");
+            // The dump waits for the worker to return the error (its
+            // executor fires it as it records its exit).
+            let root = dir.join(id.as_uuid().to_string());
+            assert!(!root.exists(), "no dump before the failure is returned");
+            worker.fire_pending();
+
+            let reason = std::fs::read_to_string(root.join("reason.txt")).unwrap();
+            assert!(
+                reason.starts_with("data-lost:")
+                    && reason.contains("records sent after the peer finished"),
+                "{reason}"
+            );
+            let sent = std::fs::read_to_string(root.join("node-a-w0.jsonl")).unwrap();
+            let outcomes: Vec<&str> = sent
+                .lines()
+                .filter(|l| l.contains("\"ev\":\"net-send\""))
+                .map(|l| {
+                    if l.contains("\"outcome\":\"accepted\"") {
+                        "accepted"
+                    } else if l.contains("\"outcome\":\"lost-after-finish\"") {
+                        "lost"
+                    } else {
+                        l
+                    }
+                })
+                .collect();
+            assert_eq!(outcomes, ["accepted", "lost"], "{sent}");
+            let link = std::fs::read_to_string(root.join("node-a-bridge-node-b.jsonl")).unwrap();
+            assert!(
+                link.contains("\"ev\":\"retired\",\"was_retired\":false"),
+                "the dump shows the link retired: {link}"
+            );
+            // The last recorder (the link's, held by the outbox's forwarder
+            // task until it ends) writes the final dump.
+            drop((worker, push, outbox));
+            let last = root.join("2-final").join("node-a-bridge-node-b.jsonl");
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !last.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("a final dump once the dataflow's last recorder drops");
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[tokio::test]
@@ -2291,6 +2518,7 @@ mod tests {
                     dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 }),
                 _transport: None,
+                trace_frames: Default::default(),
             };
             (pull, events)
         }
@@ -2447,6 +2675,7 @@ mod tests {
                 link_failure_reported: std::sync::atomic::AtomicBool::new(false),
                 close_runtime: None,
                 closed: false,
+                trace_frames: Default::default(),
             };
             // tag + time + count = 13 bytes: fits.
             push.push(Envelope::data(1, vec![])).unwrap();
@@ -2494,6 +2723,7 @@ mod tests {
                     link_failure_reported: std::sync::atomic::AtomicBool::new(false),
                     close_runtime: None,
                     closed: false,
+                    trace_frames: Default::default(),
                 };
                 drop(push);
                 let sentinel = rx.try_recv().ok().map(|f| f.payload);
@@ -2538,6 +2768,7 @@ mod tests {
                     link_failure_reported: std::sync::atomic::AtomicBool::new(false),
                     close_runtime: None,
                     closed: false,
+                    trace_frames: Default::default(),
                 };
                 let targets: Vec<Box<dyn Push<u64, u64, ()>>> =
                     vec![Box::new(local), Box::new(remote)];

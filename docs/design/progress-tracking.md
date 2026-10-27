@@ -325,6 +325,67 @@ A failed worker never seals. Its lane ends unsealed (with an abandon marker on a
 
 `progress/check.rs` is an independent oracle, compiled into debug builds (and release builds with the `progress-check` feature). It measures where work physically is (channels, operator stores, live capabilities) without reading any ledger, and checks every worker's published frontiers against it: late data (V1), unjustified output (V3), sealing or completing with work held (V4), residuals (V5), wire rules (V6) and the occupancy oracle (V7). It panics on a violation by default; `INSTANCY_PROGRESS_CHECK` selects the mode.
 
+#### 11.6.6 Diagnosing a Progress Failure
+
+A progress failure that shows up once in CI rarely reproduces locally. Examples are an S3 data loss ("records sent while the peer was finishing"), a proven residual and a checker finding. The flight recorder (`progress/trace.rs`) makes one CI artifact enough to attribute such a failure. Like the checker, it is compiled only into debug builds and builds with the `progress-check` or `test-utils` feature, never into a release build without them. It records only when `INSTANCY_TRACE_DIR` names a dump directory. CI sets it for the `test` and conformance jobs. It uploads the `test` job's dumps when that job fails, and the conformance job's whenever there are any: a case that passes only on a later attempt (flaky) still leaves the dump of its failed attempt.
+
+**What it records.** Each worker has a bounded ring of fixed-size events (`INSTANCY_TRACE_EVENTS` per ring, default 16,384, about 1 MiB). Each node also has one ring per peer link. Rings are lock-free: only the executor's thread writes a worker's ring, and a dump reads it without blocking that thread.
+
+A worker's ring holds:
+
+- every commit, with each change, its sequence number and the frames each network lane got;
+- every peer batch applied, with each change and its position on the lane;
+- seals sent and applied, and the lane states;
+- the worker's scope (the locations S2b judges) and the seeded initial capabilities;
+- the decisions:
+  - S2a shutdowns;
+  - S2b success or not-ready, with every non-zero raw count in scope (not-ready only once every hosted operator is shut down or exhausted);
+  - residuals and S3 failures, with each peer lane's position at that moment;
+- the executor's exit, with the path that produced it, and what the coordinator was told;
+- the data path: output counted as produced, pushes and their outcomes per target, network sends and receives (each data frame numbered on its channel), and input pulls.
+
+A link's ring holds:
+
+- the frames received;
+- the progress markers (seal, abandon, end-of-stream, ack);
+- each link event and whether it retired the link;
+- the coordinator's goodbye (recorded before its end-of-stream frames are queued), acks and teardown.
+
+Commit numbers never travel on the wire. Each side derives them: an in-process lane carries one batch per commit, and a network lane one batch per frame, which the sender's `frames_before`/`frames` locate.
+
+**When it dumps.** The runtime dumps at detection, at most once per dataflow and trigger:
+
+- a push of records to a retired link (data loss);
+- records that arrive for a finished operator;
+- a proven residual;
+- any checker finding;
+- an explicit call to `check::dump_traces(id, reason)`.
+
+A dataflow that was dumped writes a final dump when it ends. The conformance harness dumps every case whose outcome does not match the golden file, and prints the dump directory and the analyser's verdict.
+
+A dump goes to `$INSTANCY_TRACE_DIR/<dataflow-id>/` and contains:
+
+- `header.json`: the reason, a legend for every field, operator and edge names, and how a network channel id decodes;
+- `reason.txt`;
+- one JSON-lines file per ring: `<node>-w<worker>.jsonl` and `<node>-bridge-<peer>.jsonl`.
+
+A later dump of another trigger goes to a numbered subdirectory; `check::dump_traces` returns the directory of the dump it wrote. The header counts every gap:
+
+- events overwritten in a ring, and slots torn while dumping;
+- events at a site outside any traced worker;
+- commits and markers a retired link dropped;
+- finished dataflows evicted from the registry (the last 32 stay).
+
+A dump covers every ring of the dataflow in the process: every node of a cluster that runs in one process, as in tests. A cluster whose nodes run in separate processes dumps each process's own rings.
+
+**Reading a dump.** `tests/support/trace_verdict.rs` (`trace_verdict(dir)`) reads one dump. It names the proven residual counts (operator, port, time) and the records lost to a retired link, with what retired it and what their sender had committed at their time. It also gives the evidence for three hypotheses about an S3 or residual failure:
+
+- **(a) A missing `+n`.** At a worker's S2b success, a `+n` that a peer committed before it, at a location in the worker's scope, was not among the changes the worker had applied from that peer. The commit's batches on the lane are located through `frames_before`/`frames`, so a fragment still pending that holds only negatives is not evidence. A commit that releases a capability without the `+n` for records already sent is listed with the lost records, not judged: a `+n` is counted when output is taken, possibly sweeps before the push, and is consolidated within its commit.
+- **(b) A duplicate push.** A pusher delivered more records at a time than its port produced, a worker sent more records over the network to one worker than its port produced (a broadcast sends each record to every worker), or a channel received more records, or a higher frame number, than its sender sent. A receive is judged only once the sender's ring has recorded past it, so a dump taken between a send and its record is not evidence.
+- **(c) A success outside S2b.** A success was returned or reported without the decision module's S2b decision. At the coordinators: a node applied more worker successes than its workers reported, said goodbye before each of its workers reported success, or retired a link on its peer's end-of-stream before every progress channel from the peer ended or before the peer said goodbye.
+
+Checks that need a complete ring are skipped on a truncated one, and the verdict says so. Rings are read one after another, so each ring header gives the time it was read (`snapshot_t_ns`): a check that needs a ring's events up to some moment is made only if the ring was read after it.
+
 ### 11.7 Probes
 
 ```rust

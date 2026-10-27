@@ -112,9 +112,12 @@ fn spawn_pending(
     // These tests time scheduling of hundreds of thousands of one-record
     // batches against wall-clock deadlines. The progress checker (on in debug
     // builds) costs several microseconds per batch there, so it would time
-    // the checker instead; they check scheduling, not progress.
+    // the checker instead; they check scheduling, not progress. The same
+    // goes for the progress flight recorder, when a dump destination is set.
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     instancy::progress::check::set_mode(instancy::progress::check::Mode::Off);
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    instancy::progress::trace::set_dir(None);
     rt.spawn(dataflow, SpawnOptions::new().priority(priority))
         .unwrap()
 }

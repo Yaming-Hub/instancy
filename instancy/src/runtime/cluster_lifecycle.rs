@@ -797,6 +797,79 @@ impl LifecycleMachine {
     }
 
     fn on_link_event(&mut self, peer_id: String, event: LinkEvent) -> Vec<Action> {
+        #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+        let traced = self
+            .trace_link_before(&peer_id, &event)
+            .map(|before| (peer_id.clone(), before));
+        let actions = self.apply_link_event(peer_id, event);
+        traced! {
+            if let Some((peer_id, before)) = traced {
+                self.trace_link_after(&peer_id, before);
+            }
+        }
+        actions
+    }
+
+    /// The flight recorder: what a link event is (its code and detail; see
+    /// `trace::Kind::Link`), and whether the link was retired before it.
+    /// `None` when the link records nothing.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn trace_link_before(
+        &self,
+        peer_id: &str,
+        event: &LinkEvent,
+    ) -> Option<(usize, Option<String>, bool)> {
+        let peer = self.peers.get(peer_id)?;
+        peer.link.recorder()?;
+        let (code, detail) = match event {
+            LinkEvent::ProgressEndOfStream => (1, None),
+            LinkEvent::ProgressChannelEnded(failure) => (2, Some(failure.to_string())),
+            LinkEvent::DataChannelEnded(failure) => (3, Some(failure.to_string())),
+            LinkEvent::OutboundFailed(failure) => (4, Some(failure.to_string())),
+            LinkEvent::AckReceived => (5, None),
+            LinkEvent::CancelReceived => (6, None),
+            LinkEvent::ControlClosed => (7, None),
+            LinkEvent::ControlUndecodable(detail) => (8, Some(detail.clone())),
+            LinkEvent::InboundDataLost(detail) => (9, Some(detail.clone())),
+            LinkEvent::ConnectionFailed(error) => (10, Some(error.to_string())),
+        };
+        Some((code, detail, peer.link.is_retired()))
+    }
+
+    /// The flight recorder: a link event and the link's state after it
+    /// (whether it retired the link).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn trace_link_after(
+        &self,
+        peer_id: &str,
+        (code, detail, was_retired): (usize, Option<String>, bool),
+    ) {
+        use crate::progress::trace::{Ev, Kind, Note};
+        let Some(peer) = self.peers.get(peer_id) else {
+            return;
+        };
+        let Some(recorder) = peer.link.recorder() else {
+            return;
+        };
+        let retired = peer.link.is_retired();
+        let flags = u64::from(peer.goodbye_received)
+            | u64::from(peer.ack_received) << 1
+            | u64::from(retired) << 2
+            | u64::from(peer.lost) << 3;
+        recorder.record(
+            Ev::new(Kind::Link)
+                .a(code)
+                .w(0, flags)
+                .w(1, peer.end_of_stream as u64)
+                .w(2, peer.expected_end_of_stream as u64)
+                .w(3, u64::from(retired && !was_retired)),
+        );
+        if let Some(detail) = detail {
+            recorder.note(Note::LinkDetail, &detail);
+        }
+    }
+
+    fn apply_link_event(&mut self, peer_id: String, event: LinkEvent) -> Vec<Action> {
         let event = match event {
             LinkEvent::InboundDataLost(detail) => {
                 return self.on_inbound_data_lost(peer_id, detail, false);
@@ -1390,6 +1463,10 @@ pub(crate) struct ClusterLifecycle {
     pub(crate) unfinished_announced: bool,
     /// The first local worker error other than a cancellation.
     pub(crate) worker_failure: Option<String>,
+    /// The flight recorder: a dump of records lost on the way in, written
+    /// once the actions the loss led to were taken.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    pub(crate) trace_pending: Option<String>,
     /// Completes waiters when dropped, after every field above.
     pub(crate) _teardown: TeardownNotifier,
 }
@@ -1446,8 +1523,14 @@ impl ClusterLifecycle {
                     continue;
                 }
                 if self.perform(action).await {
+                    traced! {
+                        self.fire_trace_pending();
+                    }
                     return;
                 }
+            }
+            traced! {
+                self.fire_trace_pending();
             }
             // A peer that stopped without finishing its part sends no more
             // progress: its lanes close (after the actions above, so a
@@ -1474,10 +1557,40 @@ impl ClusterLifecycle {
                 peer,
                 event: LinkEvent::InboundDataLost(detail),
             } => {
+                #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+                let traced = {
+                    let recorder = self
+                        .outboxes
+                        .get(&peer)
+                        .and_then(|outbox| outbox.link().recorder());
+                    (recorder.is_some() || crate::progress::trace::enabled())
+                        .then(|| (recorder, peer.clone(), detail.clone()))
+                };
                 let cancelled = self.dataflow_cancel.is_cancelled();
-                self.machine.on_inbound_data_lost(peer, detail, cancelled)
+                let actions = self.machine.on_inbound_data_lost(peer, detail, cancelled);
+                // Dumped once the actions the loss led to are taken: a dump
+                // must never delay the failure.
+                traced! {
+                    use crate::progress::trace::{Ev, Kind, Note};
+                    if let Some((recorder, peer, detail)) = traced {
+                        if let Some(recorder) = recorder {
+                            recorder.record(Ev::new(Kind::Link).a(9));
+                            recorder.note(Note::Loss, &detail);
+                        }
+                        self.trace_pending
+                            .get_or_insert(format!("records from peer {peer} were lost: {detail}"));
+                    }
+                }
+                actions
             }
             LifecycleEvent::WorkerFinished { success, failure } => {
+                traced! {
+                    self.trace_coordinator(
+                        None,
+                        crate::progress::trace::coordinator::WORKER_FINISHED,
+                        u64::from(success),
+                    );
+                }
                 if let Some(failure) = failure {
                     self.worker_failure.get_or_insert(failure);
                 }
@@ -1487,6 +1600,34 @@ impl ClusterLifecycle {
                 })
             }
             event => self.machine.on_event(event),
+        }
+    }
+
+    /// The flight recorder: write the dump of records lost on the way in,
+    /// once the actions the loss led to were taken.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn fire_trace_pending(&mut self) {
+        if let Some(reason) = self.trace_pending.take() {
+            crate::progress::trace::trigger(
+                self.dataflow_id,
+                crate::progress::trace::Trigger::InboundDataLost,
+                &reason,
+            );
+        }
+    }
+
+    /// The flight recorder: the coordinator's `action` (see
+    /// `trace::coordinator`) on `peer`'s link, or on every link.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn trace_coordinator(&self, peer: Option<&str>, action: usize, value: u64) {
+        use crate::progress::trace::{Ev, Kind};
+        for (id, outbox) in &self.outboxes {
+            if peer.is_some_and(|peer| peer != id) {
+                continue;
+            }
+            if let Some(recorder) = outbox.link().recorder() {
+                recorder.record(Ev::new(Kind::Coordinator).a(action).w(0, value));
+            }
         }
     }
 
@@ -1537,6 +1678,13 @@ impl ClusterLifecycle {
                         channel_id,
                         payload: encode_progress_ack(),
                     });
+                }
+                traced! {
+                    self.trace_coordinator(
+                        Some(&peer),
+                        crate::progress::trace::coordinator::ACK_SENT,
+                        0,
+                    );
                 }
                 false
             }
@@ -1607,6 +1755,23 @@ impl ClusterLifecycle {
             let Some(&(peer_start, peer_end)) = self.peer_workers.get(peer) else {
                 continue;
             };
+            // Recorded before the frames are queued: the peer may apply them
+            // (and retire its link) before this thread runs again.
+            traced! {
+                if let Some(recorder) = outbox.link().recorder() {
+                    let channels = (self.local_workers.0..self.local_workers.1)
+                        .flat_map(|src| (peer_start..peer_end).map(move |dst| (src, dst)))
+                        .filter(|&(src, dst)| {
+                            progress_channel_id(src, dst, self.total_workers).is_ok()
+                        })
+                        .count();
+                    recorder.record(
+                        crate::progress::trace::Ev::new(crate::progress::trace::Kind::Coordinator)
+                            .a(crate::progress::trace::coordinator::GOODBYE_SENT)
+                            .w(0, channels as u64),
+                    );
+                }
+            }
             for src in self.local_workers.0..self.local_workers.1 {
                 for dst in peer_start..peer_end {
                     let Ok(channel_id) = progress_channel_id(src, dst, self.total_workers) else {
@@ -1623,6 +1788,13 @@ impl ClusterLifecycle {
     }
 
     async fn teardown(&mut self, graceful: bool) {
+        traced! {
+            self.trace_coordinator(
+                None,
+                crate::progress::trace::coordinator::TEARDOWN,
+                u64::from(graceful),
+            );
+        }
         self.bridge_cancel.cancel();
         if let Some(id) = self.peer_registration.take() {
             self.peer_registry.unregister(id);

@@ -47,6 +47,18 @@
 // Inherent to the trait-object-heavy dataflow design (Push/Pull/Codec generics).
 #![allow(clippy::type_complexity)]
 
+/// Compiles its statements only into builds with the progress trace
+/// recorder (`debug_assertions`, `progress-check` or `test-utils`; see
+/// `progress::trace`).
+macro_rules! traced {
+    ($($body:tt)*) => {
+        #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+        {
+            $($body)*
+        }
+    };
+}
+
 pub mod cancellation;
 pub mod communication;
 pub mod dataflow;

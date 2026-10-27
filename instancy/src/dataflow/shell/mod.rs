@@ -290,6 +290,9 @@ pub(crate) struct CountedInput<T: Timestamp, D: Send + 'static> {
     pull: Box<dyn Pull<T, D>>,
     handle: InputHandle<T, D>,
     ledger: PortLedger<T>,
+    /// `(operator, port)`, for the flight recorder (`progress::trace`).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    trace_at: Option<(usize, usize)>,
 }
 
 impl<T: Timestamp, D: Send + 'static> CountedInput<T, D> {
@@ -311,7 +314,15 @@ impl<T: Timestamp, D: Send + 'static> CountedInput<T, D> {
             pull,
             handle,
             ledger,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace_at: None,
         }
+    }
+
+    /// Name this port `(operator, port)` in the flight recorder's events.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    pub(in crate::dataflow) fn trace_at(&mut self, operator: usize, port: usize) {
+        self.trace_at = Some((operator, port));
     }
 
     /// The logic's view of the port.
@@ -348,6 +359,20 @@ impl<T: Timestamp, D: Send + 'static> CountedInput<T, D> {
         while let Some(envelope) = self.pull.pull() {
             match envelope.payload {
                 Payload::Data { time, data } => {
+                    traced! {
+                        if let Some((operator, port)) = self.trace_at {
+                            use crate::progress::trace::{self, Ev, Kind, Site};
+                            trace::with(Site::Input, |recorder| {
+                                recorder.record(
+                                    Ev::new(Kind::InputPull)
+                                        .a(port)
+                                        .b(operator)
+                                        .time(trace::time(&time))
+                                        .w(2, data.len() as u64),
+                                );
+                            });
+                        }
+                    }
                     self.handle.push_vec(time, data);
                     pulled = true;
                 }
@@ -395,6 +420,9 @@ pub(crate) struct CountedOutput<T: Timestamp, D: Send + 'static> {
     /// How many `Retained`s of this output are alive.
     retained_live: Arc<AtomicUsize>,
     closed: bool,
+    /// `(operator, port)`, for the flight recorder (`progress::trace`).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    trace_at: Option<(usize, usize)>,
 }
 
 impl<T: Timestamp, D: Send + 'static> CountedOutput<T, D> {
@@ -430,7 +458,15 @@ impl<T: Timestamp, D: Send + 'static> CountedOutput<T, D> {
             wake,
             retained_live: Arc::new(AtomicUsize::new(0)),
             closed: false,
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            trace_at: None,
         }
+    }
+
+    /// Name this port `(operator, port)` in the flight recorder's events.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    pub(in crate::dataflow) fn trace_at(&mut self, operator: usize, port: usize) {
+        self.trace_at = Some((operator, port));
     }
 
     /// The logic's view of the port.
@@ -486,6 +522,20 @@ impl<T: Timestamp, D: Send + 'static> CountedOutput<T, D> {
             if data.is_empty() {
                 continue;
             }
+            traced! {
+                if let Some((operator, port)) = self.trace_at {
+                    use crate::progress::trace::{self, Ev, Kind, Site};
+                    trace::with(Site::Output, |recorder| {
+                        recorder.record(
+                            Ev::new(Kind::OutputTaken)
+                                .a(port)
+                                .b(operator)
+                                .time(trace::time(&time))
+                                .w(2, data.len() as u64),
+                        );
+                    });
+                }
+            }
             produced.update(time.clone(), data.len() as i64);
             self.retry.push_back(Envelope::data(time, data));
         }
@@ -499,8 +549,41 @@ impl<T: Timestamp, D: Send + 'static> CountedOutput<T, D> {
 
     /// Push the retry queue into the channel. `Ok(false)` on backpressure.
     fn flush(&mut self, _: &ShellToken) -> Result<bool> {
+        // Exchange and broadcast pushes name this port in their events.
+        #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+        let _port = self
+            .trace_at
+            .filter(|_| crate::progress::trace::active())
+            .map(|(operator, port)| crate::progress::trace::port_scope(operator, port));
         while let Some(envelope) = self.retry.pop_front() {
-            match self.push.try_push(envelope) {
+            #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+            let pushed = self.trace_at.and_then(|at| match &envelope.payload {
+                Payload::Data { time, data } => {
+                    Some((at, crate::progress::trace::time(time), data.len() as u64))
+                }
+                Payload::Control(_) => None,
+            });
+            let result = self.push.try_push(envelope);
+            traced! {
+                if let Some(((operator, port), time, records)) = pushed {
+                    use crate::progress::trace::{self, Ev, Kind, Outcome, Site};
+                    let outcome = match &result {
+                        Ok(()) => Outcome::Accepted,
+                        Err((error, _)) => Outcome::of_error(error),
+                    };
+                    trace::with(Site::Output, |recorder| {
+                        recorder.record(
+                            Ev::new(Kind::OutputPush)
+                                .a(port)
+                                .b(operator)
+                                .time(time)
+                                .w(2, records)
+                                .w(3, outcome as u64),
+                        );
+                    });
+                }
+            }
+            match result {
                 Ok(()) => {}
                 Err((Error::Backpressure, returned)) => {
                     #[cfg(any(debug_assertions, feature = "progress-check"))]

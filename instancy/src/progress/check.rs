@@ -256,6 +256,11 @@ pub fn set_mode(mode: Mode) {
     MODE.store(encode_mode(mode), Ordering::Relaxed);
 }
 
+/// Dump the progress trace of a dataflow (see the flight recorder,
+/// `progress::trace`): for test harnesses, on any unexpected outcome.
+#[doc(hidden)]
+pub use crate::progress::trace::dump_traces;
+
 /// Whether any checking is enabled.
 pub(crate) fn enabled() -> bool {
     mode() != Mode::Off
@@ -299,11 +304,108 @@ fn log() -> MutexGuard<'static, Log> {
 }
 
 /// Every queued hook applied, and the background thread kept from dropping
-/// an oracle until the guard is released: what a reader sees is complete.
-fn settle() -> MutexGuard<'static, ()> {
+/// an oracle until the guard is released: what a reader sees is complete,
+/// and the flight recorder's dump of every finding applied before the call
+/// is written (a finding applied concurrently, by a worker still running,
+/// may still be writing its own).
+fn settle() -> Settled {
     let pass = pass();
+    // Dumps of findings applied before (by a worker, or by the background
+    // thread after its pass) are written.
+    drop(dumps_in_flight().write().unwrap_or_else(|e| e.into_inner()));
+    let dumps = DeferDumps::new();
     drain_all();
-    pass
+    Settled {
+        _pass: pass,
+        _dumps: dumps,
+    }
+}
+
+/// See [`settle`]. The flight recorder's dumps the drain triggered are
+/// written once the pass is released (fields drop in order).
+struct Settled {
+    _pass: MutexGuard<'static, ()>,
+    _dumps: DeferDumps,
+}
+
+/// Held (shared) by each thread from before it applies checker events (or
+/// logs a finding outside them) until it has written the flight recorder
+/// dumps they triggered (see [`DeferDumps`]); a reader takes it (exclusive)
+/// to wait for those dumps. A thread takes it shared holding no oracle
+/// lock and no pass (the background thread takes it after its pass), and
+/// only once: a reader takes it exclusive holding the pass.
+fn dumps_in_flight() -> &'static std::sync::RwLock<()> {
+    static IN_FLIGHT: std::sync::RwLock<()> = std::sync::RwLock::new(());
+    &IN_FLIGHT
+}
+
+thread_local! {
+    /// The flight recorder's checker dumps [`record`] triggered on this
+    /// thread while a [`DeferDumps`] is alive.
+    static DEFERRED_DUMPS: std::cell::RefCell<Option<Vec<(DataflowId, String)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// While alive, the flight recorder's checker dumps that [`record`] triggers
+/// on this thread wait, and are written when it drops. It is taken before an
+/// oracle's state lock (or after the background thread's pass) and dropped
+/// after it, so that writing a dump never holds up the dataflow's other
+/// workers or the checker: the recorder must not perturb the run it
+/// records. Unwinding (a violation in panic mode), the dump is left to the
+/// thread's worker, which writes it once it has caught the panic and
+/// recorded its exit.
+struct DeferDumps {
+    /// The thread's outermost guard (the one that writes the dumps) holds
+    /// [`dumps_in_flight`] until they are written.
+    outermost: Option<std::sync::RwLockReadGuard<'static, ()>>,
+}
+
+impl DeferDumps {
+    fn new() -> Self {
+        let outermost = crate::progress::trace::enabled()
+            && DEFERRED_DUMPS
+                .try_with(|d| {
+                    let mut d = d.borrow_mut();
+                    let outermost = d.is_none();
+                    if outermost {
+                        *d = Some(Vec::new());
+                    }
+                    outermost
+                })
+                .unwrap_or(false);
+        Self {
+            outermost: outermost
+                .then(|| dumps_in_flight().read().unwrap_or_else(|e| e.into_inner())),
+        }
+    }
+}
+
+impl Drop for DeferDumps {
+    fn drop(&mut self) {
+        if self.outermost.is_none() {
+            return;
+        }
+        use crate::progress::trace::{self, Trigger};
+        // Still the outermost guard while it writes (a dump's own findings,
+        // if any, are written too).
+        loop {
+            let dumps = DEFERRED_DUMPS
+                .try_with(|d| d.borrow_mut().as_mut().map(std::mem::take))
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            if dumps.is_empty() {
+                break;
+            }
+            for (id, text) in dumps {
+                if std::thread::panicking() && trace::defer_current(id, Trigger::Checker, &text) {
+                    continue;
+                }
+                trace::trigger(id, Trigger::Checker, &text);
+            }
+        }
+        let _ = DEFERRED_DUMPS.try_with(|d| d.borrow_mut().take());
+    }
 }
 
 /// Every violation recorded so far in this process (and still in the log).
@@ -447,6 +549,22 @@ pub(crate) fn record(
         }
     }
     let message = panics.then(|| violation.to_string());
+    let mut dump = match dataflow {
+        Some(id) if crate::progress::trace::enabled() => Some((id, violation.to_string())),
+        _ => None,
+    };
+    // The flight recorder's dump: under an oracle's lock, deferred until it
+    // is released (see `DeferDumps`); otherwise written here, before a
+    // panic can end the process, holding `dumps_in_flight` from before the
+    // violation is logged, as a `DeferDumps` would.
+    let _ = DEFERRED_DUMPS.try_with(|d| {
+        if let Some(deferred) = d.borrow_mut().as_mut() {
+            deferred.extend(dump.take());
+        }
+    });
+    let _in_flight = dump
+        .is_some()
+        .then(|| dumps_in_flight().read().unwrap_or_else(|e| e.into_inner()));
     {
         let mut log = log();
         if log.entries.len() >= LOG_CAPACITY {
@@ -456,6 +574,9 @@ pub(crate) fn record(
             }
         }
         log.entries.push_back(violation);
+    }
+    if let Some((id, text)) = dump {
+        crate::progress::trace::trigger(id, crate::progress::trace::Trigger::Checker, &text);
     }
     if let Some(message) = message {
         panic!("instancy progress check failed: {message}");
@@ -1212,8 +1333,11 @@ fn poll() {
         // violation panics on the thread that caused it.
         if mode() != Mode::Panic {
             // Held while this pass holds oracles, so that an oracle this
-            // pass drops last is finished before a reader looks.
-            let _pass = pass();
+            // pass drops last is finished before a reader looks. The
+            // flight recorder's dumps are written once it is released (a
+            // reader waits for them on `dumps_in_flight`).
+            let pass = pass();
+            let dumps = DeferDumps::new();
             let sinks: Vec<Arc<dyn Sink>> = {
                 let mut live = live();
                 live.retain(|sink| sink.strong_count() > 0);
@@ -1233,6 +1357,8 @@ fn poll() {
                     sink.failed(what);
                 }
             }
+            drop(pass);
+            drop(dumps);
         }
         std::thread::sleep(POLL_EVERY);
     }
@@ -1251,6 +1377,27 @@ fn drain_all() {
 fn pass() -> MutexGuard<'static, ()> {
     static PASS: Mutex<()> = Mutex::new(());
     PASS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// An oracle's state lock, from [`Oracle::sync`]: released before the
+/// flight recorder's dumps it deferred are written (fields drop in order).
+struct Synced<'a, T: Timestamp> {
+    state: MutexGuard<'a, State<T>>,
+    _dumps: DeferDumps,
+}
+
+impl<T: Timestamp> std::ops::Deref for Synced<'_, T> {
+    type Target = State<T>;
+
+    fn deref(&self) -> &State<T> {
+        &self.state
+    }
+}
+
+impl<T: Timestamp> std::ops::DerefMut for Synced<'_, T> {
+    fn deref_mut(&mut self) -> &mut State<T> {
+        &mut self.state
+    }
 }
 
 impl<T: Timestamp> Oracle<T> {
@@ -1302,8 +1449,10 @@ impl<T: Timestamp> Oracle<T> {
         }
     }
 
-    /// The state, with every queued event applied.
-    fn sync(&self) -> MutexGuard<'_, State<T>> {
+    /// The state, with every queued event applied. The flight recorder's
+    /// dumps a finding triggers meanwhile are written once it is released.
+    fn sync(&self) -> Synced<'_, T> {
+        let dumps = DeferDumps::new();
         let mut state = self.lock();
         loop {
             // The queue gets the previous batch's (empty) buffer back, so
@@ -1315,7 +1464,10 @@ impl<T: Timestamp> Oracle<T> {
             );
             if events.is_empty() {
                 state.spare = events;
-                return state;
+                return Synced {
+                    state,
+                    _dumps: dumps,
+                };
             }
             let mut found = Vec::new();
             for event in events.drain(..) {
@@ -1409,7 +1561,9 @@ impl<T: Timestamp> Oracle<T> {
         self.emit_locked(&mut state, found);
     }
 
-    /// `emit` under the state lock (recording takes only the log's lock).
+    /// `emit` under the state lock. Recording takes only the log's lock; a
+    /// flight recorder dump it triggers is written once the state lock is
+    /// released (see [`DeferDumps`]).
     fn emit_locked(&self, state: &mut State<T>, found: Vec<Found>) {
         for f in found {
             let logged = state.logged.entry((f.check, f.kind, f.site)).or_insert(0);
