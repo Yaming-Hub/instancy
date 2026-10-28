@@ -7,9 +7,25 @@
 //! - Handles multiple iterations until convergence
 //! - Works with the spawned dataflow API (external input/output)
 
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
+
 use instancy::dataflow::dataflow_builder::IterateResult;
 use instancy::order::Product;
 use instancy::{DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions};
+
+/// Records observed inside a loop, with their timestamps.
+type Seen<T> = Arc<Mutex<Vec<(T, u64)>>>;
+
+/// Run `f` on another thread and fail the test if it takes over 30 s.
+fn with_timeout<R: Send + 'static>(what: &str, f: impl FnOnce() -> R + Send + 'static) -> R {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|_| panic!("{what}: did not finish within 30 s"))
+}
 
 /// Simple doubling loop: each value doubles until it exceeds a threshold.
 ///
@@ -305,4 +321,71 @@ async fn iterate_collatz_sequence() {
     // All values converge to 1
     assert_eq!(results.len(), 3);
     assert!(results.iter().all(|&x| x == 1));
+}
+
+/// An `iterate` whose output is the loop variable itself, with no operator in
+/// between, passes every record through once, unchanged, at its outer time;
+/// inside the loop each record is seen once, at inner time 0. With no input
+/// the same loop sees and outputs nothing, and the dataflow completes. The
+/// feedback branch carries nothing.
+#[test]
+fn iterate_with_the_loop_variable_as_output_passes_records_through_at_their_outer_time() {
+    for records in [(0..10u64).collect::<Vec<_>>(), Vec::new()] {
+        let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+        let builder = DataflowBuilder::<u64>::new("pass-through-scope");
+        let inside: Seen<Product<u64, u32>> = Arc::default();
+        let observer = Arc::clone(&inside);
+        builder
+            .input::<u64>("data")
+            .unwrap()
+            .iterate::<u32>("scope", 1u32, move |var| {
+                let observed =
+                    var.clone()
+                        .inspect("inside", move |t: &Product<u64, u32>, x: &u64| {
+                            observer.lock().unwrap().push((*t, *x));
+                        });
+                IterateResult {
+                    feedback: observed.filter("unused", |_t, _x| false),
+                    output: var,
+                }
+            })
+            .output("out")
+            .unwrap();
+        let mut spawned = rt
+            .spawn(builder.build().unwrap(), SpawnOptions::default())
+            .unwrap();
+        let sender = spawned.take_input::<u64>("data").unwrap();
+        let receiver = spawned.take_output::<u64>("out").unwrap();
+        // With no records, nothing is sent at all, not even an empty batch.
+        if !records.is_empty() {
+            sender.send(0, records.clone()).unwrap();
+        }
+        drop(sender);
+        let (joined, collected) = with_timeout("pass-through-scope", move || {
+            (spawned.join_blocking(), receiver.collect_data())
+        });
+        joined.unwrap();
+        let mut out: Vec<(u64, u64)> = collected
+            .into_iter()
+            .flat_map(|(t, d)| d.into_iter().map(move |x| (t, x)))
+            .collect();
+        out.sort_unstable();
+        assert_eq!(
+            out,
+            records.iter().map(|x| (0, *x)).collect::<Vec<_>>(),
+            "{} records",
+            records.len()
+        );
+        let mut inside = inside.lock().unwrap().clone();
+        inside.sort();
+        assert_eq!(
+            inside,
+            records
+                .iter()
+                .map(|x| (Product::new(0, 0), *x))
+                .collect::<Vec<_>>(),
+            "{} records",
+            records.len()
+        );
+    }
 }

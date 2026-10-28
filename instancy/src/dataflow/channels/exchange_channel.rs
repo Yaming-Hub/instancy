@@ -2674,3 +2674,8 @@ mod tests {
         let _ = set.take_pair(0);
     }
 }
+
+// An empty batch, or a target's empty share of one, never reaches, wakes or
+// is refused by that target.
+#[cfg(test)]
+mod empty_batch_tests;

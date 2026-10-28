@@ -1282,3 +1282,8 @@ impl<L: OperatorLogic> SchedulableOperator for OperatorShell<L> {
         true
     }
 }
+
+// A record the output owes holds the frontier until a later flush delivers
+// it, even after its produced count was drained.
+#[cfg(test)]
+mod owed_delivery_tests;

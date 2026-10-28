@@ -88,6 +88,12 @@ fn delay_batch_shifts_timestamps() {
     // No data at original timestamps
     assert!(!by_time.contains_key(&0));
     assert!(!by_time.contains_key(&5));
+
+    // Each batch arrives at the time its function gives, and at no other time.
+    assert!(
+        by_time.is_empty(),
+        "records at unexpected times: {by_time:?}"
+    );
 }
 
 #[test]
@@ -193,6 +199,12 @@ fn delay_per_item_routes_by_content() {
     let mut t10 = by_time.remove(&10).unwrap_or_default();
     t10.sort();
     assert_eq!(t10, vec![200, 300]);
+
+    // Each record arrives at the time its function gives, and at no other time.
+    assert!(
+        by_time.is_empty(),
+        "records at unexpected times: {by_time:?}"
+    );
 }
 
 #[test]

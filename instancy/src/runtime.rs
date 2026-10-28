@@ -5862,6 +5862,17 @@ fn num_cpus() -> usize {
 mod tests {
     use super::*;
 
+    /// Runs `f` on its own thread; the test fails if it takes over 30 s, so a
+    /// dataflow that never completes fails instead of hanging.
+    fn within<R: Send + 'static>(what: &str, f: impl FnOnce() -> R + Send + 'static) -> R {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("{what}: did not finish within 30 s"))
+    }
+
     #[test]
     fn create_default_runtime() {
         let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
@@ -6870,32 +6881,33 @@ mod tests {
         in1.send(0u64, vec![20, 21, 22, 23]).unwrap();
         in1.close();
 
-        let _ = multi.join_blocking();
+        let (out0, out1) = within("exchange to two workers", move || {
+            multi.join_blocking().unwrap();
+            (out0.collect_data(), out1.collect_data())
+        });
 
-        // Worker 0 should receive all even numbers.
-        let mut worker0_data: Vec<i32> = out0
-            .collect_data()
+        // Complete timestamped output per destination worker; records are
+        // routed by the closure's value modulo the number of workers.
+        let mut worker0_data: Vec<(u64, i32)> = out0
             .into_iter()
-            .flat_map(|(_t, batch)| batch)
+            .flat_map(|(t, batch)| batch.into_iter().map(move |x| (t, x)))
             .collect();
         worker0_data.sort();
 
-        // Worker 1 should receive all odd numbers.
-        let mut worker1_data: Vec<i32> = out1
-            .collect_data()
+        let mut worker1_data: Vec<(u64, i32)> = out1
             .into_iter()
-            .flat_map(|(_t, batch)| batch)
+            .flat_map(|(t, batch)| batch.into_iter().map(move |x| (t, x)))
             .collect();
         worker1_data.sort();
 
         assert_eq!(
             worker0_data,
-            vec![10, 12, 14, 20, 22],
+            vec![(0, 10), (0, 12), (0, 14), (0, 20), (0, 22)],
             "worker0 got wrong data"
         );
         assert_eq!(
             worker1_data,
-            vec![11, 13, 15, 21, 23],
+            vec![(0, 11), (0, 13), (0, 15), (0, 21), (0, 23)],
             "worker1 got wrong data; worker0 was: {worker0_data:?}"
         );
     }
@@ -6925,15 +6937,18 @@ mod tests {
         inp.send(0u64, vec![1, 2, 3]).unwrap();
         inp.close();
 
-        let _ = multi.join_blocking();
+        let out = within("exchange on one worker", move || {
+            multi.join_blocking().unwrap();
+            out.collect_data()
+        });
 
-        let mut results: Vec<i32> = out
-            .collect_data()
+        // On one worker every record arrives once, at its time.
+        let mut results: Vec<(u64, i32)> = out
             .into_iter()
-            .flat_map(|(_t, batch)| batch)
+            .flat_map(|(t, batch)| batch.into_iter().map(move |x| (t, x)))
             .collect();
         results.sort();
-        assert_eq!(results, vec![1, 2, 3]);
+        assert_eq!(results, vec![(0, 1), (0, 2), (0, 3)]);
     }
 
     #[test]
@@ -7797,9 +7812,12 @@ mod tests {
         sender.send(0, vec![1, 2]).unwrap();
         sender.close();
 
-        // Close other workers' inputs
+        // Workers 1 and 2 each send 1, so each of the three workers' maps
+        // shows the value it observed: every one of the three workers
+        // observes the configured value.
         for i in 1..3 {
             let s = handle.take_input::<i32>(i, "data").unwrap();
+            s.send(0, vec![1]).unwrap();
             s.close();
         }
 
@@ -7810,14 +7828,132 @@ mod tests {
             all_data.push(receiver);
         }
 
-        handle.join_blocking().unwrap();
+        let per_worker: Vec<Vec<(u64, i32)>> = within("context on three workers", move || {
+            handle.join_blocking().unwrap();
+            all_data
+                .into_iter()
+                .map(|r| r.collect_data())
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .map(|batches| {
+            let mut data: Vec<(u64, i32)> = batches
+                .into_iter()
+                .flat_map(|(t, d)| d.into_iter().map(move |x| (t, x)))
+                .collect();
+            data.sort();
+            data
+        })
+        .collect();
+        assert_eq!(
+            per_worker,
+            vec![vec![(0, 5), (0, 10)], vec![(0, 5)], vec![(0, 5)]]
+        );
+    }
 
-        let mut collected: Vec<i32> = all_data
+    /// Every operator is built with its own worker's `WorkerContext`: index 0
+    /// of 1 on one worker, and each worker's own index of 3 on three. The
+    /// test wraps the `observe` operator's factory to record the context each
+    /// worker builds it with, on one worker (`spawn`) and on three
+    /// (`spawn_planned`, the path `spawn_multi` takes after building).
+    #[test]
+    fn executing_operators_receive_their_worker_context() {
+        use crate::dataflow::schedulable::OperatorFactory;
+
+        let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+        let build = |seen: &Arc<Mutex<Vec<(usize, usize)>>>| {
+            let builder = DataflowBuilder::<u64>::new("worker-context");
+            builder
+                .input::<i32>("data")
+                .unwrap()
+                .map("observe", |_t, x| x)
+                .output("out")
+                .unwrap();
+            let mut dataflow = builder.build().unwrap();
+            let observe = dataflow
+                .graph
+                .operators()
+                .find(|op| op.name == "observe")
+                .unwrap()
+                .index;
+            let (_, factory) = dataflow
+                .operator_factories
+                .iter_mut()
+                .find(|(index, _)| *index == observe)
+                .unwrap();
+            let mut inner = std::mem::replace(factory, OperatorFactory::new(|_, _| unreachable!()));
+            let seen = Arc::clone(seen);
+            *factory = OperatorFactory::new(move |ctx, endpoints| {
+                seen.lock()
+                    .unwrap()
+                    .push((ctx.worker_index(), ctx.num_workers()));
+                inner.build(ctx, endpoints)
+            });
+            dataflow
+        };
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut handle = rt.spawn(build(&seen), SpawnOptions::default()).unwrap();
+        let out = handle.take_output::<i32>("out").unwrap();
+        let input = handle.take_input::<i32>("data").unwrap();
+        input.send(0, vec![1]).unwrap();
+        input.close();
+        let output: Vec<(u64, i32)> = within("context on one worker", move || {
+            handle.join_blocking().unwrap();
+            out.collect_data()
+        })
+        .into_iter()
+        .flat_map(|(t, d)| d.into_iter().map(move |x| (t, x)))
+        .collect();
+        assert_eq!(output, vec![(0, 1)]);
+        assert_eq!(*seen.lock().unwrap(), vec![(0, 1)]);
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let dataflow = build(&seen);
+        let plan =
+            PhysicalPlan::new(&dataflow.graph, &dataflow.stages, Parallelism::Uniform(3)).unwrap();
+        let options = SpawnOptions::default();
+        let mut multi = rt
+            .spawn_planned(
+                "worker-context",
+                dataflow,
+                plan,
+                options.io_mode.into(),
+                options.metrics_config,
+                options.priority,
+                None,
+                None,
+            )
+            .unwrap();
+        let outs = multi.take_all_outputs::<i32>("out").unwrap();
+        for (w, input) in multi
+            .take_all_inputs::<i32>("data")
+            .unwrap()
             .into_iter()
-            .flat_map(|r| r.collect_data().into_iter().flat_map(|(_, d)| d))
+            .enumerate()
+        {
+            input.send(0, vec![w as i32]).unwrap();
+            input.close();
+        }
+        let per_worker: Vec<Vec<(u64, i32)>> =
+            within("context on three planned workers", move || {
+                multi.join_blocking().unwrap();
+                outs.into_iter()
+                    .map(|out| out.collect_data())
+                    .collect::<Vec<_>>()
+            })
+            .into_iter()
+            .map(|batches| {
+                batches
+                    .into_iter()
+                    .flat_map(|(t, d)| d.into_iter().map(move |x| (t, x)))
+                    .collect()
+            })
             .collect();
-        collected.sort();
-        assert_eq!(collected, vec![5, 10]);
+        assert_eq!(per_worker, vec![vec![(0, 0)], vec![(0, 1)], vec![(0, 2)]]);
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(seen, vec![(0, 3), (1, 3), (2, 3)]);
     }
 
     #[test]
@@ -8134,17 +8270,22 @@ mod tests {
 
         let mut handle = rt.spawn(dataflow).unwrap();
         let receiver = handle.take_output::<i32>("out").unwrap();
-        let data: Vec<(u64, Vec<i32>)> = receiver.collect_data();
+        let (data, joined): (Vec<(u64, Vec<i32>)>, _) =
+            within("finite generated source", move || {
+                let data = receiver.collect_data();
+                (data, handle.join_blocking())
+            });
+        joined.unwrap();
 
-        // Verify all timestamps and data are present.
-        let all_data: Vec<(u64, i32)> = data
+        // Verify all timestamps and data are present, each exactly once and
+        // nothing else: the finite generated source gives each value at its
+        // own time and then completes.
+        let mut all_data: Vec<(u64, i32)> = data
             .into_iter()
             .flat_map(|(t, vs)| vs.into_iter().map(move |v| (t, v)))
             .collect();
-        assert!(all_data.contains(&(0, 10)));
-        assert!(all_data.contains(&(1, 20)));
-        assert!(all_data.contains(&(2, 30)));
-        handle.join_blocking().unwrap();
+        all_data.sort();
+        assert_eq!(all_data, vec![(0, 10), (1, 20), (2, 30)]);
     }
 
     // -----------------------------------------------------------------------

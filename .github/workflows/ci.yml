@@ -42,13 +42,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2 pin
+        with:
+          tool: nextest@0.9.150
       - name: cargo build (no default features)
         run: cargo build -p instancy --no-default-features
       - name: cargo build (no default features, release)
         run: cargo build -p instancy --no-default-features --release
       # The library's own tests need the `test-utils` feature.
       - name: Tests (no default features)
-        run: cargo test -p instancy --no-default-features --features test-utils --lib --tests -- --test-threads=4
+        run: cargo nextest run -p instancy --no-default-features --features test-utils --lib --tests --profile ci --no-tests fail
 
   test:
     name: Test
@@ -61,10 +64,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Unit tests
-        run: cargo test -p instancy --lib --all-features -- --test-threads=4
-      - name: Integration tests
-        run: cargo test -p instancy --tests --all-features -- --test-threads=4
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2 pin
+        with:
+          tool: nextest@0.9.150
+      - name: Tests
+        run: cargo nextest run -p instancy --all-features --lib --tests --profile ci --no-tests fail
       - name: Doc tests
         run: cargo test -p instancy --doc --all-features
       # Every audit repro must pass. Each runs in its own child process with

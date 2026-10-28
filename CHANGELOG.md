@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### CI
+
+- **Unit and integration tests run under cargo-nextest 0.9.150**, each
+  test once and in its own process: no retries, and a test still running
+  after 120 s is terminated and fails (one test has 180 s), as does a run
+  that selects no tests. The Test job no longer runs the library's unit
+  tests twice. Doc tests, the audit repros, the full conformance matrix
+  and the release flight-recorder check keep their own commands. See
+  `docs/testing/nextest.md`.
+
+### Tests
+
+- **Probes over TCP stay exact while inputs are open.** On two-node
+  clusters over Dedicated and Shared TCP, rounds of records routed by
+  value (sent from every worker, or from one worker while the others only
+  advance their inputs) and timed requests through a filter that drops
+  everything are checked round by round: each wait ends only with every
+  probe exactly at the time the inputs were advanced to and every earlier
+  record already delivered, and no probe moves back
+  (`tests/probe_cluster.rs`).
+- **Empty batches and owed records on the exchange.** Unit tests drive the
+  real exchange pusher with empty and skewed batches into bounded targets
+  (an empty share is never sent, never wakes a target and is never refused
+  by a full one), and a real counted output into a full exchange between
+  two real progress trackers (the frontier holds at the owed record's time
+  after its produced count is drained, and the next flush delivers it).
+  The second is checked on the output port and the trackers; the full
+  runtime path is a documented limit.
+- **Complete outputs and new coverage across the suite.** Existing tests
+  now assert their complete timestamped output, exact multiplicities and
+  frontiers where they checked only part of it, and new tests cover what
+  nothing checked before, without duplicate tests. `Pipe::exchange`'s
+  documentation shows, as a `compile_fail` doc test, that a record type
+  without a codec cannot be exchanged with the `transport` feature, and
+  `ExchangeData`'s documentation shows how to give a type a codec.
+
 ### Progress trace recorder
 
 - **A flight recorder for progress failures.** In debug builds and

@@ -180,10 +180,23 @@ fn many_epochs_completing_together_are_delivered_in_order() {
         }
         tx.advance_to(epochs).unwrap();
         drop(tx);
-        with_timeout("join", TIMEOUT, move || h.join_blocking()).unwrap();
-        c.join().unwrap();
+        let (joined, forwarded) =
+            with_timeout("join", TIMEOUT, move || (h.join_blocking(), c.join()));
+        joined.unwrap();
+        let forwarded = forwarded.unwrap();
         let order = order.lock().unwrap();
         assert_eq!(*order, (0..epochs).collect::<Vec<_>>(), "round {round}");
+        // Every batch is forwarded unchanged, at its own time.
+        let mut forwarded: Vec<(u64, u64)> = forwarded
+            .into_iter()
+            .flat_map(|(t, d)| d.into_iter().map(move |x| (t, x)))
+            .collect();
+        forwarded.sort_unstable();
+        assert_eq!(
+            forwarded,
+            (0..epochs).map(|e| (e, e)).collect::<Vec<_>>(),
+            "round {round}"
+        );
     }
 }
 

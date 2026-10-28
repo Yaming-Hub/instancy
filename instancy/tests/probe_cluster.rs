@@ -7,12 +7,22 @@
 //! must never move backwards (including while peers' initial capabilities are
 //! still in flight at startup), never report a time complete while data at
 //! that time still arrives on the stream, and reach the inputs' frontier.
+//!
+//! The stepped tests at the bottom drive a cluster from the test thread: they
+//! advance every input to a time, keep the inputs open and wait. Every probe
+//! must then reach exactly that time (a probe that is done or past it fails at
+//! once), and by then every record before that time must have reached its
+//! worker's output.
 
 #![cfg(feature = "transport")]
+
+#[path = "support/cluster_loopback.rs"]
+mod cluster_loopback;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use tokio::net::{TcpListener, TcpStream};
@@ -23,10 +33,11 @@ use instancy::communication::shared_transport::{
     ConnectionFactory, DynConnectionFactory, SharedPeerManager,
 };
 use instancy::communication::transport_session::PeerConnection;
+use instancy::dataflow::OutputEvent;
 use instancy::progress::frontier::Antichain;
 use instancy::{
-    ClusterTopology, DataflowBuilder, DataflowId, NodeConfig, ProbeHandle, Result, RuntimeConfig,
-    RuntimeHandle, SpawnOptions,
+    ClusterTopology, DataflowBuilder, DataflowId, InputSender, NodeConfig, OutputReceiver,
+    ProbeHandle, Result, RuntimeConfig, RuntimeHandle, SpawnOptions,
 };
 
 type Reader = tokio::net::tcp::OwnedReadHalf;
@@ -457,4 +468,400 @@ async fn shared_tcp_cluster_probes_are_monotone_conservative_and_live() {
     for round in 0..3 {
         run_cluster(true, round).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Probes driven step by step from the test thread
+// ---------------------------------------------------------------------------
+
+/// Workers in the stepped tests: one on node-a, two on node-b.
+const STEPPED_WORKERS: usize = 3;
+
+/// How long any one wait of a stepped test may take.
+const STEP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The probes a stepped dataflow's build registers, one per worker.
+type StepProbes = Arc<Mutex<Vec<ProbeHandle<u64>>>>;
+
+/// A dataflow with a `u64` input `in` and output `out` on every worker of a
+/// two-node cluster, driven from the test thread.
+struct Stepped {
+    inputs: Vec<InputSender<u64, u64>>,
+    outputs: Vec<OutputReceiver<u64, u64>>,
+    /// Each worker's output so far.
+    received: Vec<Vec<(u64, u64)>>,
+    probes: Vec<ProbeHandle<u64>>,
+    /// Each probe's frontier at its last read.
+    last: Vec<Antichain<u64>>,
+    join: JoinHandle<Result<()>>,
+    teardown: Box<dyn FnOnce()>,
+}
+
+impl Stepped {
+    fn start<F>(transport: cluster_loopback::Transport, build: F) -> Self
+    where
+        F: Fn(&mut DataflowBuilder<u64>, &StepProbes) -> Result<()> + Clone + Send + Sync + 'static,
+    {
+        let probes = StepProbes::default();
+        let built = Arc::clone(&probes);
+        let build = move |b: &mut DataflowBuilder<u64>| build(b, &built);
+        let tokio = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let topology = ClusterTopology::multi_node(vec![
+            NodeConfig::new("node-a", 1),
+            NodeConfig::new("node-b", STEPPED_WORKERS - 1),
+        ])
+        .expect("topology");
+        let (nodes, mut a, mut b) = tokio.block_on(cluster_loopback::spawn_pair(
+            transport,
+            topology,
+            DataflowId::new(),
+            build,
+            SpawnOptions::new(),
+        ));
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        for node in [&mut a, &mut b] {
+            assert_eq!(node.local_worker_range().0, inputs.len(), "worker order");
+            for local in 0..node.num_local_workers() {
+                inputs.push(node.take_input(local, "in").expect("input"));
+                outputs.push(node.take_output(local, "out").expect("output"));
+            }
+        }
+        let join = std::thread::spawn(move || {
+            let a = std::thread::spawn(move || a.join_blocking());
+            let b = std::thread::spawn(move || b.join_blocking());
+            let a = a.join().expect("node-a panicked");
+            let b = b.join().expect("node-b panicked");
+            a.and(b)
+        });
+        let teardown = move || {
+            drop(nodes);
+            tokio.shutdown_timeout(Duration::from_secs(1));
+        };
+        let probes = std::mem::take(&mut *probes.lock().unwrap());
+        assert_eq!(probes.len(), STEPPED_WORKERS, "one probe per worker");
+        let last = probes.iter().map(ProbeHandle::frontier).collect();
+        Self {
+            inputs,
+            outputs,
+            received: vec![Vec::new(); STEPPED_WORKERS],
+            probes,
+            last,
+            join,
+            teardown: Box::new(teardown),
+        }
+    }
+
+    fn send(&self, worker: usize, time: u64, data: Vec<u64>) {
+        self.inputs[worker].send(time, data).expect("send");
+    }
+
+    fn advance(&self, worker: usize, time: u64) {
+        self.inputs[worker].advance_to(time).expect("advance");
+    }
+
+    fn advance_all(&self, time: u64) {
+        for worker in 0..STEPPED_WORKERS {
+            self.advance(worker, time);
+        }
+    }
+
+    /// Take whatever each worker's output has delivered so far.
+    fn drain_outputs(&mut self) {
+        for (output, received) in self.outputs.iter().zip(&mut self.received) {
+            while let Some(event) = output.try_recv() {
+                if let OutputEvent::Data { time, data } = event {
+                    received.extend(data.into_iter().map(|x| (time, x)));
+                }
+            }
+        }
+    }
+
+    /// Read every probe, checking that none moved back since its last read.
+    fn read_probes(&mut self) -> Vec<Antichain<u64>> {
+        let now: Vec<Antichain<u64>> = self.probes.iter().map(ProbeHandle::frontier).collect();
+        for (probe, (before, now)) in self.last.iter().zip(&now).enumerate() {
+            assert!(
+                dominates(before, now),
+                "probe {probe} moved back from {before:?} to {now:?}"
+            );
+        }
+        self.last = now.clone();
+        now
+    }
+
+    /// Every input has been advanced to `time` and stays open: wait until
+    /// every probe is at exactly `time`. A probe that is done or past `time`
+    /// claims completion that cannot have happened yet, and fails at once.
+    /// Then every record before `time` must already have been delivered.
+    fn barrier(&mut self, time: u64, expected: &[Vec<(u64, u64)>]) {
+        let deadline = Instant::now() + STEP_TIMEOUT;
+        loop {
+            self.drain_outputs();
+            let frontiers = self.read_probes();
+            for (probe, frontier) in frontiers.iter().enumerate() {
+                assert!(
+                    !frontier.is_empty() && frontier.elements().iter().all(|t| *t <= time),
+                    "probe {probe} is at {frontier:?} while the inputs are open at {time}: \
+                     it reports completion that has not happened"
+                );
+            }
+            if frontiers
+                .iter()
+                .all(|frontier| frontier.elements() == [time])
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "probes stuck at {frontiers:?}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.drain_outputs();
+        for (worker, (received, expected)) in self.received.iter().zip(expected).enumerate() {
+            let before = |records: &[(u64, u64)]| {
+                sorted(records.iter().filter(|(t, _)| *t < time).copied().collect())
+            };
+            assert_eq!(
+                before(received),
+                before(expected),
+                "worker {worker}: records before {time} when the probes reached {time}"
+            );
+        }
+    }
+
+    /// The earliest time any probe may still see.
+    fn acknowledged(&mut self) -> u64 {
+        self.read_probes()
+            .iter()
+            .flat_map(|frontier| frontier.elements().to_vec())
+            .min()
+            .expect("probes done while the inputs are open")
+    }
+
+    /// Close the inputs, wait for the probes to finish and the dataflow to
+    /// complete, and return each worker's output, sorted.
+    fn finish(mut self) -> Vec<Vec<(u64, u64)>> {
+        self.inputs.clear();
+        let deadline = Instant::now() + STEP_TIMEOUT;
+        loop {
+            self.drain_outputs();
+            let frontiers = self.read_probes();
+            if frontiers.iter().all(Antichain::is_empty) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "probes stuck at {frontiers:?}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        while !self.join.is_finished() {
+            assert!(Instant::now() < deadline, "the dataflow did not finish");
+            self.drain_outputs();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The dataflow has finished sending: take the rest.
+        self.drain_outputs();
+        let Stepped {
+            join,
+            teardown,
+            received,
+            ..
+        } = self;
+        join.join().expect("join panicked").expect("dataflow");
+        teardown();
+        received.into_iter().map(sorted).collect()
+    }
+}
+
+fn sorted<T: Ord>(mut records: Vec<T>) -> Vec<T> {
+    records.sort();
+    records
+}
+
+/// Four rounds: in each, every worker sends `0..8` at its input's current
+/// time, every input advances to the round, and the test waits on the probes.
+/// The inputs trail the rounds, so the rounds send at 0, 0, 1 and 2. The
+/// exchange routes each value to worker `value % 3`.
+fn probes_reach_each_open_round_after_earlier_records_arrive(
+    transport: cluster_loopback::Transport,
+) {
+    let mut expected = vec![Vec::new(); STEPPED_WORKERS];
+    for _sender in 0..STEPPED_WORKERS {
+        for time in [0, 0, 1, 2] {
+            for value in 0..8u64 {
+                expected[value as usize % STEPPED_WORKERS].push((time, value));
+            }
+        }
+    }
+    let mut run = Stepped::start(transport, |b, probes| {
+        let (stream, probe) = b
+            .input::<u64>("in")?
+            .exchange_by_hash("exchange", |x: &u64| *x)
+            .probe();
+        probes.lock().unwrap().push(probe);
+        stream.output("out")?;
+        Ok(())
+    });
+    let mut time = 0;
+    for round in 0..4 {
+        for worker in 0..STEPPED_WORKERS {
+            run.send(worker, time, (0..8).collect());
+        }
+        run.advance_all(round);
+        time = round;
+        run.barrier(round, &expected);
+    }
+    let outputs = run.finish();
+    for (worker, (got, want)) in outputs.into_iter().zip(expected).enumerate() {
+        assert_eq!(got, sorted(want), "records at worker {worker}");
+    }
+}
+
+/// While every input is open at round `r`, every worker's probe on the
+/// exchange's output reaches exactly `r`: never done, never past `r` and never
+/// back. By then every record before `r` has reached the output of the worker
+/// the exchange routes it to.
+#[test]
+fn dedicated_tcp_cluster_probes_reach_each_open_round_after_earlier_records_arrive() {
+    probes_reach_each_open_round_after_earlier_records_arrive(
+        cluster_loopback::Transport::Dedicated,
+    );
+}
+
+/// Over pooled connections: see the dedicated variant.
+#[test]
+fn shared_tcp_cluster_probes_reach_each_open_round_after_earlier_records_arrive() {
+    probes_reach_each_open_round_after_earlier_records_arrive(cluster_loopback::Transport::Shared);
+}
+
+/// Ten rounds in which only worker 0 (on node-a) sends: `round` at `round`.
+/// Every input then advances to `round + 1`; the two workers on node-b keep
+/// their inputs open and advance them without ever sending a record. The
+/// exchange routes each value to worker `value % 3`.
+fn probes_reach_each_round_when_only_one_worker_sends(transport: cluster_loopback::Transport) {
+    let mut expected = vec![Vec::new(); STEPPED_WORKERS];
+    for round in 0..10u64 {
+        expected[round as usize % STEPPED_WORKERS].push((round, round));
+    }
+    let mut run = Stepped::start(transport, |b, probes| {
+        let (stream, probe) = b
+            .input::<u64>("in")?
+            .exchange_by_hash("exchange", |x: &u64| *x)
+            .probe();
+        probes.lock().unwrap().push(probe);
+        stream.output("out")?;
+        Ok(())
+    });
+    for round in 0..10 {
+        run.send(0, round, vec![round]);
+        run.advance_all(round + 1);
+        run.barrier(round + 1, &expected);
+    }
+    let outputs = run.finish();
+    for (worker, (got, want)) in outputs.into_iter().zip(expected).enumerate() {
+        assert_eq!(got, want, "records at worker {worker}");
+    }
+}
+
+/// When one worker sends and the workers on the other node only advance
+/// their open inputs, without data, every worker's probe still reaches
+/// exactly each round: never done, never past it and never back. By then
+/// every earlier record has reached the worker the exchange routes it to,
+/// including the receive-only workers.
+#[test]
+fn dedicated_tcp_cluster_probes_reach_each_round_when_only_one_worker_sends() {
+    probes_reach_each_round_when_only_one_worker_sends(cluster_loopback::Transport::Dedicated);
+}
+
+/// Over pooled connections: see the dedicated variant.
+#[test]
+fn shared_tcp_cluster_probes_reach_each_round_when_only_one_worker_sends() {
+    probes_reach_each_round_when_only_one_worker_sends(cluster_loopback::Transport::Shared);
+}
+
+/// Requests `0..16` are due every 1024 ns of a simulated clock; worker `w`
+/// sends requests `w, w + 3, ...`. Four ticks at 4096, 8192, 12288 and
+/// 16384 ns: at each tick every worker sends the requests now due at its
+/// input's current time (the previous tick), advances its input to the tick,
+/// and the test waits on the probes. Nothing reaches the output, since the
+/// filter drops every request.
+fn probes_acknowledge_every_tick_though_a_filter_drops_everything(
+    transport: cluster_loopback::Transport,
+) {
+    const NS_PER_REQUEST: u64 = 1024;
+    const REQUESTS: u64 = 16;
+    const TICKS: [u64; 4] = [4096, 8192, 12288, 16384];
+    let no_output: Vec<Vec<(u64, u64)>> = vec![Vec::new(); STEPPED_WORKERS];
+    let seen: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
+    let filter_seen = Arc::clone(&seen);
+    let mut run = Stepped::start(transport, move |b, probes| {
+        let seen = Arc::clone(&filter_seen);
+        let (stream, probe) = b
+            .input::<u64>("in")?
+            .filter("discard", move |time: &u64, request: &u64| {
+                seen.lock().unwrap().push((*time, *request));
+                false
+            })
+            .probe();
+        probes.lock().unwrap().push(probe);
+        stream.output("out")?;
+        Ok(())
+    });
+    let workers = STEPPED_WORKERS as u64;
+    // The next request each worker sends.
+    let mut next: Vec<u64> = (0..workers).collect();
+    let mut sent_at = 0;
+    for tick in TICKS {
+        assert_eq!(
+            run.acknowledged(),
+            sent_at,
+            "tick {tick} starts with requests not yet acknowledged"
+        );
+        for (worker, request) in next.iter_mut().enumerate() {
+            let mut batch = Vec::new();
+            while *request * NS_PER_REQUEST < tick {
+                batch.push(*request);
+                *request += workers;
+            }
+            run.send(worker, sent_at, batch);
+            run.advance(worker, tick);
+        }
+        sent_at = tick;
+        run.barrier(tick, &no_output);
+    }
+    let acknowledged = run.acknowledged();
+    assert_eq!(acknowledged, 16384, "the last tick is acknowledged");
+    let outputs = run.finish();
+    assert_eq!(outputs, no_output, "the filter drops everything");
+    // Request `r` falls due in tick `r / 4` and is sent at that tick's start.
+    let want: Vec<(u64, u64)> = (0..REQUESTS)
+        .map(|request| (request / 4 * 4096, request))
+        .collect();
+    let seen = sorted(seen.lock().unwrap().clone());
+    assert_eq!(seen, want, "requests seen by the filter");
+    assert!(
+        seen.iter().all(|(time, _)| *time < acknowledged),
+        "every request was acknowledged: {seen:?}"
+    );
+}
+
+/// A filter that drops every record emits nothing, yet while every input is
+/// open at a tick, every worker's probe after the filter reaches exactly that
+/// tick: never done, never past it and never back. So every request sent
+/// before the tick is acknowledged, and the filter saw each request once, at
+/// the time it was sent.
+#[test]
+fn dedicated_tcp_cluster_probes_acknowledge_every_tick_though_a_filter_drops_everything() {
+    probes_acknowledge_every_tick_though_a_filter_drops_everything(
+        cluster_loopback::Transport::Dedicated,
+    );
+}
+
+/// Over pooled connections: see the dedicated variant.
+#[test]
+fn shared_tcp_cluster_probes_acknowledge_every_tick_though_a_filter_drops_everything() {
+    probes_acknowledge_every_tick_though_a_filter_drops_everything(
+        cluster_loopback::Transport::Shared,
+    );
 }

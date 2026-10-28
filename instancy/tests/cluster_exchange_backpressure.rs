@@ -244,7 +244,8 @@ async fn exchange_of_large_records_delivers_each_record_once() {
 }
 
 /// Every worker of a three-node cluster feeds data at once, at several
-/// timestamps, through two chained exchanges.
+/// timestamps, through two chained exchanges. Every record reaches, exactly
+/// once, the worker its last exchange routes it to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn three_node_chained_exchanges_from_every_worker() {
     let build = |b: &mut DataflowBuilder<u64>| -> Result<()> {
@@ -274,5 +275,18 @@ async fn three_node_chained_exchanges_from_every_worker() {
         spec.hold_inputs_until = Some(expected.len());
         let out = cluster::run(&spec, build, inputs).await;
         out.assert_exactly(&expected, &format!("{mode:?}"));
+        let workers = spec.total_workers() as u64;
+        for (worker, records) in out.outputs.iter().enumerate() {
+            let misrouted: Vec<_> = records
+                .iter()
+                .filter(|(_, x)| (x / 3) % workers != worker as u64)
+                .take(5)
+                .collect();
+            assert!(
+                misrouted.is_empty(),
+                "{mode:?}: worker {worker} received records routed to another worker, \
+                 e.g. {misrouted:?}"
+            );
+        }
     }
 }

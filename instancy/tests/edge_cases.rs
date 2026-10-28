@@ -9,11 +9,24 @@
 //! - Rapid advance_to without data
 //! - Filter that drops everything
 //! - Chain of many operators (deep pipelines)
+//! - An input and a source whose streams have no consumers
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use instancy::progress::frontier::Antichain;
 use instancy::{DataflowBuilder, Pipe, RuntimeConfig, RuntimeHandle, SpawnOptions};
+
+/// Runs `f` on its own thread; the test fails if it takes over 30 s, so a
+/// dataflow that never completes fails instead of hanging.
+fn within<R: Send + 'static>(what: &str, f: impl FnOnce() -> R + Send + 'static) -> R {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|_| panic!("{what}: did not finish within 30 s"))
+}
 
 /// Helper: create a runtime, build and spawn a dataflow, return join result.
 #[allow(dead_code)]
@@ -61,12 +74,20 @@ fn empty_input_completes_cleanly() {
 
 /// Send exactly one record at each of several timestamps.
 /// Verifies that single-record batches propagate correctly through operators.
+///
+/// The inspect on the input and the exact output check that record `t`, sent
+/// at time `t` before the input advances to `t + 1`, is seen once, at `t`.
 #[test]
 fn single_record_per_timestamp() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("single-record");
     let input = builder.input::<i32>("data").unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen_by_inspect = Arc::clone(&seen);
     input
+        .inspect("seen", move |t, v| {
+            seen_by_inspect.lock().unwrap().push((*t, *v))
+        })
         .map("increment", |_t, v| v + 1)
         .filter("positive", |_t, v| *v > 0)
         .output("results")
@@ -82,13 +103,30 @@ fn single_record_per_timestamp() {
         sender.advance_to(t + 1).unwrap();
     }
     drop(sender);
-    handle.join_blocking().unwrap();
-
-    let data = receiver.collect_data();
+    let (joined, mut data) = within("single records", move || {
+        (handle.join_blocking(), receiver.collect_data())
+    });
+    joined.unwrap();
     // All values: 0+1=1, 1+1=2, ..., 9+1=10 — all > 0
     let total: i32 = data.iter().flat_map(|(_, vs)| vs.iter()).sum();
     assert_eq!(total, (1..=10).sum::<i32>());
     assert_eq!(data.iter().flat_map(|(_, vs)| vs.iter()).count(), 10);
+
+    // Exactly one record per epoch, at its epoch.
+    data.sort_by_key(|(t, _)| *t);
+    assert_eq!(
+        data,
+        (0..10u64)
+            .map(|t| (t, vec![t as i32 + 1]))
+            .collect::<Vec<_>>()
+    );
+    let mut seen = seen.lock().unwrap().clone();
+    seen.sort();
+    assert_eq!(
+        seen,
+        (0..10u64).map(|t| (t, t as i32)).collect::<Vec<_>>(),
+        "the inspect saw each record once, at its epoch"
+    );
 }
 
 // ===========================================================================
@@ -211,10 +249,26 @@ async fn rapid_advance_no_data() {
     let receiver = handle.take_output::<i32>("results").unwrap();
     let sender = handle.take_input::<i32>("data").unwrap();
 
-    // Advance through 1000 timestamps with no data
+    // Advance through 1000 timestamps with no data. While the input is open,
+    // the probe is never done and never ahead of the input's current time.
     for t in 0..1000u64 {
+        assert!(
+            !probe.is_done(),
+            "probe done while the input is open at {t}"
+        );
+        let frontier = probe.frontier();
+        assert!(
+            frontier.less_equal(&t) && frontier.less_than(&(t + 1)),
+            "probe {frontier:?} is ahead of the input at {t}"
+        );
         sender.advance_to(t + 1).unwrap();
     }
+    // Still open: the probe reaches the input's time without data, and stops.
+    tokio::time::timeout(Duration::from_secs(30), probe.wait_until_done_with(&999))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(probe.frontier(), Antichain::from_elem(1000));
     drop(sender);
 
     tokio::time::timeout(Duration::from_secs(5), probe.wait_until_done())
@@ -309,7 +363,7 @@ fn notify_fires_without_data_at_time() {
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
-    let _receiver = handle.take_output::<i32>("results").unwrap();
+    let receiver = handle.take_output::<i32>("results").unwrap();
     let sender = handle.take_input::<i32>("data").unwrap();
 
     // Send one record at time 0 to trigger the notify_at requests
@@ -317,11 +371,14 @@ fn notify_fires_without_data_at_time() {
     // Advance past all notification times
     sender.advance_to(20).unwrap();
     drop(sender);
-    handle.join_blocking().unwrap();
+    let (joined, forwarded) = within("notify", move || {
+        (handle.join_blocking(), receiver.collect_data())
+    });
+    joined.unwrap();
 
     let mut fired = notifications_fired.lock().unwrap().clone();
     fired.sort();
-    // All three notifications should have fired (plus possibly time 0)
+    // All three notifications should have fired
     assert!(
         fired.contains(&5),
         "notification at 5 should fire, got: {fired:?}"
@@ -334,6 +391,10 @@ fn notify_fires_without_data_at_time() {
         fired.contains(&15),
         "notification at 15 should fire, got: {fired:?}"
     );
+    // Exactly the forwarded record, at its time, and each requested time
+    // notified once, nothing else.
+    assert_eq!(forwarded, vec![(0, vec![42])]);
+    assert_eq!(fired, vec![5, 10, 15]);
 }
 
 // ===========================================================================
@@ -369,9 +430,19 @@ fn flat_map_variable_output() {
 
     sender.send(0, vec![-5, -1, 0, 1, 2, 3]).unwrap();
     drop(sender);
-    handle.join_blocking().unwrap();
-
-    let data = receiver.collect_data();
+    let (joined, data) = within("variable flat_map", move || {
+        (handle.join_blocking(), receiver.collect_data())
+    });
+    joined.unwrap();
+    // Every expanded record keeps its input's time.
+    let timed: Vec<(u64, i32)> = data
+        .iter()
+        .flat_map(|(t, vs)| vs.iter().map(move |v| (*t, *v)))
+        .collect();
+    assert_eq!(
+        timed,
+        vec![(0, 0), (0, 1), (0, 2), (0, 2), (0, 3), (0, 3), (0, 3)]
+    );
     let all_values: Vec<i32> = data.into_iter().flat_map(|(_, vs)| vs).collect();
     // -5 → [], -1 → [], 0 → [0], 1 → [1], 2 → [2,2], 3 → [3,3,3]
     assert_eq!(all_values, vec![0, 1, 2, 2, 3, 3, 3]);
@@ -419,4 +490,34 @@ fn concat_multiple_inputs() {
     all_values.sort();
     // a: [10, 20], b: [300], c: [4000]
     assert_eq!(all_values, vec![10, 20, 300, 4000]);
+}
+
+// ===========================================================================
+// Test 11: An input and a source with no consumers
+// ===========================================================================
+
+/// Streams that nothing consumes do not hold a dataflow open, and `()` works
+/// as a dataflow's time: a `String` input and a finite `0..10` source with no
+/// consumers, on `()` time, complete once the input is dropped unused.
+#[test]
+fn unconsumed_input_and_source_complete_on_unit_time() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+    let builder = DataflowBuilder::<()>::new("unconsumed-streams");
+    {
+        let _strings = builder.input::<String>("strings").unwrap();
+        let _numbers = builder.source("numbers", vec![((), (0..10).collect::<Vec<i32>>())]);
+    }
+    let mut handle = rt
+        .spawn(builder.build().unwrap(), SpawnOptions::new())
+        .unwrap();
+    drop(handle.take_input::<String>("strings").unwrap());
+
+    let (done, joined) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(handle.join_blocking());
+    });
+    joined
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the dataflow did not finish within 30 s")
+        .unwrap();
 }
