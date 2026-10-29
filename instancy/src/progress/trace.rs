@@ -46,11 +46,15 @@
 //! header: reason, every ring's counters and every recording gap),
 //! `reason.txt`, and one JSON-lines file per ring: `<node>-w<worker>.jsonl`
 //! and `<node>-bridge-<peer>.jsonl`. Each file starts with its ring's header
-//! line. A dump covers every ring of the dataflow in this process: every
-//! node of a cluster that runs in one process, as in tests. A cluster whose
-//! nodes run in separate processes dumps each process's own rings. Writing
-//! a dump never panics; I/O errors are ignored. A dump is in addition to the
-//! failure that triggered it, never instead of it.
+//! line. In builds with the progress checker, `header.json` and `reason.txt`
+//! also list the inputs whose every channel is exhausted and that hold no
+//! record, but whose frontier is not empty in some worker's view: in a hang,
+//! they show where it is stuck. A dump covers every ring of the dataflow in
+//! this process: every node of a cluster that runs in one process, as in
+//! tests. A cluster whose nodes run in separate processes dumps each
+//! process's own rings. Writing a dump never panics; I/O errors are ignored.
+//! A dump is in addition to the failure that triggered it, never instead of
+//! it.
 //!
 //! The rings of a finished dataflow stay available for a while (the last
 //! 32 finished dataflows), so a test harness can dump them after the run.
@@ -1333,6 +1337,7 @@ fn write_dump(entry: &Entry, dir: &Path, trigger: Trigger, reason: &str) -> std:
     // can be.
     let snapshots: Vec<Snapshot> = rings.iter().map(|r| r.snapshot()).collect();
     let at_ns = now_ns();
+    let settled = settled_inputs(entry.id);
     std::fs::create_dir_all(dir)?;
     let id = entry.id.as_uuid().to_string();
     let graph = {
@@ -1389,7 +1394,18 @@ fn write_dump(entry: &Entry, dir: &Path, trigger: Trigger, reason: &str) -> std:
         }
         let _ = write!(header, "\"{ordinal}\":{edge}");
     }
-    header.push_str("},\"rings\":[");
+    header.push('}');
+    if let Some(settled) = &settled {
+        header.push_str(",\"settled_inputs\":[");
+        for (i, line) in settled.iter().enumerate() {
+            if i > 0 {
+                header.push(',');
+            }
+            json_str(line, &mut header);
+        }
+        header.push(']');
+    }
+    header.push_str(",\"rings\":[");
 
     let mut used: HashMap<String, usize> = HashMap::new();
     for (i, (ring, snap)) in rings.iter().zip(&snapshots).enumerate() {
@@ -1475,8 +1491,30 @@ fn write_dump(entry: &Entry, dir: &Path, trigger: Trigger, reason: &str) -> std:
         "dataflow {id}; {} ring(s); {gaps} event(s) not in this dump (see header.json)",
         rings.len()
     );
+    if let Some(settled) = settled.filter(|s| !s.is_empty()) {
+        text.push_str(
+            "inputs whose every channel is exhausted and that hold no record, \
+             with a non-empty frontier:\n",
+        );
+        for line in settled {
+            let _ = writeln!(text, "  {line}");
+        }
+    }
     std::fs::write(dir.join("reason.txt"), text)?;
     Ok(())
+}
+
+/// The progress checker's settled inputs with a non-empty frontier (see
+/// `check::settled_inputs`).
+#[cfg(any(debug_assertions, feature = "progress-check"))]
+fn settled_inputs(id: DataflowId) -> Option<Vec<String>> {
+    Some(crate::progress::check::settled_inputs(id))
+}
+
+/// None: the progress checker is not compiled in.
+#[cfg(not(any(debug_assertions, feature = "progress-check")))]
+fn settled_inputs(_id: DataflowId) -> Option<Vec<String>> {
+    None
 }
 
 fn json_str(s: &str, out: &mut String) {
@@ -1506,7 +1544,7 @@ const DECISIONS: [&str; 5] = [
 ];
 
 /// The dump header's `legend`: how to read the events.
-const LEGEND: &str = r#"{"t_ns":"nanoseconds since the process's first recorded event, on one monotonic clock (std::time::Instant) shared by every ring of the process: events of different rings and nodes are ordered by it","seq":"the ring's event number, from 0; a ring keeps its newest `capacity` events","commit":"a worker's commit sequence number: its n-th non-empty commit, from 1","frames":"frames with changes each network lane got for this commit (a commit over the progress batch cap is split, positives first)","frames_before":"frames with changes each network lane got for the worker's earlier commits","lane_batch":"a batch's position on the lane from `from`, from 1: an in-process lane carries one batch per commit (lane_batch = commit); a network lane one per frame (frames_before < lane_batch <= frames_before + frames of the commit); markers (seal, abandon, end-of-stream, ack) are never counted","lane-state":"a peer's seal (sealed) or the end of its lane (closed; closed without sealed: abandoned), as this worker applied it, after lane_batches batches","skipped":"decisions since the previous recorded one that were not recorded: not-ready or shut-down decisions made before every hosted operator was shut down or exhausted (S2b cannot hold then), or identical to the previous recorded one (outcome, flags, lane states and view activity)","decision-count":"a non-zero raw count in the worker's scope (what exact zero judges) at the decision just before it","decision-lane":"after a success, residual or S3 decision: each peer lane's applied position and state","loc":"src: an operator output (capabilities); tgt: an operator input (records); loc_node is the node in the scope (the operator index in scope 0)","seed":"an initial capability seeded when the tracker was initialized; `operator` is the operator seeded","scope":"as a field: the progress scope (0: the root); as an event: a location in the worker's scope (S2b, what its exact zero judges), recorded when its tracker was initialized (no scope event: every location)","frame":"net-send: the data frames this channel's push enqueued so far, this one included if it was enqueued (outcome accepted); net-recv (data): the data frames the channel received so far, this one included","data_channel_id":"2^63 + (exchange * total_workers + src) * total_workers + dst, where `exchange` indexes exchange_edges, which gives the edge","progress_channel_id":"2^62 + src * total_workers + dst","untraced":"events at sites that ran outside any traced worker, process-wide, by site","snapshot_t_ns":"when the ring was read for this dump: it holds every event it recorded before then, unless counted as overwritten or torn","goodbye-sent":"recorded before the end-of-stream frames to that peer are queued","lane_drops":"commits and markers a network lane dropped (its link was retired, the frame did not encode, or the outbox closed)"}"#;
+const LEGEND: &str = r#"{"t_ns":"nanoseconds since the process's first recorded event, on one monotonic clock (std::time::Instant) shared by every ring of the process: events of different rings and nodes are ordered by it","seq":"the ring's event number, from 0; a ring keeps its newest `capacity` events","commit":"a worker's commit sequence number: its n-th non-empty commit, from 1","frames":"frames with changes each network lane got for this commit (a commit over the progress batch cap is split, positives first)","frames_before":"frames with changes each network lane got for the worker's earlier commits","lane_batch":"a batch's position on the lane from `from`, from 1: an in-process lane carries one batch per commit (lane_batch = commit); a network lane one per frame (frames_before < lane_batch <= frames_before + frames of the commit); markers (seal, abandon, end-of-stream, ack) are never counted","lane-state":"a peer's seal (sealed) or the end of its lane (closed; closed without sealed: abandoned), as this worker applied it, after lane_batches batches","skipped":"decisions since the previous recorded one that were not recorded: not-ready or shut-down decisions made before every hosted operator was shut down or exhausted (S2b cannot hold then), or identical to the previous recorded one (outcome, flags, lane states and view activity)","decision-count":"a non-zero raw count in the worker's scope (what exact zero judges) at the decision just before it","decision-lane":"after a success, residual or S3 decision: each peer lane's applied position and state","loc":"src: an operator output (capabilities); tgt: an operator input (records); loc_node is the node in the scope (the operator index in scope 0)","seed":"an initial capability seeded when the tracker was initialized; `operator` is the operator seeded","scope":"as a field: the progress scope (0: the root); as an event: a location in the worker's scope (S2b, what its exact zero judges), recorded when its tracker was initialized (no scope event: every location)","frame":"net-send: the data frames this channel's push enqueued so far, this one included if it was enqueued (outcome accepted); net-recv (data): the data frames the channel received so far, this one included","data_channel_id":"2^63 + (exchange * total_workers + src) * total_workers + dst, where `exchange` indexes exchange_edges, which gives the edge","progress_channel_id":"2^62 + src * total_workers + dst","untraced":"events at sites that ran outside any traced worker, process-wide, by site","snapshot_t_ns":"when the ring was read for this dump: it holds every event it recorded before then, unless counted as overwritten or torn","goodbye-sent":"recorded before the end-of-stream frames to that peer are queued","lane_drops":"commits and markers a network lane dropped (its link was retired, the frame did not encode, or the outbox closed)","settled_inputs":"inputs whose every channel is exhausted and that hold no record, but whose frontier is not empty in a worker's view, as the progress checker last applied them (builds with the checker only). Not violations: a view keeps such a frontier until it has applied every worker's last commits. In a hang, they show where it is stuck"}"#;
 
 /// The flags of a [`Kind::Decision`].
 pub(crate) mod decision {

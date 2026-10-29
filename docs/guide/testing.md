@@ -120,8 +120,7 @@ invariant checker, `instancy::progress::check`. It watches progress tracking
 without changing how a dataflow runs, and records a violation when:
 
 - **V1**: an operator consumes data behind its input frontier;
-- **V4**: a worker force-closes or finishes while work is outstanding, or an
-  exhausted input never gets an empty frontier;
+- **V4**: a worker force-closes or finishes while work is outstanding;
 - **V6**: a progress frame breaks the wire rules (a split batch that is not
   positives-first, a batch after end-of-stream);
 - **V7**: a worker's frontier claims a location is done while records,

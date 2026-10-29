@@ -6,4 +6,4 @@
 // commit message, the audit finding that explains it.
 //
 // <case> | <failures every recorded run showed> | <failures some runs
-// showed, plus the margin> | <audit findings>
+// showed> | <audit findings>

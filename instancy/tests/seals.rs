@@ -13,6 +13,8 @@
 //! process), so it cannot mask a real record and the outcome is
 //! deterministic. The same fault also trips the checker (V4, V5); these tests
 //! run it in report mode so the production error surfaces, and assert both.
+//! An extra `+n` mid-graph never reaches a seal: the run hangs, and only a
+//! timeout reports it.
 
 #![cfg(any(debug_assertions, feature = "progress-check"))]
 
@@ -24,7 +26,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use instancy::progress::check::{self, Check, Mode};
-use instancy::{DataflowBuilder, Result, RuntimeConfig, RuntimeHandle, SpawnOptions};
+use instancy::{DataflowBuilder, DataflowId, Result, RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 /// A time no record of these tests uses (each test adds its own offset).
 const UNUSED: u64 = 1_000_000;
@@ -45,6 +47,9 @@ enum Fault {
     /// A `+1` at the terminal sink's input: a record counted that is never
     /// consumed (a leaked `+n` at a sink, which keeps no frontier waiting).
     LeakAtSink,
+    /// A `+1` at `map`'s input: a record counted that never arrives (an
+    /// extra `+n` mid-graph, which keeps `map`'s frontier from emptying).
+    ExtraMidGraph,
 }
 
 impl Fault {
@@ -52,14 +57,18 @@ impl Fault {
         match self {
             Fault::MissingPlus => builder.check_inject_count(worker, "map", 0, time, -1),
             Fault::LeakAtSink => builder.check_inject_count(worker, "sink", 0, time, 1),
+            Fault::ExtraMidGraph => builder.check_inject_count(worker, "map", 0, time, 1),
         };
     }
 
-    /// How the residual shows in a V5 report.
+    /// How the residual shows in a production residual error and in a V5
+    /// report: `map` is operator 2 and `sink` operator 3 of [`build`]'s
+    /// dataflow.
     fn residual(self, time: u64) -> String {
         match self {
-            Fault::MissingPlus => format!("@{time}: -1"),
-            Fault::LeakAtSink => format!("@{time}: +1"),
+            Fault::MissingPlus => format!("Target {{ node: 2, port: 0 }}@{time}: -1"),
+            Fault::LeakAtSink => format!("Target {{ node: 3, port: 0 }}@{time}: +1"),
+            Fault::ExtraMidGraph => format!("Target {{ node: 2, port: 0 }}@{time}: +1"),
         }
     }
 }
@@ -83,26 +92,35 @@ fn with_timeout<R: Send + 'static>(what: &str, f: impl FnOnce() -> R + Send + 's
         .unwrap_or_else(|_| panic!("{what}: hung instead of reporting the residual"))
 }
 
-fn assert_residual(what: &str, result: &Result<()>) {
+/// The run failed with the residual the fault left.
+fn assert_residual(what: &str, result: &Result<()>, residual: &str) {
     match result {
-        Err(error) => assert!(
-            error
-                .to_string()
-                .contains("progress residual at completion"),
-            "{what}: expected a proven residual, got: {error}"
-        ),
+        Err(error) => {
+            let text = error.to_string();
+            assert!(
+                text.contains("progress residual at completion") && text.contains(residual),
+                "{what}: expected the residual {residual}, got: {text}"
+            );
+        }
         Ok(()) => panic!("{what}: succeeded with a residual"),
     }
 }
 
-/// The checker reported the fault too (V5, a report even in panic mode):
-/// returns the workers whose view it was left in.
-fn checker_reports(what: &str, mark: u64, fault: Fault, time: u64) -> Vec<usize> {
+/// The checker reported the fault too (V5, a report even in panic mode),
+/// for `dataflow` when given: returns the workers whose view it was left in.
+fn checker_reports(
+    what: &str,
+    mark: u64,
+    fault: Fault,
+    time: u64,
+    dataflow: Option<DataflowId>,
+) -> Vec<usize> {
     let residual = fault.residual(time);
     let violations = check::violations_since(mark);
     let mut workers: Vec<usize> = violations
         .iter()
         .filter(|v| v.check == Check::V5 && v.detail.contains(&residual))
+        .filter(|v| dataflow.is_none() || v.dataflow == dataflow)
         .filter_map(|v| v.worker)
         .collect();
     workers.sort_unstable();
@@ -134,8 +152,8 @@ fn run_in_process(fault: Fault, workers: usize, time: u64) {
         drop(input);
     }
     let result = with_timeout(&what, move || multi.join_blocking());
-    assert_residual(&what, &result);
-    checker_reports(&what, mark, fault, time);
+    assert_residual(&what, &result, &fault.residual(time));
+    checker_reports(&what, mark, fault, time, None);
     // Every exhausted worker sealed (the positive control for the R34
     // tests, which assert a failed worker does not).
     let mut sealed: Vec<usize> = check::oracles_since(mark)
@@ -162,11 +180,103 @@ fn leak_at_a_terminal_sink_is_a_residual() {
     run_in_process(Fault::LeakAtSink, 2, UNUSED + 4);
 }
 
-/// Two nodes, one worker each, both exhausted: each applies the other's seal
-/// and fails with the residual, naming the count the fault left.
+/// An extra `+n` mid-graph keeps `map`'s frontier from emptying, so `map`
+/// never shuts down, the sink never sees the end of its input, and no
+/// worker seals: no residual can be proven, and the run hangs until it is
+/// cancelled. A dump taken while it hangs shows where: `map`'s input, at the
+/// injected time, in both workers' views.
+#[test]
+fn an_extra_count_mid_graph_hangs_and_a_dump_shows_where() {
+    use instancy::progress::trace;
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let _serial = serial();
+    check::set_mode(Mode::Report);
+    let dumps = std::env::temp_dir().join(format!(
+        "instancy-seals-hang-{}",
+        DataflowId::new().as_uuid()
+    ));
+    let previous = trace::dir();
+    trace::set_dir(Some(dumps.clone()));
+    let fault = Fault::ExtraMidGraph;
+    let time = UNUSED + 10;
+    let mark = check::mark();
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let mut multi = rt
+        .spawn_multi(
+            "seals-extra-mid-graph",
+            2,
+            move |builder: &mut DataflowBuilder<u64>| build(builder, fault, time),
+            SpawnOptions::default().cancellation_token(cancel.clone()),
+        )
+        .unwrap();
+    for worker in 0..2 {
+        let input = multi.take_input::<u64>(worker, "in").unwrap();
+        input.send(1, vec![worker as u64; 3]).unwrap();
+        drop(input);
+    }
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(multi.join_blocking());
+    });
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Err(RecvTimeoutError::Timeout) => {}
+        Err(RecvTimeoutError::Disconnected) => panic!("the thread joining the run died"),
+        Ok(Ok(())) => panic!("succeeded with a record counted that never arrives"),
+        Ok(Err(error)) => panic!("expected a hang, got: {error}"),
+    }
+    // Dumped while it hangs: cancelling it retires the workers' views.
+    let oracles = check::oracles_since(mark);
+    let dump = oracles
+        .first()
+        .and_then(|oracle| oracle.dataflow)
+        .and_then(|id| check::dump_traces(id, "the run hangs"));
+    let listed = dump.as_ref().map(|dir| {
+        let header: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("header.json")).unwrap())
+                .unwrap();
+        let mut listed: Vec<String> = header["settled_inputs"]
+            .as_array()
+            .expect("the dump lists settled inputs")
+            .iter()
+            .map(|line| line.as_str().unwrap().to_string())
+            .collect();
+        listed.sort();
+        listed
+    });
+    cancel.cancel();
+    let ended = rx.recv_timeout(Duration::from_secs(30));
+    trace::set_dir(previous);
+    let _ = std::fs::remove_dir_all(&dumps);
+    assert!(
+        matches!(ended, Ok(Err(_))),
+        "the cancelled run must end with an error: {ended:?}"
+    );
+    let [oracle] = &oracles[..] else {
+        panic!("one oracle: {oracles:?}");
+    };
+    assert_eq!(
+        (oracle.total_workers, oracle.registered_workers),
+        (2, 2),
+        "{oracle:?}"
+    );
+    assert_eq!(oracle.halted, None, "{oracle:?}");
+    assert!(oracle.sealed_workers.is_empty(), "{oracle:?}");
+    assert_eq!(
+        listed.expect("a dump of the hung run"),
+        [
+            format!("map[in 0]: frontier [{time}] in worker 0's view"),
+            format!("map[in 0]: frontier [{time}] in worker 1's view"),
+        ]
+    );
+}
+
+/// Two nodes, one worker each, both exhausted: both fail with the residual
+/// the fault left, and the checker of each node that proved it reports it.
 #[cfg(feature = "transport")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn missing_plus_is_a_residual_on_both_nodes_of_a_cluster() {
+async fn missing_plus_fails_both_nodes_of_a_cluster_with_the_residual() {
     missing_plus_on_a_cluster(false, UNUSED + 5).await;
 }
 
@@ -174,14 +284,25 @@ async fn missing_plus_is_a_residual_on_both_nodes_of_a_cluster() {
 /// pooled connection.
 #[cfg(feature = "transport")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn missing_plus_is_a_residual_on_both_nodes_of_a_shared_cluster() {
+async fn missing_plus_fails_both_nodes_of_a_shared_cluster_with_the_residual() {
     missing_plus_on_a_cluster(true, UNUSED + 8).await;
+}
+
+/// The worker that proved the residual a failed run names (a node may fail
+/// with the other node's residual, relayed).
+#[cfg(feature = "transport")]
+fn prover(text: &str) -> usize {
+    text.split("progress residual at completion: worker ")
+        .nth(1)
+        .and_then(|rest| rest.split(':').next())
+        .and_then(|worker| worker.parse().ok())
+        .unwrap_or_else(|| panic!("the residual names no worker: {text}"))
 }
 
 #[cfg(feature = "transport")]
 #[allow(clippy::await_holding_lock)]
 async fn missing_plus_on_a_cluster(shared: bool, time: u64) {
-    use instancy::{ClusterTopology, DataflowId, NodeConfig};
+    use instancy::{ClusterTopology, NodeConfig};
     use support::{Mesh, drop_runtimes, fmt_join, join_with_timeout, spawn_node};
 
     let _serial = serial();
@@ -222,14 +343,28 @@ async fn missing_plus_on_a_cluster(shared: bool, time: u64) {
     let jb = join_with_timeout(cb, Duration::from_secs(30));
     let (ra, rb) = (ja.await.unwrap(), jb.await.unwrap());
     drop_runtimes(vec![rt_a, rt_b]).await;
+    // A node that proves the residual fails with it, and its failure
+    // cancels the other node, which may stop before it has applied the
+    // first node's seal: it then fails with the relayed residual without
+    // proving it, and its checker reports nothing.
+    let residual = fault.residual(time);
+    let mut provers = Vec::new();
     for (node, result) in [("node-a", &ra), ("node-b", &rb)] {
         match result {
-            Some(result) => assert_residual(node, result),
+            Some(result) => assert_residual(node, result, &residual),
             None => panic!("{node}: {}", fmt_join(result)),
         }
+        if let Some(Err(error)) = result {
+            provers.push(prover(&error.to_string()));
+        }
     }
-    // Both nodes applied every seal: each reports the residual.
-    assert_eq!(checker_reports("cluster", mark, fault, time), [0, 1]);
+    provers.sort_unstable();
+    provers.dedup();
+    assert_eq!(
+        checker_reports("cluster", mark, fault, time, Some(id)),
+        provers,
+        "cluster: the checker reports the residual exactly where it was proven"
+    );
     let mut sealed: Vec<usize> = check::oracles_since(mark)
         .into_iter()
         .flat_map(|o| o.sealed_workers)
