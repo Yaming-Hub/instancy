@@ -192,7 +192,8 @@ let prioritized = stream.delay("prioritize", |t, item| {
 ```
 
 > **Constraint:** The delay function must return a timestamp `>=` the input
-> timestamp. Returning an earlier timestamp will panic.
+> timestamp. Returning an earlier (or incomparable) timestamp fails the
+> dataflow with an error.
 
 ### Cross-Worker Error Propagation
 

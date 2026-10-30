@@ -455,7 +455,7 @@ where
 **Semantics**: The operator holds a capability for each output timestamp that has buffered data. When the input frontier advances past a buffered timestamp, the data is emitted at the delayed timestamp and the capability is released. This ensures downstream operators see correct frontier progress.
 
 **Use cases**:
-- **Windowing**: `delay_batch(|t| t / window_size * window_size)` groups data into fixed windows.
+- **Windowing**: `delay_batch(|t| (t / window_size + 1) * window_size)` groups data into fixed windows, each emitted at its window's end. (Rounding down, `t / window_size * window_size`, would move data to an earlier time, which is an error.)
 - **Ordering**: `delay_batch(|t| *t)` (identity) buffers data until the frontier confirms no more data at `t` will arrive.
 - **Rate limiting**: delay data to spread output over time.
 

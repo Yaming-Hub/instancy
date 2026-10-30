@@ -7,14 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Test suite, docs and small fixes
+
+- **Fixed: a refused Shared spawn no longer cancels another run.** A
+  Shared `spawn_cluster` refused because its `DataflowId` is registered
+  with a peer manager (a running dataflow) or already ran there now sends
+  nothing under that id. It used to broadcast `Cancel` under it, failing
+  the run that owns the id: a running duplicate on every node, or a peer
+  still finishing the run whose id a retry reused. The id is checked before
+  anything else can fail, and again where registration races a concurrent
+  spawn of the same id. A spawn that fails with an unused id still tells
+  every peer.
+- **Fixed: a failed spawn with per-job Shared managers no longer loses its
+  `Cancel`.** When nothing else held the managers, releasing them could
+  stop their bridges before the `Cancel` queued on them was written, so the
+  peer waited out its handshake timeout. The spawn now holds the managers
+  until the `Cancel` has passed their bridges, and closes them (bounded)
+  if it releases the last reference, as a dataflow's teardown does.
+- **Fixed: `SimpleRuntime` reports an operator panic as
+  `Error::OperatorPanic`**, naming the operator, on `spawn` and
+  `spawn_multi`, as `RuntimeHandle` does. It used to report
+  `RuntimeError::InvalidConfig("dataflow executor terminated unexpectedly
+  (possible panic)")`.
+- **Fixed: `TokioMode::Create { worker_threads: 0 }`** makes
+  `RuntimeHandle::new` return `RuntimeError::InvalidConfig` instead of
+  panicking inside tokio.
+- **Tests:** the correctness audit's 105 repro tests and the 6 stress tests
+  are no longer ignored. They run with the rest of the suite under nextest;
+  the audit repros join the `tcp-cluster` group, so they still run two at
+  a time. The separate CI step and the table that ran them are gone. New
+  tests cover a record reaching an operator that has shut down (an error,
+  never a silent drop), `unary_async` waiting without a busy loop at its
+  concurrency limit, both fixes above, and a node's completion resolving
+  while its runtime is dropped (a test no longer holds it back).
+- **CI:** the nextest `ci` profile runs every test after a failure
+  (`fail-fast = false`), so one run reports all failing tests.
+- **Docs:** `MembershipEvent::NodeJoined` and the cluster design's
+  membership section now say that `spawn_cluster` runs on the topology
+  passed to it (pass `current_topology()` to include a new node), and that
+  a departed node's dataflows are cancelled, not released. The
+  `delay_batch` windowing example rounds up (rounding down fails at run
+  time). Notes on connection pooling, the conformance golden file, the
+  test commands and several test comments are brought up to date.
+
 ### CI
 
 - **Unit and integration tests run under cargo-nextest 0.9.150**, each
   test once and in its own process: no retries, and a test still running
   after 120 s is terminated and fails (one test has 180 s), as does a run
   that selects no tests. The Test job no longer runs the library's unit
-  tests twice. Doc tests, the audit repros, the full conformance matrix
-  and the release flight-recorder check keep their own commands. See
+  tests twice. Doc tests, the full conformance matrix and the release
+  flight-recorder check keep their own commands. See
   `docs/testing/nextest.md`.
 
 ### Tests

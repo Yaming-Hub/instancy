@@ -179,8 +179,8 @@ fn probe_inside_iterate_body_completes() {
 // ---------------------------------------------------------------------------
 
 /// Nested loops with exchanges inside the inner and/or outer body, on one and
-/// on two workers (a `map` separates each loop's output from an exchange; see
-/// `multi_worker_nested_iterate_inner_exchange` for the shape that still hangs).
+/// on two workers (a `map` separates each loop's output from an exchange;
+/// `multi_worker_nested_iterate_inner_exchange` covers the shape without it).
 /// With two workers an exchange in the inner body used to run without in-flight
 /// accounting (its binding was projected through one scope level only), so the
 /// outer epoch could complete early and drop results.

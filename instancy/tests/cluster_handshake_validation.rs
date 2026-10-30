@@ -33,9 +33,9 @@ use instancy::{
     RuntimeConfig, RuntimeHandle, SpawnOptions, Timestamp, TokioMode,
 };
 
-/// Handshake/ready-barrier timeout used by mismatch scenarios. Shared mode has
-/// no connection EOF to signal a failed peer, so a node whose peer rejected the
-/// handshake only fails once this expires.
+/// Handshake/ready-barrier timeout used by mismatch scenarios. A node whose
+/// peer rejected the handshake learns it promptly (the peer's `Cancel`, or a
+/// closed connection); the timeout only bounds a hang.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Upper bound for a whole spawn attempt in a mismatch scenario.
 const SPAWN_BOUND: Duration = Duration::from_secs(20);

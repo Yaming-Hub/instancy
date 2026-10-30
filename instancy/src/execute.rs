@@ -293,7 +293,9 @@ impl ClusterTopology {
     /// or has zero workers.
     ///
     /// **Note**: Adding a node does not affect already-running dataflows.
-    /// Only subsequent `spawn_cluster` calls will include the new node.
+    /// Only `spawn_cluster` calls given the updated topology include the new
+    /// node. Because nodes are sorted by id, adding a node can renumber the
+    /// workers of the nodes that sort after it.
     pub fn add_node(&mut self, config: NodeConfig) -> Result<(), Error> {
         if config.logical_workers == 0 {
             return Err(Error::Topology(TopologyError::InvalidNodeConfig {
@@ -387,14 +389,21 @@ impl ClusterTopology {
 /// to update its internal topology, routing tables, and connection state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MembershipEvent {
-    /// A new physical node has joined the cluster and is ready to host logical workers.
+    /// A physical node has joined (or rejoined) the cluster and is ready to host
+    /// logical workers.
     ///
     /// The runtime will:
-    /// 1. Clear any "left" state for this node (if it was previously departed).
-    /// 2. Add the node to the live [`ClusterTopology`].
-    /// 3. Future `spawn_cluster` calls will include this node automatically.
+    /// 1. Clear any "left" state for this node (if it was previously departed),
+    ///    so a later `spawn_cluster` that includes it is no longer cancelled at once.
+    /// 2. Add the node to the live [`ClusterTopology`] that
+    ///    `RuntimeHandle::current_topology` returns. If the node is already
+    ///    there with a different worker count (it restarted with a new
+    ///    configuration), its count is updated.
     ///
-    /// Already-running dataflows are **not** affected.
+    /// `spawn_cluster` runs on the topology passed to it, not on the live one:
+    /// to include the new node, pass a topology that contains it (for example
+    /// `current_topology()`). Already-running dataflows are **not** affected.
+    /// An event with `logical_workers == 0` is ignored.
     NodeJoined {
         /// Physical node identity (e.g., hostname, IP:port, pod name).
         node_id: String,
@@ -407,8 +416,9 @@ pub enum MembershipEvent {
     /// The runtime will:
     /// 1. Cancel all dataflows with workers on this node.
     /// 2. Remove the node from the live [`ClusterTopology`].
-    /// 3. Mark the node as "left" — future `spawn_cluster` calls that include
-    ///    this node will be immediately cancelled.
+    /// 3. Mark the node as "left": a later `spawn_cluster` that includes this
+    ///    node is cancelled at once, until a `NodeJoined` for it arrives. (The
+    ///    runtime remembers the 1,024 most recently departed nodes.)
     NodeLeft {
         /// Physical node identity.
         node_id: String,

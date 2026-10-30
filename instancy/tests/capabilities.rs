@@ -1156,6 +1156,95 @@ async fn count_after_a_failed_unary_async_task_never_fires() {
     );
 }
 
+/// At its concurrency limit, with batches waiting for a task slot and no
+/// task finishing, `unary_async` waits for a task to finish instead of
+/// being activated over and over (a busy loop).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unary_async_at_its_concurrency_limit_waits_without_spinning() {
+    use instancy::metrics::{DataflowMetrics, MetricsConfig};
+
+    fn activations(metrics: &DataflowMetrics) -> u64 {
+        metrics
+            .operator_snapshots()
+            .iter()
+            .filter(|op| op.name.contains("at-limit"))
+            .map(|op| op.activations)
+            .sum()
+    }
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let rt = runtime();
+    let builder = DataflowBuilder::<u64>::new("async-at-limit");
+    let task_gate = Arc::clone(&gate);
+    builder
+        .input::<u64>("in")
+        .unwrap()
+        .unary_async(
+            "at-limit",
+            1,
+            Arc::new(move |_t: u64, data: Vec<u64>| {
+                let gate = Arc::clone(&task_gate);
+                async move {
+                    let _permit = gate.acquire().await.unwrap();
+                    Ok(data)
+                }
+            }),
+        )
+        .output("out")
+        .unwrap();
+    let mut spawned = rt
+        .spawn(
+            builder.build().unwrap(),
+            SpawnOptions::new().metrics(MetricsConfig::full()),
+        )
+        .unwrap();
+    let metrics = Arc::clone(spawned.metrics().unwrap());
+    let sender = spawned.take_input::<u64>("in").unwrap();
+    let receiver = spawned.take_output::<u64>("out").unwrap();
+    // One task runs (blocked on the gate); four batches wait for its slot.
+    for i in 0..5 {
+        sender.send(0, vec![i]).unwrap();
+    }
+    // Wait until the operator has taken every batch and the worker parked:
+    // its activation count stops changing.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut settled = activations(&metrics);
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let now = activations(&metrics);
+        if now == settled && now > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the operator was still being activated after 10 s ({now} activations)"
+        );
+        settled = now;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let idle = activations(&metrics) - settled;
+    assert!(
+        idle < 10,
+        "{idle} activations in 1 s at the concurrency limit with no task finishing"
+    );
+    gate.add_permits(5);
+    drop(sender);
+    let result = tokio::time::timeout(Duration::from_secs(30), spawned.join()).await;
+    assert!(matches!(result, Ok(Ok(()))), "join: {result:?}");
+    let mut out: Vec<u64> = tokio::task::spawn_blocking(move || receiver.collect_data())
+        .await
+        .unwrap()
+        .into_iter()
+        .flat_map(|(_, data)| data)
+        .collect();
+    out.sort();
+    assert_eq!(out, vec![0, 1, 2, 3, 4]);
+    assert!(
+        activations(&metrics) > settled,
+        "the operator ran again once its tasks finished"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Egress
 // ---------------------------------------------------------------------------

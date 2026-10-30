@@ -359,6 +359,13 @@ The spin→yield→park→shutdown progression ensures:
 
 #### 12.7.3 Network Exchange: Connection & Bandwidth Management
 
+> **Current state:** the scaling pool sketched here was not kept. Shared
+> mode uses a fixed pool of `SharedConnectionConfig::connections`
+> connections per peer, with no adaptive scaling, and Dedicated mode uses
+> one connection per peer per dataflow (see `communication.md` §6.3.1).
+> Cross-node backpressure is also not implemented yet: a receiver buffers
+> what arrives without bound.
+
 When a dataflow spans multiple nodes, inter-process data exchange becomes the bottleneck. The system manages throughput across three layers:
 
 ```
