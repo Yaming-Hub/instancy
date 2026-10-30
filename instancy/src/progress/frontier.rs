@@ -260,7 +260,8 @@ mod tests {
     #[test]
     fn insert_dominated_by_existing_incomparable() {
         let mut ac: Antichain<Product<u64, u64>> = Antichain::new();
-        ac.insert(Product::new(1, 1));
+        // Inserting into an empty antichain reports `true`.
+        assert!(ac.insert(Product::new(1, 1)));
         // (2, 2) is greater than (1, 1) in product order
         assert!(!ac.insert(Product::new(2, 2)));
         assert_eq!(ac.len(), 1);
@@ -384,6 +385,28 @@ mod tests {
         let mut ac = Antichain::from_elem(5u64);
         ac.extend(vec![3, 7, 1]);
         assert_eq!(ac.elements(), &[1]);
+    }
+
+    /// `extend` is `std::iter::Extend` and returns nothing, so the antichain is
+    /// compared before and after: it changes only when an element is inserted.
+    #[test]
+    fn extend_changes_the_antichain_only_when_an_element_is_inserted() {
+        let mut ac = Antichain::<u64>::new();
+
+        let before = ac.clone();
+        ac.extend(Some(3));
+        assert_ne!(ac, before);
+        assert_eq!(ac.elements(), &[3]);
+
+        let before = ac.clone();
+        ac.extend(vec![2, 5]);
+        assert_ne!(ac, before);
+        assert_eq!(ac.elements(), &[2]);
+
+        let before = ac.clone();
+        ac.extend(vec![3, 4]);
+        assert_eq!(ac, before);
+        assert_eq!(ac.elements(), &[2]);
     }
 
     // --- IntoIterator ---

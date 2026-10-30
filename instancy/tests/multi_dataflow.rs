@@ -4,15 +4,19 @@
 //! concurrent conditions:
 //! - Multiple dataflows spawned on a shared RuntimeHandle
 //! - Concurrent InputSender writes and OutputReceiver reads
+//! - Independent progress: each dataflow's probe follows only its own inputs
 //! - Poll budget fairness between heavy and light workloads
 //! - Cancellation propagation under load
 
+use std::cell::OnceCell;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use instancy::DataflowBuilder;
 use instancy::Error;
-use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
+use instancy::dataflow::OutputEvent;
+use instancy::progress::frontier::Antichain;
+use instancy::{OutputReceiver, RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 /// Spawn 4 dataflows concurrently on a 2-thread pool. Each receives unique data
 /// via InputSender and produces results on OutputReceiver. Verify all complete
@@ -215,14 +219,19 @@ fn shutdown_cancels_all_running_dataflows() {
     .unwrap();
 
     let mut spawned = Vec::new();
+    let mut inputs = Vec::new();
 
-    // Spawn 4 dataflows with open input ports (will block waiting for data)
+    // Spawn 4 dataflows with open input ports (will block waiting for data).
+    // The test holds the senders until every join returns: an untaken sender
+    // is dropped by join(), which closes the input and lets a dataflow whose
+    // sweep began before the shutdown finish normally.
     for i in 0..4 {
         let builder = DataflowBuilder::<u64>::new(format!("blocked_{i}"));
         let input = builder.input::<i32>("data").unwrap();
         input.output("out").unwrap();
         let dataflow = builder.build().unwrap();
-        let handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
+        let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
+        inputs.push(handle.take_input::<i32>("data").unwrap());
         spawned.push(handle);
     }
 
@@ -247,6 +256,7 @@ fn shutdown_cancels_all_running_dataflows() {
         elapsed < Duration::from_secs(30),
         "shutdown took {elapsed:?} — possible hang"
     );
+    drop(inputs);
 }
 
 /// Spawn dataflows, cancel individual ones via SpawnedDataflow::cancel(),
@@ -418,6 +428,156 @@ fn concurrent_input_from_multiple_threads() {
     assert_eq!(all_values, expected);
 
     handle.join_blocking().unwrap();
+}
+
+/// Dataflows open at once on one runtime make progress independently:
+/// advancing one dataflow's inputs moves its probe to exactly the new time
+/// and delivers its records, while every other dataflow's probe stays exactly
+/// where its own inputs left it, neither advanced nor done.
+///
+/// Three dataflows, each an input and a chain of identity maps on `()` to a
+/// probe, are open at once, each on three workers. Round `r` touches only
+/// dataflow `r % 3`: on even rounds every worker sends `()` at that input's
+/// current time, so every dataflow has rounds with and without data; then
+/// every worker advances to `r` and the test waits for that dataflow's probe.
+#[test]
+fn open_dataflows_on_one_runtime_progress_independently() {
+    const DATAFLOWS: usize = 3;
+    const WORKERS: usize = 3;
+    const LENGTH: usize = 4;
+    const ROUNDS: u64 = 30;
+    const TIMEOUT: Duration = Duration::from_secs(10);
+    /// Append the records `output` has delivered so far to `received`, each
+    /// with its time.
+    fn drain(output: &OutputReceiver<u64, ()>, received: &mut Vec<(u64, ())>) {
+        while let Some(event) = output.try_recv() {
+            if let OutputEvent::Data { time, data } = event {
+                received.extend(data.into_iter().map(|x| (time, x)));
+            }
+        }
+    }
+    let rt = RuntimeHandle::new(RuntimeConfig {
+        worker_threads: 2,
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
+    let mut dataflows = Vec::new();
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    let mut probes = Vec::new();
+    for index in 0..DATAFLOWS {
+        let probe = OnceCell::new();
+        let mut dataflow = rt
+            .spawn_multi(
+                &format!("independent-{index}"),
+                WORKERS,
+                |b: &mut DataflowBuilder<u64>| {
+                    let mut stream = b.input::<()>("in")?;
+                    for step in 0..LENGTH {
+                        stream = stream.map(format!("step-{step}"), |_time, x: ()| x);
+                    }
+                    let (stream, handle) = stream.probe();
+                    probe.set(handle).expect("the dataflow is built once");
+                    stream.output("out")?;
+                    Ok(())
+                },
+                SpawnOptions::new().per_stage_parallelism(false),
+            )
+            .expect("spawn");
+        inputs.push(dataflow.take_all_inputs::<()>("in").expect("inputs"));
+        outputs.push(dataflow.take_all_outputs::<()>("out").expect("outputs"));
+        probes.push(probe.into_inner().expect("probe"));
+        dataflows.push(dataflow);
+    }
+    let mut last = [0u64; DATAFLOWS];
+    let mut expected: Vec<Vec<(u64, ())>> = vec![Vec::new(); DATAFLOWS];
+    let mut received: Vec<Vec<Vec<(u64, ())>>> = vec![vec![Vec::new(); WORKERS]; DATAFLOWS];
+    for round in 0..ROUNDS {
+        let index = round as usize % DATAFLOWS;
+        let with_data = round % 2 == 0;
+        for input in &inputs[index] {
+            if with_data {
+                input.send(last[index], vec![()]).expect("send");
+            }
+            input.advance_to(round).expect("advance");
+        }
+        if with_data {
+            expected[index].push((last[index], ()));
+        }
+        let probe = &probes[index];
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let frontier = probe.frontier();
+            assert!(
+                !frontier.is_empty() && frontier.elements().iter().all(|t| *t <= round),
+                "dataflow {index}: probe at {frontier:?} while its inputs are open at {round}"
+            );
+            if frontier.elements() == [round] {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "dataflow {index}: probe stuck at {frontier:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for (other, probe) in probes.iter().enumerate() {
+            if other != index {
+                assert_eq!(
+                    probe.frontier(),
+                    Antichain::from_elem(last[other]),
+                    "dataflow {other}'s probe while dataflow {index} ran round {round}"
+                );
+            }
+        }
+        for (output, received) in outputs[index].iter().zip(&mut received[index]) {
+            drain(output, received);
+        }
+        let want: Vec<(u64, ())> = expected[index]
+            .iter()
+            .filter(|(t, _)| *t < round)
+            .copied()
+            .collect();
+        for (worker, got) in received[index].iter().enumerate() {
+            let got: Vec<(u64, ())> = got.iter().filter(|(t, _)| *t < round).copied().collect();
+            assert_eq!(
+                got, want,
+                "dataflow {index}, worker {worker}: records before {round}"
+            );
+        }
+        last[index] = round;
+    }
+    drop(inputs);
+    let joins: Vec<_> = dataflows
+        .into_iter()
+        .map(|dataflow| std::thread::spawn(move || dataflow.join_blocking()))
+        .collect();
+    let deadline = Instant::now() + TIMEOUT;
+    while !(probes.iter().all(|probe| probe.is_done())
+        && joins.iter().all(|join| join.is_finished()))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "unfinished, probes at {:?}",
+            probes
+                .iter()
+                .map(|probe| probe.frontier())
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    for join in joins {
+        join.join().expect("join panicked").expect("dataflow");
+    }
+    for (index, (outputs, received)) in outputs.iter().zip(&mut received).enumerate() {
+        for (worker, (output, received)) in outputs.iter().zip(received).enumerate() {
+            drain(output, received);
+            assert_eq!(
+                received, &expected[index],
+                "dataflow {index}, worker {worker}: records"
+            );
+        }
+    }
 }
 
 /// Verify that an operator panic propagates as an error through join_blocking(),

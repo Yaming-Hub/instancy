@@ -1600,6 +1600,113 @@ mod tests {
         );
     }
 
+    /// Three one-input, one-output operators, nodes 1, 2 and 3 (node 0 is the
+    /// scope boundary), in a ring with summaries 0, 0 and 1. The advancing
+    /// ring is accepted and kept: a pointstamp at time 17 reaches the loop
+    /// head at 18 and the other inputs at 17, and retracting it retracts
+    /// exactly those implications.
+    #[test]
+    fn three_node_ring_propagates_the_increment_to_the_loop_head() {
+        let mut builder = Builder::<u64>::new(0, 0);
+        builder
+            .add_node(1, 1, 1, PortConnectivity::identity(0))
+            .unwrap();
+        builder
+            .add_node(2, 1, 1, PortConnectivity::identity(0))
+            .unwrap();
+        builder
+            .add_node(3, 1, 1, PortConnectivity::identity(1))
+            .unwrap();
+        builder
+            .add_edge(Location::source(1, 0), Location::target(2, 0))
+            .unwrap();
+        builder
+            .add_edge(Location::source(2, 0), Location::target(3, 0))
+            .unwrap();
+        builder
+            .add_edge(Location::source(3, 0), Location::target(1, 0))
+            .unwrap();
+        assert!(builder.find_identity_cycle().is_none());
+        let (mut tracker, _) = builder.build();
+        let target_changes = |tracker: &mut Tracker<u64>| {
+            sorted(
+                tracker
+                    .drain_pushed()
+                    .into_iter()
+                    .filter(|((location, _), _)| matches!(location, Location::Target { .. }))
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        tracker.update_source(1, 0, 17, 1);
+        tracker.propagate_all();
+        assert_eq!(
+            target_changes(&mut tracker),
+            vec![
+                ((Location::target(1, 0), 18), 1),
+                ((Location::target(2, 0), 17), 1),
+                ((Location::target(3, 0), 17), 1),
+            ]
+        );
+
+        tracker.update_source(1, 0, 17, -1);
+        tracker.propagate_all();
+        assert_eq!(
+            target_changes(&mut tracker),
+            vec![
+                ((Location::target(1, 0), 18), -1),
+                ((Location::target(2, 0), 17), -1),
+                ((Location::target(3, 0), 17), -1),
+            ]
+        );
+    }
+
+    /// A chain of three identity operators, nodes 1, 2 and 3, has no identity
+    /// cycle until an edge closes it.
+    #[test]
+    fn closing_a_three_node_identity_chain_makes_an_identity_cycle() {
+        let mut builder = Builder::<u64>::new(0, 0);
+        for node in 1..=3 {
+            builder
+                .add_node(node, 1, 1, PortConnectivity::identity(0))
+                .unwrap();
+        }
+        builder
+            .add_edge(Location::source(1, 0), Location::target(2, 0))
+            .unwrap();
+        builder
+            .add_edge(Location::source(2, 0), Location::target(3, 0))
+            .unwrap();
+        assert!(builder.find_identity_cycle().is_none());
+
+        builder
+            .add_edge(Location::source(3, 0), Location::target(1, 0))
+            .unwrap();
+        assert_eq!(
+            builder.find_identity_cycle(),
+            Some((Location::target(1, 0), 0))
+        );
+    }
+
+    /// One operator, node 1, with paths in0 -> out0 (summary 0) and
+    /// in1 -> out1 (summary 1), each output wired to the other input. The
+    /// only cycle passes through both paths and so advances.
+    #[test]
+    fn crossed_ports_with_one_advancing_path_are_no_identity_cycle() {
+        let mut builder = Builder::<u64>::new(0, 0);
+        let mut conn = PortConnectivity::new(2, 2);
+        conn.path_mut(0, 0).insert(0);
+        conn.path_mut(1, 1).insert(1);
+        builder.add_node(1, 2, 2, conn).unwrap();
+        builder
+            .add_edge(Location::source(1, 0), Location::target(1, 1))
+            .unwrap();
+        builder
+            .add_edge(Location::source(1, 1), Location::target(1, 0))
+            .unwrap();
+        assert!(builder.find_identity_cycle().is_none());
+    }
+
     /// The incremental zero tracking (`counts_zero_at`, `counted_zero`)
     /// agrees with a recount from the pointstamps after every propagation,
     /// under random updates (cancelling, negative, re-counted ports).

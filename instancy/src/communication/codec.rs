@@ -243,6 +243,62 @@ impl<T: Clone + Send + 'static> Data for T {}
 /// `ExchangeData` extends [`Data`] with an associated codec type. Any type that
 /// needs to be sent over the network must implement this trait (or use the
 /// blanket implementation provided by the `bincode-codec` feature).
+///
+/// # Example
+///
+/// A record type becomes exchangeable once it has a codec:
+///
+/// ```
+/// use instancy::DataflowBuilder;
+/// use instancy::communication::codec::{Codec, CodecError, ExchangeData};
+///
+/// #[derive(Clone, Debug, PartialEq)]
+/// struct Point {
+///     x: u64,
+///     y: u64,
+/// }
+///
+/// struct PointCodec;
+///
+/// impl Codec<Point> for PointCodec {
+///     fn encode(&self, p: &Point, buf: &mut Vec<u8>) -> Result<(), CodecError> {
+///         buf.extend_from_slice(&p.x.to_le_bytes());
+///         buf.extend_from_slice(&p.y.to_le_bytes());
+///         Ok(())
+///     }
+///
+///     fn decode(&self, buf: &[u8]) -> Result<(Point, usize), CodecError> {
+///         if buf.len() < 16 {
+///             return Err(CodecError::InsufficientData { needed: 16, available: buf.len() });
+///         }
+///         let x = u64::from_le_bytes(buf[..8].try_into().unwrap());
+///         let y = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+///         Ok((Point { x, y }, 16))
+///     }
+/// }
+///
+/// impl ExchangeData for Point {
+///     type CodecType = PointCodec;
+///     fn codec() -> PointCodec {
+///         PointCodec
+///     }
+/// }
+///
+/// // The codec round-trips a point.
+/// let p = Point { x: 1, y: 2 };
+/// let mut buf = Vec::new();
+/// Point::codec().encode(&p, &mut buf).unwrap();
+/// assert_eq!(Point::codec().decode(&buf).unwrap(), (p.clone(), 16));
+///
+/// // And points can now be exchanged.
+/// let builder = DataflowBuilder::<u64>::new("points");
+/// builder
+///     .source("points", vec![(0u64, vec![p])])
+///     .exchange("by-x", |p: &Point| p.x)
+///     .output("out")
+///     .unwrap();
+/// builder.build().unwrap();
+/// ```
 pub trait ExchangeData: Data {
     /// The codec type used to serialize/deserialize this data.
     type CodecType: Codec<Self>;

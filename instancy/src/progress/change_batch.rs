@@ -245,6 +245,16 @@ mod tests {
         assert!(batch.is_empty());
     }
 
+    /// A cancelled key is compacted away and a negative count survives.
+    #[test]
+    fn len_counts_a_negative_survivor_after_a_key_cancels() {
+        let mut batch = ChangeBatch::new_from(17u64, 1);
+        batch.update(17, -1);
+        batch.update(14, -1);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch.iter().cloned().collect::<Vec<_>>(), vec![(14, -1)]);
+    }
+
     #[test]
     fn update_multiple_keys() {
         let mut batch = ChangeBatch::new();
@@ -355,8 +365,10 @@ mod tests {
 
     #[test]
     fn with_capacity() {
-        let batch = ChangeBatch::<u64>::with_capacity(100);
+        let mut batch = ChangeBatch::<u64>::with_capacity(100);
         assert_eq!(batch.updates.capacity(), 100);
+        // Reserved capacity holds no updates.
+        assert!(batch.is_empty());
     }
 
     // --- is_dirty ---

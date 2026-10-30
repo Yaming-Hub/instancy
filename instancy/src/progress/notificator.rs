@@ -199,12 +199,17 @@ mod tests {
         notificator.notify_at(5);
         assert_eq!(notificator.pending_count(), 1);
         assert_eq!(notificator.ready_count(), 0);
+        // The requested time itself is pending, once, until the frontier
+        // passes it.
+        assert_eq!(notificator.pending, BTreeSet::from([5]));
+        assert!(notificator.ready.is_empty());
 
         // Frontier advances to 3 — not past 5 yet
         let frontier_3 = Antichain::from_elem(3u64);
         let fired = notificator.update_frontier(&frontier_3);
         assert_eq!(fired, 0);
         assert_eq!(notificator.pending_count(), 1);
+        assert_eq!(notificator.pending, BTreeSet::from([5]));
 
         // Frontier advances to 6 — past 5!
         let frontier_6 = Antichain::from_elem(6u64);
@@ -212,11 +217,14 @@ mod tests {
         assert_eq!(fired, 1);
         assert_eq!(notificator.pending_count(), 0);
         assert_eq!(notificator.ready_count(), 1);
+        assert!(notificator.pending.is_empty());
+        assert_eq!(notificator.ready, BTreeSet::from([5]));
 
         // Consume the notification
         let n = notificator.next().unwrap();
         assert_eq!(*n.time(), 5);
         assert!(notificator.next().is_none());
+        assert!(notificator.is_empty());
     }
 
     #[test]
@@ -243,6 +251,9 @@ mod tests {
         notificator.notify_at(5);
         notificator.notify_at(5);
         assert_eq!(notificator.pending_count(), 1);
+        // The one pending entry is the requested time.
+        assert_eq!(notificator.pending, BTreeSet::from([5]));
+        assert!(notificator.ready.is_empty());
     }
 
     #[test]
@@ -394,6 +405,58 @@ mod tests {
         // Already complete: fires immediately and must be delivered first.
         n.notify_at(2);
         assert_eq!(drain_times(&mut n), vec![2, 4, 8]);
+    }
+
+    /// On `Product` times: duplicate requests are delivered once, a time the
+    /// frontier has not passed waits for a later frontier, and a request made
+    /// mid-drain is delivered before the later ready time. (6, 0) precedes
+    /// (5, 8) because it completes at an earlier frontier.
+    #[test]
+    fn product_time_notifications_follow_the_partial_order_across_frontiers() {
+        use crate::order::Product;
+        let p = Product::<u64, u32>::new;
+        let mut n = Notificator::new(Antichain::from_elem(p(0, 0)));
+        for (outer, inner) in [
+            (3, 5),
+            (5, 4),
+            (1, 2),
+            (1, 1),
+            (1, 1),
+            (5, 4),
+            (6, 0),
+            (6, 2),
+            (5, 8),
+        ] {
+            n.notify_at(p(outer, inner));
+        }
+        assert!(n.next().is_none());
+        assert_eq!(
+            n.pending,
+            BTreeSet::from([
+                p(1, 1),
+                p(1, 2),
+                p(3, 5),
+                p(5, 4),
+                p(5, 8),
+                p(6, 0),
+                p(6, 2),
+            ])
+        );
+
+        n.update_frontier(&Antichain::from_elem_iter([p(5, 7), p(6, 1)]));
+        assert_eq!(
+            drain_times(&mut n),
+            vec![p(1, 1), p(1, 2), p(3, 5), p(5, 4), p(6, 0)]
+        );
+        assert_eq!(n.pending, BTreeSet::from([p(5, 8), p(6, 2)]));
+
+        n.update_frontier(&Antichain::from_elem(p(6, 10)));
+        assert_eq!(n.next().map(FiredNotification::into_time), Some(p(5, 8)));
+        n.notify_at(p(5, 9));
+        assert_eq!(n.next().map(FiredNotification::into_time), Some(p(5, 9)));
+        assert_eq!(n.next().map(FiredNotification::into_time), Some(p(6, 2)));
+        assert!(n.next().is_none());
+        assert!(n.is_empty());
     }
 
     /// Requests in any order, repeated, delivered once each in time order,

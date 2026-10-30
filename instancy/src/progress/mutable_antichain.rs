@@ -363,6 +363,8 @@ mod tests {
         assert!(mac.less_than(&6));
         assert!(mac.less_equal(&5));
         assert!(!mac.less_equal(&4));
+        // A time strictly above the frontier is also included.
+        assert!(mac.less_equal(&6));
     }
 
     // --- Update beyond frontier is no-op for frontier ---
@@ -392,8 +394,28 @@ mod tests {
         let mut mac = MutableAntichain::from_elem(1u64);
         let changes = mac.update_iter(vec![(1, -1), (2, 7)]);
         assert_eq!(mac.frontier(), &[2]);
-        assert!(changes.contains(&(1, -1)));
-        assert!(changes.contains(&(2, 1)));
+        // Exactly these deltas, in this order.
+        assert_eq!(changes, vec![(1, -1), (2, 1)]);
+    }
+
+    /// After the first update sets the frontier to 7, no update rebuilds it
+    /// (each is dominated by 7 or strictly beyond it), and the raw update
+    /// buffer still stays bounded.
+    #[test]
+    fn non_rebuilding_cancelling_updates_keep_the_raw_buffer_bounded() {
+        let mut mac = MutableAntichain::new();
+        for _ in 0..6 {
+            mac.update_iter(Some((7u64, 1)));
+        }
+        for _ in 0..5 {
+            mac.update_iter(Some((8u64, 1)));
+        }
+        for _ in 0..1000 {
+            mac.update_iter(Some((9u64, 1)));
+            mac.update_iter(Some((9u64, -1)));
+        }
+        let raw = mac.updates.unstable_internal_updates().len();
+        assert!(raw <= 32, "{raw} raw updates");
     }
 
     // --- count_for ---

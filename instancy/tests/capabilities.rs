@@ -2,15 +2,24 @@
 //! logic calls is covered by a capability, and every output and capability
 //! request must be justified by the call that makes it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use instancy::dataflow::{OutputEvent, Retained};
+use instancy::progress::frontier::Antichain;
 use instancy::{
-    DataflowBuilder, IterateResult, Pipe, Result, RuntimeConfig, RuntimeHandle, SpawnOptions,
+    DataflowBuilder, IterateResult, OutputReceiver, Pipe, Result, RuntimeConfig, RuntimeHandle,
+    SpawnOptions,
 };
+
+/// An operator's input frontier and the records it still held, at the end
+/// of each of its calls.
+type HeldLog = Arc<Mutex<Vec<(Antichain<u64>, usize)>>>;
+
+/// Each release of held records: their time and the input frontier then.
+type ReleaseLog = Arc<Mutex<Vec<(u64, Antichain<u64>)>>>;
 
 fn runtime() -> RuntimeHandle {
     RuntimeHandle::new(RuntimeConfig::default()).unwrap()
@@ -374,6 +383,301 @@ fn retain_then_emit_completes_with_exact_counts() {
     assert_eq!(out, expected);
 }
 
+/// A plain `unary` that retains its records' support is called again when
+/// its input frontier advances, with no new records: the advance alone
+/// releases the held records, and they arrive while the input stays open.
+///
+/// For each of three epochs, records are sent at the input's current time
+/// and the test waits for the operator's own witness that a call ended
+/// holding them. Nothing has been released or output by then. Then the input
+/// advances, without another batch, and the probe after the operator reaches
+/// exactly the next time, the operator has released that epoch with the
+/// frontier past it, and its records have arrived, all before the input
+/// closes.
+#[test]
+fn retained_records_are_released_by_a_frontier_advance_alone() {
+    let rt = runtime();
+    let held_at_end: HeldLog = Arc::default();
+    let released: ReleaseLog = Arc::default();
+    let builder = DataflowBuilder::<u64>::new("release-on-advance");
+    let (stream, probe) = builder
+        .input::<u64>("in")
+        .unwrap()
+        .unary("hold", {
+            let mut held = Held::default();
+            let held_at_end = Arc::clone(&held_at_end);
+            let released = Arc::clone(&released);
+            move |input, output| {
+                let held = &mut held;
+                while let Some((time, data)) = input.next() {
+                    held.0.push((output.retain(time), data));
+                }
+                let frontier = input.frontier().clone();
+                held.0.retain_mut(|(retained, data)| {
+                    if frontier.less_equal(retained.time()) {
+                        return true;
+                    }
+                    released
+                        .lock()
+                        .unwrap()
+                        .push((*retained.time(), frontier.clone()));
+                    output.push_vec(*retained.time(), std::mem::take(data));
+                    false
+                });
+                let still_held = held.0.iter().map(|(_, data)| data.len()).sum();
+                held_at_end.lock().unwrap().push((frontier, still_held));
+                Ok(())
+            }
+        })
+        .probe();
+    stream.output("out").unwrap();
+    let mut spawned = rt
+        .spawn(builder.build().unwrap(), SpawnOptions::new())
+        .unwrap();
+    let sender = spawned.take_input::<u64>("in").unwrap();
+    let receiver = spawned.take_output::<u64>("out").unwrap();
+    let mut received: Vec<(u64, u64)> = Vec::new();
+    for epoch in 0..3u64 {
+        let records: Vec<u64> = (0..=epoch).map(|i| epoch * 10 + i).collect();
+        sender.send(epoch, records.clone()).unwrap();
+        // A call has taken the records and ended holding them, at `epoch`.
+        wait_until("a call ending with the epoch's records held", || {
+            held_at_end.lock().unwrap().iter().any(|(frontier, held)| {
+                *frontier == Antichain::from_elem(epoch) && *held == records.len()
+            })
+        });
+        assert_eq!(
+            released.lock().unwrap().len() as u64,
+            epoch,
+            "released while epoch {epoch}'s time could still arrive"
+        );
+        assert!(
+            receiver.try_recv().is_none(),
+            "output while epoch {epoch} is held"
+        );
+        assert_eq!(probe.frontier(), Antichain::from_elem(epoch));
+
+        // Advance alone, with no new records.
+        sender.advance_to(epoch + 1).unwrap();
+        wait_until("the probe reaching the next epoch", || {
+            let frontier = probe.frontier();
+            assert!(
+                !frontier.is_empty() && frontier.elements().iter().all(|t| *t <= epoch + 1),
+                "probe at {frontier:?} while the input is open at {}",
+                epoch + 1
+            );
+            frontier.elements() == [epoch + 1]
+        });
+        while let Some(event) = receiver.try_recv() {
+            if let OutputEvent::Data { time, data } = event {
+                received.extend(data.into_iter().map(|x| (time, x)));
+            }
+        }
+        received.sort_unstable();
+        let want: Vec<(u64, u64)> = (0..=epoch)
+            .flat_map(|e| (0..=e).map(move |i| (e, e * 10 + i)))
+            .collect();
+        assert_eq!(
+            received, want,
+            "records once the input advanced past {epoch}, with the input open"
+        );
+        let release = released.lock().unwrap()[epoch as usize].clone();
+        assert_eq!(release.0, epoch, "released time");
+        assert!(
+            !release.1.less_equal(&epoch),
+            "released with the input frontier at {:?}",
+            release.1
+        );
+    }
+    drop(sender);
+    let (joined, rest) = with_timeout("release-on-advance", move || {
+        (spawned.join_blocking(), receiver.collect_data())
+    });
+    joined.unwrap();
+    assert!(rest.is_empty(), "records after the input closed: {rest:?}");
+    assert!(probe.is_done());
+    assert_eq!(released.lock().unwrap().len(), 3, "one release per epoch");
+}
+
+/// Behind an exchange on three workers, each instance of a plain `unary`
+/// holds its records until every worker's input has passed their time, and
+/// a frontier advance alone, with no new records, then releases them while
+/// the inputs stay open.
+///
+/// For each of three epochs, workers 0 and 1 send records and advance past
+/// the epoch; then worker 2, which lags, sends its records at the epoch
+/// without advancing. The exchange gives each instance one record from each
+/// worker. Each instance's own witness shows its call ending with all three
+/// held at the epoch, and nothing has been released. Then worker 2 advances
+/// alone: the probe reaches exactly the next epoch, each worker has exactly
+/// the records routed to it, and every release was made with the
+/// instance's input frontier past the epoch, before the inputs close.
+#[test]
+fn retained_records_behind_an_exchange_are_released_when_the_last_worker_advances() {
+    const WORKERS: usize = 3;
+    let rt = runtime();
+    // Each instance's latest call end: its input frontier and the records it
+    // still held. Instances are numbered in the order they are first called.
+    let instances: HeldLog = Arc::default();
+    let released: ReleaseLog = Arc::default();
+    let probe = std::cell::OnceCell::new();
+    let mut dataflow = rt
+        .spawn_multi(
+            "release-behind-exchange",
+            WORKERS,
+            |b: &mut DataflowBuilder<u64>| {
+                let (stream, handle) = b
+                    .input::<u64>("in")?
+                    .exchange_by_hash("route", |x: &u64| *x)
+                    .unary("hold", {
+                        let mut held = Held::default();
+                        let mut instance: Option<usize> = None;
+                        let instances = Arc::clone(&instances);
+                        let released = Arc::clone(&released);
+                        move |input, output| {
+                            let held = &mut held;
+                            while let Some((time, data)) = input.next() {
+                                held.0.push((output.retain(time), data));
+                            }
+                            let frontier = input.frontier().clone();
+                            held.0.retain_mut(|(retained, data)| {
+                                if frontier.less_equal(retained.time()) {
+                                    return true;
+                                }
+                                released
+                                    .lock()
+                                    .unwrap()
+                                    .push((*retained.time(), frontier.clone()));
+                                output.push_vec(*retained.time(), std::mem::take(data));
+                                false
+                            });
+                            let still_held = held.0.iter().map(|(_, data)| data.len()).sum();
+                            let mut instances = instances.lock().unwrap();
+                            let i = *instance.get_or_insert_with(|| {
+                                instances.push((frontier.clone(), still_held));
+                                instances.len() - 1
+                            });
+                            instances[i] = (frontier, still_held);
+                            Ok(())
+                        }
+                    })
+                    .probe();
+                probe.set(handle).expect("the dataflow is built once");
+                stream.output("out")?;
+                Ok(())
+            },
+            SpawnOptions::new().per_stage_parallelism(false),
+        )
+        .unwrap();
+    let probe = probe.into_inner().expect("probe");
+    let inputs = dataflow.take_all_inputs::<u64>("in").unwrap();
+    let outputs = dataflow.take_all_outputs::<u64>("out").unwrap();
+    // Worker `w` sends `epoch * 100 + w * 10 + 0..3` at `epoch`: three
+    // consecutive values, one routed to each worker (`value % 3`).
+    let records = |epoch: u64, worker: u64| -> Vec<u64> {
+        (0..3).map(|i| epoch * 100 + worker * 10 + i).collect()
+    };
+    let mut received: Vec<Vec<(u64, u64)>> = vec![Vec::new(); WORKERS];
+    let mut expected: Vec<Vec<(u64, u64)>> = vec![Vec::new(); WORKERS];
+    for epoch in 0..3u64 {
+        for worker in 0..2u64 {
+            inputs[worker as usize]
+                .send(epoch, records(epoch, worker))
+                .unwrap();
+            inputs[worker as usize].advance_to(epoch + 1).unwrap();
+        }
+        // Worker 2 lags: it sends at the epoch and stays there.
+        inputs[2].send(epoch, records(epoch, 2)).unwrap();
+        for worker in 0..3u64 {
+            for value in records(epoch, worker) {
+                expected[value as usize % WORKERS].push((epoch, value));
+            }
+        }
+        wait_until(
+            "every instance ending a call with its three records held",
+            || {
+                let instances = instances.lock().unwrap();
+                instances.len() == WORKERS
+                    && instances.iter().all(|(frontier, held)| {
+                        *frontier == Antichain::from_elem(epoch) && *held == 3
+                    })
+            },
+        );
+        assert!(
+            released
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(time, _)| *time < epoch),
+            "released {epoch} while worker 2 is still at it"
+        );
+        assert_eq!(
+            probe.frontier(),
+            Antichain::from_elem(epoch),
+            "probe while worker 2 lags"
+        );
+
+        // Worker 2 advances alone, with no new records.
+        inputs[2].advance_to(epoch + 1).unwrap();
+        wait_until("the probe reaching the next epoch", || {
+            let frontier = probe.frontier();
+            assert!(
+                !frontier.is_empty() && frontier.elements().iter().all(|t| *t <= epoch + 1),
+                "probe at {frontier:?} while the inputs are open at {}",
+                epoch + 1
+            );
+            frontier.elements() == [epoch + 1]
+        });
+        for (output, received) in outputs.iter().zip(&mut received) {
+            while let Some(event) = output.try_recv() {
+                if let OutputEvent::Data { time, data } = event {
+                    received.extend(data.into_iter().map(|x| (time, x)));
+                }
+            }
+            received.sort_unstable();
+        }
+        for (worker, (got, want)) in received.iter().zip(&expected).enumerate() {
+            let mut want = want.clone();
+            want.sort_unstable();
+            assert_eq!(
+                got, &want,
+                "worker {worker}'s records once every input passed {epoch}, with the inputs open"
+            );
+        }
+        // The epoch's held batches were released, each with its instance's
+        // input frontier past the epoch.
+        let released = released.lock().unwrap();
+        let this_epoch: Vec<&(u64, Antichain<u64>)> =
+            released.iter().filter(|(time, _)| *time == epoch).collect();
+        assert!(!this_epoch.is_empty(), "nothing released at {epoch}");
+        assert!(
+            this_epoch
+                .iter()
+                .all(|(_, frontier)| !frontier.less_equal(&epoch)),
+            "released before every input passed {epoch}: {released:?}"
+        );
+    }
+    drop(inputs);
+    let (joined, rest) = with_timeout("release-behind-exchange", move || {
+        let joined = dataflow.join_blocking();
+        let rest: Vec<_> = outputs.iter().map(|o| o.collect_data()).collect();
+        (joined, rest)
+    });
+    joined.unwrap();
+    assert!(
+        rest.iter().all(Vec::is_empty),
+        "records after the inputs closed: {rest:?}"
+    );
+    assert!(probe.is_done());
+    let released = released.lock().unwrap();
+    assert!(
+        released
+            .iter()
+            .all(|(time, frontier)| !frontier.less_equal(time)),
+        "a release with the input frontier not past its time: {released:?}"
+    );
+}
+
 /// A loop feeding a downstream `retain` whose final flush happens when its
 /// input frontier empties (never only on channel exhaustion: inside a loop,
 /// end-of-stream would wait for the capability).
@@ -460,6 +764,279 @@ fn retained_dropped_on_another_thread_is_released_and_wakes_the_worker() {
         "the count must fire once, after the retained capability was released"
     );
     dropper.join().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Output at a later time, justified by consumed input
+// ---------------------------------------------------------------------------
+
+/// Retained work of any shape, fresh per worker like [`Held`].
+#[derive(Default)]
+struct Fresh<V>(V);
+
+impl<V: Default> Clone for Fresh<V> {
+    fn clone(&self) -> Self {
+        Fresh::default()
+    }
+}
+
+/// Every record of `batches` with its time, sorted.
+fn records<D: Ord>(batches: Vec<(u64, Vec<D>)>) -> Vec<(u64, D)> {
+    let mut records: Vec<(u64, D)> = batches
+        .into_iter()
+        .flat_map(|(time, data)| data.into_iter().map(move |x| (time, x)))
+        .collect();
+    records.sort();
+    records
+}
+
+/// The next batch `receiver` delivers; fails the test after 30 s.
+fn next_batch<D: std::fmt::Debug + Send + 'static>(
+    receiver: &OutputReceiver<u64, D>,
+) -> (u64, Vec<D>) {
+    match receiver.recv_timeout(Duration::from_secs(30)) {
+        Some(OutputEvent::Data { time, data }) => (time, data),
+        other => panic!("expected an output batch within 30s, got {other:?}"),
+    }
+}
+
+/// Polls `condition` until it holds, failing the test after 30 s. The
+/// condition is the witness, never the time waited.
+fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !condition() {
+        assert!(Instant::now() < deadline, "{what}: not reached within 30s");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Input consumed in a call justifies output at any later time in that call,
+/// and that output is delivered at once, while the input is still open at the
+/// earlier time; records retained at the earlier time are held until the
+/// input frontier passes it, and are then released once.
+///
+/// `0..10` at 0 feed an operator that gives 12 at 12 in its first call that
+/// consumes input, and stashes each batch under support retained at its time
+/// until the input frontier passes it. The 12 arrives while the input is
+/// still open at 0 and the records are held; once the input closes, the whole
+/// output is the records at 0 and exactly one 12 at 12.
+#[test]
+fn consumed_input_justifies_one_later_output_while_its_records_wait_for_the_frontier() {
+    let rt = runtime();
+    // The operator's own record of each call's end: its input frontier and
+    // how many original records it still held.
+    let held_at_end: HeldLog = Arc::default();
+    // Each release of held records: their time and the input frontier then.
+    let released: ReleaseLog = Arc::default();
+    let builder = DataflowBuilder::<u64>::new("later-output-held-records");
+    let (stream, probe) = builder
+        .input::<u64>("in")
+        .unwrap()
+        .unary("later-output-and-hold", {
+            let mut sent = false;
+            let mut held = Held::default();
+            let held_at_end = Arc::clone(&held_at_end);
+            let released = Arc::clone(&released);
+            move |input, output| {
+                let held = &mut held;
+                while let Some((time, data)) = input.next() {
+                    if !sent {
+                        output.push_vec(12, vec![12]);
+                        sent = true;
+                    }
+                    held.0.push((output.retain(time), data));
+                }
+                let frontier = input.frontier().clone();
+                held.0.retain_mut(|(retained, data)| {
+                    if frontier.less_equal(retained.time()) {
+                        return true;
+                    }
+                    released
+                        .lock()
+                        .unwrap()
+                        .push((*retained.time(), frontier.clone()));
+                    output.push_vec(*retained.time(), std::mem::take(data));
+                    false
+                });
+                let still_held = held.0.iter().map(|(_, data)| data.len()).sum();
+                held_at_end.lock().unwrap().push((frontier, still_held));
+                Ok(())
+            }
+        })
+        .probe();
+    stream.output("out").unwrap();
+    let mut spawned = rt
+        .spawn(builder.build().unwrap(), SpawnOptions::new())
+        .unwrap();
+    let sender = spawned.take_input::<u64>("in").unwrap();
+    let receiver = spawned.take_output::<u64>("out").unwrap();
+    sender.send(0, (0..10).collect()).unwrap();
+    let first = next_batch(&receiver);
+    assert_eq!(first, (12, vec![12]));
+    // The input is still open at 0: a call that consumed the records ended
+    // with all ten held at frontier 0, and none has been released.
+    wait_until("a call ending with the records held", || {
+        held_at_end
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(frontier, held)| *frontier == Antichain::from_elem(0) && *held == 10)
+    });
+    assert_eq!(
+        *released.lock().unwrap(),
+        Vec::<(u64, Antichain<u64>)>::new(),
+        "records were released while their time could still arrive"
+    );
+    assert!(!probe.done_with(&0));
+    drop(sender);
+    let (joined, rest) = with_timeout("later-output-held-records", move || {
+        (spawned.join_blocking(), receiver.collect_data())
+    });
+    joined.unwrap();
+    let mut batches = vec![first];
+    batches.extend(rest);
+    let mut expected: Vec<(u64, u64)> = (0..10).map(|x| (0, x)).collect();
+    expected.push((12, 12));
+    assert_eq!(records(batches), expected);
+    // The records were released once, after the frontier had passed 0.
+    let released = released.lock().unwrap();
+    assert_eq!(released.len(), 1, "releases: {released:?}");
+    let (time, frontier) = &released[0];
+    assert_eq!(*time, 0);
+    assert!(
+        !frontier.less_equal(&0),
+        "released with the input frontier at {frontier:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Two inputs: support held until both input frontiers pass
+// ---------------------------------------------------------------------------
+
+/// What a two-input operator has done, updated at the end of each call. A
+/// test waits until the operator has seen its first input's frontier move
+/// (the witness that it processed that side) before checking what it has
+/// released.
+#[derive(Debug, Default)]
+struct TwoInputCalls {
+    /// The first input's frontier at the end of the latest call, if any.
+    first_frontier: Option<Vec<u64>>,
+    /// Each time whose support the operator released, in release order.
+    released: Vec<u64>,
+}
+
+fn wait_for_first_frontier(calls: &Mutex<TwoInputCalls>, frontier: &[u64]) {
+    wait_until("the operator seeing its first input's frontier", || {
+        calls.lock().unwrap().first_frontier.as_deref() == Some(frontier)
+    });
+}
+
+/// A `binary` operator is called on one input's data alone, and what it gives
+/// is delivered at once, while its other input is still behind. Each input
+/// reports its own frontier, so support the operator retains per time is
+/// released only once both input frontiers have passed that time, and until
+/// then it holds the probe.
+///
+/// For `i` in `1..10` each input in turn sends `i - 1` and advances to `i`.
+/// Every batch is forwarded at once and retains support at its time; each
+/// time's support is released once, in order, after both inputs pass it.
+/// Then the first input sends 9 and closes while the second is still open at
+/// 9: an empty frontier on one input does not release time 9 until the other
+/// input passes it too.
+#[test]
+fn binary_forwards_at_once_and_releases_each_time_once_both_input_frontiers_pass_it() {
+    let rt = runtime();
+    let builder = DataflowBuilder::<u64>::new("binary-forward-and-release");
+    let calls: Arc<Mutex<TwoInputCalls>> = Arc::default();
+    let first = builder.input::<u64>("in1").unwrap();
+    let second = builder.input::<u64>("in2").unwrap();
+    let (forwarded, probe) = first
+        .binary(second, "forward-and-release", {
+            let calls = Arc::clone(&calls);
+            let mut support = Fresh::<BTreeMap<u64, Retained<u64>>>::default();
+            move |input1, input2, output| {
+                let support = &mut support;
+                while let Some((time, data)) = input1.next() {
+                    support.0.entry(time).or_insert_with(|| output.retain(time));
+                    output.push_vec(time, data);
+                }
+                while let Some((time, data)) = input2.next() {
+                    support.0.entry(time).or_insert_with(|| output.retain(time));
+                    output.push_vec(time, data);
+                }
+                let (frontier1, frontier2) = (input1.frontier(), input2.frontier());
+                let mut calls = calls.lock().unwrap();
+                support.0.retain(|time, _support| {
+                    if frontier1.less_equal(time) || frontier2.less_equal(time) {
+                        return true;
+                    }
+                    calls.released.push(*time);
+                    false
+                });
+                calls.first_frontier = Some(frontier1.elements().to_vec());
+                Ok(())
+            }
+        })
+        .unwrap()
+        .probe();
+    forwarded.output("out").unwrap();
+    let mut spawned = rt
+        .spawn(builder.build().unwrap(), SpawnOptions::new())
+        .unwrap();
+    let in1 = spawned.take_input::<u64>("in1").unwrap();
+    let in2 = spawned.take_input::<u64>("in2").unwrap();
+    let receiver = spawned.take_output::<u64>("out").unwrap();
+    let mut batches = Vec::new();
+    for i in 1..10u64 {
+        in1.send(i - 1, vec![i - 1]).unwrap();
+        in1.advance_to(i).unwrap();
+        // Forwarded at once, while the second input is still at i - 1.
+        let batch = next_batch(&receiver);
+        assert_eq!(batch, (i - 1, vec![i - 1]));
+        batches.push(batch);
+        wait_for_first_frontier(&calls, &[i]);
+        assert_eq!(
+            calls.lock().unwrap().released,
+            (0..i - 1).collect::<Vec<_>>(),
+            "released {} while the second input was still at it",
+            i - 1
+        );
+        assert!(!probe.done_with(&(i - 1)));
+        in2.send(i - 1, vec![i - 1]).unwrap();
+        in2.advance_to(i).unwrap();
+        let batch = next_batch(&receiver);
+        assert_eq!(batch, (i - 1, vec![i - 1]));
+        batches.push(batch);
+        wait_until("both inputs passing the round's time", || {
+            probe.done_with(&(i - 1))
+        });
+        assert_eq!(calls.lock().unwrap().released, (0..i).collect::<Vec<_>>());
+    }
+    // One input closes while the other is still open: the first input sends 9
+    // and closes, so its frontier is empty, but the second is still at 9, so
+    // time 9's support stays held until the second input closes too.
+    in1.send(9, vec![9]).unwrap();
+    drop(in1);
+    let batch = next_batch(&receiver);
+    assert_eq!(batch, (9, vec![9]));
+    batches.push(batch);
+    wait_for_first_frontier(&calls, &[]);
+    assert_eq!(
+        calls.lock().unwrap().released,
+        (0..9).collect::<Vec<_>>(),
+        "released 9 while the second input was still open at it"
+    );
+    assert!(!probe.done_with(&9));
+    in2.send(9, vec![9]).unwrap();
+    drop(in2);
+    let (joined, rest) = with_timeout("binary-forward-and-release", move || {
+        (spawned.join_blocking(), receiver.collect_data())
+    });
+    joined.unwrap();
+    batches.extend(rest);
+    let expected: Vec<(u64, u64)> = (0..10).flat_map(|t| [(t, t), (t, t)]).collect();
+    assert_eq!(records(batches), expected);
+    assert_eq!(calls.lock().unwrap().released, (0..10).collect::<Vec<_>>());
 }
 
 // ---------------------------------------------------------------------------

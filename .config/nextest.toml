@@ -1,0 +1,25 @@
+# cargo-nextest configuration. CI runs the regular test jobs with
+# `--profile ci`; see docs/testing/nextest.md.
+
+[profile.ci]
+# A test that fails once has failed.
+retries = 0
+# As many at a time as `cargo test --test-threads=4` ran before.
+test-threads = 4
+# A test still running after 120 s (4 periods of 30 s) is terminated and fails.
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+[test-groups]
+# Caps how many TCP-using test processes run at once.
+tcp-cluster = { max-threads = 2 }
+
+# Runs three fault variants and can take over 60 s: terminated after 180 s.
+[[profile.ci.overrides]]
+filter = 'binary(=cluster_teardown_adversarial) & test(=writer_only_failure_never_hangs_or_passes_silently)'
+slow-timeout = { period = "30s", terminate-after = 6 }
+
+# Tests that open TCP connections: whole binaries where helper-based TCP
+# use is mixed with local tests, plus the library's transport tests.
+[[profile.ci.overrides]]
+filter = 'binary(/^cluster/) | binary(/^(parallel_cluster_tcp|probe_cluster|inter_process|parallel_dataflows|operator_panic|output_receiver_drop|port_take_mode_mismatch|runtime_lifecycle|trace_recorder|seals|shared_transport_reliability|transport_frame_integrity|progress_conformance)$/) | (kind(lib) & test(/cluster|tcp|shared_transport|peer_link|interprocess|network_progress/)) | (kind(lib) & test(=communication::transport_session::tests::dropped_session_keeps_reading_so_its_last_frames_survive))'
+test-group = 'tcp-cluster'

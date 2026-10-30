@@ -463,6 +463,9 @@ cargo test -p instancy --no-default-features --features tracing
 cargo test -p instancy --all-features --test cluster_tcp
 ```
 
+CI runs the unit and integration tests with cargo-nextest; see
+[docs/testing/nextest.md](./docs/testing/nextest.md).
+
 ### Test Organization
 
 | File | Description |

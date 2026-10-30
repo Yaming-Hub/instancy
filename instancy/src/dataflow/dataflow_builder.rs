@@ -3600,6 +3600,30 @@ impl<
     /// ```ignore
     /// let partitioned = stream.exchange("by_key", |record: &(u64, String)| record.0);
     /// ```
+    ///
+    /// # Records need a codec
+    ///
+    /// With the `transport` feature, exchanged records must implement
+    /// [`ExchangeData`](crate::communication::codec::ExchangeData), so a
+    /// record type without a codec can't be exchanged:
+    ///
+    /// ```compile_fail,E0599
+    /// use instancy::DataflowBuilder;
+    ///
+    /// #[derive(Clone, Debug)]
+    /// struct Point {
+    ///     x: u64,
+    ///     y: u64,
+    /// }
+    ///
+    /// let builder = DataflowBuilder::<u64>::new("points");
+    /// builder
+    ///     .source("points", vec![(0u64, vec![Point { x: 1, y: 2 }])])
+    ///     .exchange("by-x", |p: &Point| p.x);
+    /// ```
+    ///
+    /// Implementing `ExchangeData` for the type makes it exchangeable; its
+    /// documentation has an example.
     pub fn exchange<K: std::hash::Hash + 'static>(
         mut self,
         name: impl Into<String>,
@@ -5419,6 +5443,46 @@ mod tests {
         assert_eq!(results[0], (0, vec![1, 2, 3]));
     }
 
+    /// Without the `transport` feature, exchanged data needs no codec. A
+    /// codec-less record type, which must not compile with `transport` (see
+    /// `Pipe::exchange`'s documentation), is exchanged and every record is
+    /// delivered once at time 0.
+    #[cfg(not(feature = "transport"))]
+    #[test]
+    fn codec_less_records_are_exchanged_without_transport() {
+        #[derive(Clone, Debug)]
+        struct TreeNode {
+            data: u64,
+            children: Vec<TreeNode>,
+        }
+
+        let builder = DataflowBuilder::<u64>::new("types");
+        let port = builder
+            .source("nums", vec![(0u64, (0..10u64).collect::<Vec<_>>())])
+            .map("tree", |_t, data| TreeNode {
+                data,
+                children: Vec::new(),
+            })
+            .exchange("by-data", |node: &TreeNode| node.data)
+            .output("seen")
+            .unwrap();
+        rt().run(builder.build().unwrap()).unwrap();
+
+        let collector = port.collector();
+        let mut seen: Vec<(u64, u64, usize)> = collector
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(t, nodes)| {
+                nodes
+                    .iter()
+                    .map(move |node| (*t, node.data, node.children.len()))
+            })
+            .collect();
+        seen.sort();
+        assert_eq!(seen, (0..10).map(|x| (0, x, 0)).collect::<Vec<_>>());
+    }
+
     #[test]
     fn test_map_operator() {
         let builder = DataflowBuilder::<u64>::new("map_test");
@@ -5446,6 +5510,13 @@ mod tests {
         let collector = port.collector();
         let results = collector.lock().unwrap();
         assert_eq!(results[0].1, vec![2, 4, 6]);
+
+        // The whole output is the kept records, each at its input time.
+        let all: Vec<(u64, i32)> = results
+            .iter()
+            .flat_map(|(t, v)| v.iter().map(move |x| (*t, *x)))
+            .collect();
+        assert_eq!(all, vec![(0, 2), (0, 4), (0, 6)]);
     }
 
     #[test]
@@ -5492,6 +5563,33 @@ mod tests {
                 .map(String::from)
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// Four chained increments, each its own operator, then a `Some` wrapping
+    /// flattened by `flat_map`: every record comes out once, four higher, at
+    /// its time.
+    #[test]
+    fn test_composed_increments_then_option_flatten() {
+        let builder = DataflowBuilder::<u64>::new("composed_increments");
+        let port = builder
+            .source("nums", vec![(0u64, (0..10i32).collect::<Vec<_>>())])
+            .flat_map("plus_one", |_t, x| vec![x + 1])
+            .map("plus_two", |_t, x| x + 1)
+            .map("plus_three", |_t, x| x + 1)
+            .map("plus_four", |_t, x| x + 1)
+            .map("some", |_t, x| Some(x))
+            .flat_map("flatten", |_t, x: Option<i32>| x.into_iter().collect())
+            .output("results")
+            .unwrap();
+        rt().run(builder.build().unwrap()).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let all: Vec<(u64, i32)> = r
+            .iter()
+            .flat_map(|(t, v)| v.iter().map(move |x| (*t, *x)))
+            .collect();
+        assert_eq!(all, (4..14).map(|x| (0, x)).collect::<Vec<_>>());
     }
 
     #[test]
@@ -5970,6 +6068,53 @@ mod tests {
         let mut all: Vec<i32> = r.iter().flat_map(|(_, v)| v.iter().copied()).collect();
         all.sort();
         assert_eq!(all, vec![1, 2, 3]);
+
+        // Three independent sources of the same values keep every copy.
+        let builder = DataflowBuilder::<u64>::new("concat3_identical");
+        let sources = (0..3)
+            .map(|i| {
+                builder.source(
+                    format!("nums{i}"),
+                    vec![(0u64, (0..10).collect::<Vec<i32>>())],
+                )
+            })
+            .collect();
+        let port = Pipe::concat(sources).unwrap().output("merged").unwrap();
+        rt().run(builder.build().unwrap()).unwrap();
+
+        let col = port.collector();
+        let r = col.lock().unwrap();
+        let mut all: Vec<(u64, i32)> = r
+            .iter()
+            .flat_map(|(t, v)| v.iter().map(move |x| (*t, *x)))
+            .collect();
+        all.sort();
+        assert_eq!(all, (0..10).flat_map(|x| [(0, x); 3]).collect::<Vec<_>>());
+    }
+
+    /// A stream connected to both inputs of one operator reaches it along
+    /// each edge: merged with itself, it carries every record twice, at its
+    /// time.
+    #[test]
+    fn test_merge_stream_with_itself_emits_every_record_twice() {
+        let builder = DataflowBuilder::<u64>::new("merge_self");
+        let stream = builder.source("nums", vec![(0u64, (0..10).collect::<Vec<i32>>())]);
+        let port = stream
+            .clone()
+            .merge(stream)
+            .unwrap()
+            .output("merged")
+            .unwrap();
+        rt().run(builder.build().unwrap()).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let mut all: Vec<(u64, i32)> = r
+            .iter()
+            .flat_map(|(t, v)| v.iter().map(move |x| (*t, *x)))
+            .collect();
+        all.sort();
+        assert_eq!(all, (0..10).flat_map(|x| [(0, x); 2]).collect::<Vec<_>>());
     }
 
     #[test]
@@ -6531,6 +6676,54 @@ mod tests {
         let c = port.collector();
         let r = c.lock().unwrap();
         assert_eq!(r[0].1, vec![Ok(2), Err("bad".into()), Ok(6)]);
+
+        // The whole output is these three records at time 0.
+        let all: Vec<(u64, std::result::Result<i32, String>)> = r
+            .iter()
+            .flat_map(|(t, v)| v.iter().map(move |x| (*t, x.clone())))
+            .collect();
+        assert_eq!(all, vec![(0, Ok(2)), (0, Err("bad".into())), (0, Ok(6))]);
+    }
+
+    /// A native `map` over `Result::map_err`: only errors are rewritten.
+    #[test]
+    fn test_map_err_via_map_rewrites_only_errors() {
+        let builder = DataflowBuilder::<u64>::new("map_err");
+        let port = builder
+            .source::<std::result::Result<i32, ()>>("data", vec![(0u64, vec![Ok(0), Err(())])])
+            .map("map_err", |_t, x| x.map_err(|()| 10))
+            .output("results")
+            .unwrap();
+        rt().run(builder.build().unwrap()).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let all: Vec<(u64, std::result::Result<i32, i32>)> = r
+            .iter()
+            .flat_map(|(t, v)| v.iter().map(move |x| (*t, *x)))
+            .collect();
+        assert_eq!(all, vec![(0, Ok(0)), (0, Err(10))]);
+    }
+
+    /// A native `map` over `Result::unwrap_or_else`: an `Ok` unwraps and an
+    /// `Err` becomes the fallback, computed from the error (5 * 2).
+    #[test]
+    fn test_unwrap_or_else_via_map_replaces_errors_with_fallback() {
+        let builder = DataflowBuilder::<u64>::new("unwrap_or_else");
+        let port = builder
+            .source::<std::result::Result<i32, i32>>("data", vec![(0u64, vec![Ok(0), Err(5)])])
+            .map("unwrap_or_else", |_t, x| x.unwrap_or_else(|e| e * 2))
+            .output("results")
+            .unwrap();
+        rt().run(builder.build().unwrap()).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let all: Vec<(u64, i32)> = r
+            .iter()
+            .flat_map(|(t, v)| v.iter().map(move |x| (*t, *x)))
+            .collect();
+        assert_eq!(all, vec![(0, 0), (0, 10)]);
     }
 
     #[test]
@@ -6581,6 +6774,22 @@ mod tests {
         assert_eq!(r[0].1[0], Ok(42));
         assert_eq!(r[0].1[1], Err("upstream_err".into()));
         assert!(r[0].1[2].is_err()); // parse error
+
+        // The whole output is these three records at time 0, with no further
+        // batches.
+        let parse_error = "not_a_number".parse::<i32>().unwrap_err().to_string();
+        let all: Vec<(u64, std::result::Result<i32, String>)> = r
+            .iter()
+            .flat_map(|(t, v)| v.iter().map(move |x| (*t, x.clone())))
+            .collect();
+        assert_eq!(
+            all,
+            vec![
+                (0, Ok(42)),
+                (0, Err("upstream_err".into())),
+                (0, Err(parse_error)),
+            ]
+        );
     }
 
     #[test]
@@ -6607,6 +6816,20 @@ mod tests {
         let mut err_vals: Vec<String> = er.iter().flat_map(|(_, v)| v.iter().cloned()).collect();
         err_vals.sort();
         assert_eq!(err_vals, vec!["a", "b"]);
+
+        // Each output carries exactly its unwrapped variant, at the input time.
+        let mut ok_records: Vec<(u64, i32)> = or
+            .iter()
+            .flat_map(|(t, v)| v.iter().map(move |x| (*t, *x)))
+            .collect();
+        ok_records.sort();
+        assert_eq!(ok_records, vec![(0, 1), (0, 2)]);
+        let mut err_records: Vec<(u64, String)> = er
+            .iter()
+            .flat_map(|(t, v)| v.iter().map(move |x| (*t, x.clone())))
+            .collect();
+        err_records.sort();
+        assert_eq!(err_records, vec![(0, "a".to_owned()), (0, "b".to_owned())]);
     }
 
     #[test]
@@ -6894,25 +7117,79 @@ mod tests {
         let c = port.collector();
         let r = c.lock().unwrap();
         assert_eq!(r[0].1, vec![10, 20, 30]);
+
+        // The complete output of the inspected source is every record at its
+        // time.
+        let forwarded: Vec<(u64, i32)> = r
+            .iter()
+            .flat_map(|(t, v)| v.iter().map(move |x| (*t, *x)))
+            .collect();
+        assert_eq!(forwarded, vec![(0, 10), (0, 20), (0, 30)]);
+
+        // A prime-testing inspect: the callback sees every record but selects
+        // only the primes, and the stream is forwarded unchanged.
+        let all_seen = Arc::new(Mutex::new(Vec::new()));
+        let primes = Arc::new(Mutex::new(Vec::new()));
+        let all_seen_in_inspect = all_seen.clone();
+        let primes_in_inspect = primes.clone();
+        let builder = DataflowBuilder::<u64>::new("inspect_primes");
+        let prime_port = builder
+            .source("nums", vec![(0u64, (0u64..10).collect::<Vec<_>>())])
+            .inspect("primes", move |_t, x| {
+                all_seen_in_inspect.lock().unwrap().push(*x);
+                let limit = (*x as f64).sqrt() as u64;
+                if *x > 1 && (2..=limit).all(|i| x % i > 0) {
+                    primes_in_inspect.lock().unwrap().push(*x);
+                }
+            })
+            .output("results")
+            .unwrap();
+        rt().run(builder.build().unwrap()).unwrap();
+
+        assert_eq!(*all_seen.lock().unwrap(), (0..10).collect::<Vec<u64>>());
+        assert_eq!(*primes.lock().unwrap(), vec![2, 3, 5, 7]);
+        let c = prime_port.collector();
+        let r = c.lock().unwrap();
+        let forwarded: Vec<(u64, u64)> = r
+            .iter()
+            .flat_map(|(t, v)| v.iter().map(move |x| (*t, *x)))
+            .collect();
+        assert_eq!(forwarded, (0..10).map(|x| (0, x)).collect::<Vec<_>>());
     }
 
     #[test]
     fn test_inspect_batch_sees_whole_batch() {
         let batch_sizes = Arc::new(Mutex::new(Vec::new()));
         let batch_sizes_clone = batch_sizes.clone();
+        // Each callback's time and batch, and whether the probe had already
+        // passed that time when the callback ran.
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_clone = observed.clone();
 
         let builder = DataflowBuilder::<u64>::new("inspect_batch_test");
-        let port = builder
+        let (nums, probe) = builder
             .source(
                 "nums",
                 vec![(0u64, vec![1i32, 2, 3]), (1u64, vec![4i32, 5])],
             )
-            .inspect_batch("batch-spy", move |_t, batch| {
+            .probe();
+        let probe_in_callback = probe.clone();
+        let port = nums
+            .inspect_batch("batch-spy", move |t, batch| {
                 batch_sizes_clone.lock().unwrap().push(batch.len());
+                observed_clone.lock().unwrap().push((
+                    *t,
+                    batch.to_vec(),
+                    probe_in_callback.done_with(t),
+                ));
             })
             .output("results")
             .unwrap();
         let dataflow = builder.build().unwrap();
+        // Subscribed before execution. The minimum is the probe's logical
+        // starting state, not a reported frontier change.
+        let frontier_updates = probe.subscribe();
+        assert_eq!(probe.frontier(), Antichain::from_elem(0));
         rt().run(dataflow).unwrap();
 
         // Two batches observed
@@ -6926,6 +7203,18 @@ mod tests {
         let r = c.lock().unwrap();
         assert_eq!(r[0], (0, vec![1, 2, 3]));
         assert_eq!(r[1], (1, vec![4, 5]));
+
+        // Data events go to `inspect_batch` and frontier events to a probe:
+        // each batch callback gets its time and records while the probe still
+        // holds that time, the frontier then advances to empty, and no other
+        // batch is forwarded.
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![(0, vec![1, 2, 3], false), (1, vec![4, 5], false)]
+        );
+        assert!(probe.is_done());
+        assert!(frontier_updates.borrow().is_empty());
+        assert_eq!(*r, vec![(0, vec![1, 2, 3]), (1, vec![4, 5])]);
     }
 
     #[test]
@@ -6952,12 +7241,15 @@ mod tests {
     fn test_inspect_receives_timestamp() {
         let timestamps = Arc::new(Mutex::new(Vec::new()));
         let ts_clone = timestamps.clone();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_clone = observed.clone();
 
         let builder = DataflowBuilder::<u64>::new("inspect_ts");
         let port = builder
             .source("nums", vec![(10u64, vec![1i32]), (20u64, vec![2i32])])
-            .inspect("ts-spy", move |t, _x| {
+            .inspect("ts-spy", move |t, x| {
                 ts_clone.lock().unwrap().push(*t);
+                observed_clone.lock().unwrap().push((*t, *x));
             })
             .output("results")
             .unwrap();
@@ -6970,6 +7262,61 @@ mod tests {
         let c = port.collector();
         let r = c.lock().unwrap();
         assert_eq!(r.len(), 2);
+
+        // The callback gets each record with its time, and the forwarded
+        // output is exactly those records at those times.
+        let expected = vec![(10, 1), (20, 2)];
+        assert_eq!(*observed.lock().unwrap(), expected);
+        let forwarded: Vec<(u64, i32)> = r
+            .iter()
+            .flat_map(|(t, v)| v.iter().map(move |x| (*t, *x)))
+            .collect();
+        assert_eq!(forwarded, expected);
+    }
+
+    /// An inspect that panics if called sits on a typed source with no data,
+    /// is never called, and the dataflow completes. The control injects one
+    /// record into the same graph and shows the guard does fire.
+    #[test]
+    fn test_empty_source_never_calls_inspect_guard_and_completes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let run_guarded = |records: Vec<(u64, Vec<()>)>| {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let calls_in_guard = calls.clone();
+            let builder = DataflowBuilder::<u64>::new("empty_source");
+            builder.catch_panics(true);
+            let (stream, probe) = builder
+                .source::<()>("empty", records)
+                .inspect("never", move |_t, _x| {
+                    calls_in_guard.fetch_add(1, Ordering::SeqCst);
+                    panic!("never called");
+                })
+                .probe();
+            let port = stream.output("results").unwrap();
+            let result = rt().run(builder.build().unwrap());
+            let output = port.collector().lock().unwrap().clone();
+            (result, calls.load(Ordering::SeqCst), probe, output)
+        };
+
+        let (result, calls, probe, output) = run_guarded(vec![]);
+        result.unwrap();
+        assert_eq!(calls, 0);
+        assert!(probe.is_done());
+        assert!(output.is_empty());
+
+        let (result, calls, _probe, output) = run_guarded(vec![(0, vec![()])]);
+        match result {
+            Err(Error::OperatorPanic {
+                operator, message, ..
+            }) => {
+                assert_eq!(operator, "never");
+                assert_eq!(message, "never called");
+            }
+            other => panic!("expected the guard's OperatorPanic, got {other:?}"),
+        }
+        assert_eq!(calls, 1);
+        assert!(output.is_empty());
     }
 
     #[test]
@@ -7600,6 +7947,99 @@ mod tests {
         let or_ = oc.lock().unwrap();
         let odd_results: Vec<i32> = or_.iter().flat_map(|(_, d)| d.clone()).collect();
         assert_eq!(odd_results, vec![1, 3, 5]);
+
+        // Each output is its records, at the input time.
+        let even_records: Vec<(u64, i32)> = er
+            .iter()
+            .flat_map(|(t, d)| d.iter().map(move |x| (*t, *x)))
+            .collect();
+        assert_eq!(even_records, vec![(0, 2), (0, 4), (0, 6)]);
+        let odd_records: Vec<(u64, i32)> = or_
+            .iter()
+            .flat_map(|(t, d)| d.iter().map(move |x| (*t, *x)))
+            .collect();
+        assert_eq!(odd_records, vec![(0, 1), (0, 3), (0, 5)]);
+    }
+
+    /// A branch's outputs are ordinary streams: its second output can be
+    /// branched again, and the resulting outputs, connected directly, can be
+    /// concatenated or merged. Each record reaches exactly one leg, at its
+    /// time, and recombining the legs gives back exactly the input.
+    #[test]
+    fn test_branch_outputs_can_be_branched_again_and_recombined() {
+        let builder = DataflowBuilder::<u64>::new("branch_again");
+        let input: Vec<(u64, Vec<u64>)> = vec![(0, (0..6).collect()), (1, (6..10).collect())];
+        let (zero, rest) = builder
+            .source("nums", input.clone())
+            .branch("is-zero-mod-3", |_t, x| x % 3 == 0);
+        let (one, two) = rest.branch("is-one-mod-3", |_t, x| x % 3 == 1);
+        let zero_port = zero.clone().output("zero").unwrap();
+        let one_port = one.clone().output("one").unwrap();
+        let two_port = two.clone().output("two").unwrap();
+        let all_port = Pipe::concat(vec![zero, one.clone(), two.clone()])
+            .unwrap()
+            .output("all")
+            .unwrap();
+        let one_or_two_port = one.merge(two).unwrap().output("one-or-two").unwrap();
+        rt().run(builder.build().unwrap()).unwrap();
+
+        let records = |port: &OutputPort<u64, u64>| {
+            let collector = port.collector();
+            let mut records: Vec<(u64, u64)> = collector
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|(t, v)| v.iter().map(move |x| (*t, *x)))
+                .collect();
+            records.sort();
+            records
+        };
+        let expected = |residues: &[u64]| -> Vec<(u64, u64)> {
+            input
+                .iter()
+                .flat_map(|(t, v)| v.iter().map(move |x| (*t, *x)))
+                .filter(|(_, x)| residues.contains(&(x % 3)))
+                .collect()
+        };
+        assert_eq!(records(&zero_port), expected(&[0]), "first branch, slot 0");
+        assert_eq!(records(&one_port), expected(&[1]), "second branch, slot 0");
+        assert_eq!(records(&two_port), expected(&[2]), "second branch, slot 1");
+        assert_eq!(
+            records(&all_port),
+            expected(&[0, 1, 2]),
+            "concat of all three"
+        );
+        assert_eq!(
+            records(&one_or_two_port),
+            expected(&[1, 2]),
+            "merge of the second branch"
+        );
+    }
+
+    /// `branch` gives its predicate each record's time, so a stream can be
+    /// split by time: records delayed to times `0..10` split into `< 5` and
+    /// `>= 5`, each keeping its time.
+    #[test]
+    fn test_branch_predicate_receives_each_records_time() {
+        let builder = DataflowBuilder::<u64>::new("branch_by_time");
+        let (after_five, before_five) = builder
+            .source("nums", vec![(0u64, (0..10u64).collect::<Vec<_>>())])
+            .delay("to_value", |_t, x| *x)
+            .branch("at_least_five", |t, _x| *t >= 5);
+        let before_port = before_five.output("before_five").unwrap();
+        let after_port = after_five.output("after_five").unwrap();
+        rt().run(builder.build().unwrap()).unwrap();
+
+        for (port, times) in [(before_port, 0..5u64), (after_port, 5..10)] {
+            let c = port.collector();
+            let r = c.lock().unwrap();
+            let mut all: Vec<(u64, u64)> = r
+                .iter()
+                .flat_map(|(t, d)| d.iter().map(move |x| (*t, *x)))
+                .collect();
+            all.sort();
+            assert_eq!(all, times.map(|x| (x, x)).collect::<Vec<_>>());
+        }
     }
 
     #[test]

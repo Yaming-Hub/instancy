@@ -14,14 +14,15 @@ use std::time::Duration;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Helper: spawn a multi-worker dataflow, send data, collect results per worker.
-async fn run_broadcast_per_worker<D, F>(
+/// Helper: spawn a multi-worker dataflow, send data, collect each worker's
+/// timestamped results.
+async fn run_broadcast_timed_per_worker<D, F>(
     name: &str,
     num_workers: usize,
     build_fn: F,
     input_data: Vec<(u64, Vec<i64>)>,
     output_name: &str,
-) -> Vec<Vec<D>>
+) -> Vec<Vec<(u64, D)>>
 where
     D: Clone + Send + Sync + 'static,
     F: Fn(&mut DataflowBuilder<u64>) + Send + Sync + 'static,
@@ -63,26 +64,49 @@ where
 
     let result = tokio::time::timeout(
         TEST_TIMEOUT,
-        tokio::task::spawn_blocking(move || multi.join_blocking()),
+        tokio::task::spawn_blocking(move || {
+            let joined = multi.join_blocking();
+            let collected: Vec<_> = receivers.into_iter().map(|r| r.collect_data()).collect();
+            (joined, collected)
+        }),
     )
     .await;
 
-    match result {
-        Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(e))) => panic!("dataflow join failed: {e}"),
+    let collected = match result {
+        Ok(Ok((Ok(()), collected))) => collected,
+        Ok(Ok((Err(e), _))) => panic!("dataflow join failed: {e}"),
         Ok(Err(e)) => panic!("spawn_blocking panicked: {e}"),
         Err(_) => panic!("dataflow did not complete within {TEST_TIMEOUT:?}"),
-    }
+    };
 
-    let mut per_worker: Vec<Vec<D>> = Vec::new();
-    for recv in receivers {
+    let mut per_worker: Vec<Vec<(u64, D)>> = Vec::new();
+    for batches in collected {
         let mut worker_data = Vec::new();
-        for (_time, data) in recv.collect_data() {
-            worker_data.extend(data);
+        for (time, data) in batches {
+            worker_data.extend(data.into_iter().map(|d| (time, d)));
         }
         per_worker.push(worker_data);
     }
     per_worker
+}
+
+/// Helper: spawn a multi-worker dataflow, send data, collect results per worker.
+async fn run_broadcast_per_worker<D, F>(
+    name: &str,
+    num_workers: usize,
+    build_fn: F,
+    input_data: Vec<(u64, Vec<i64>)>,
+    output_name: &str,
+) -> Vec<Vec<D>>
+where
+    D: Clone + Send + Sync + 'static,
+    F: Fn(&mut DataflowBuilder<u64>) + Send + Sync + 'static,
+{
+    run_broadcast_timed_per_worker(name, num_workers, build_fn, input_data, output_name)
+        .await
+        .into_iter()
+        .map(|worker| worker.into_iter().map(|(_time, d)| d).collect())
+        .collect()
 }
 
 /// Helper: collect all results across workers, sorted.
@@ -107,26 +131,38 @@ where
 // ============================================================
 // Test: broadcast delivers all data to every worker
 // ============================================================
+/// Each worker, of one or of three, receives every record exactly once, at
+/// its time.
 #[tokio::test]
 async fn broadcast_delivers_to_all_workers() {
-    let per_worker = run_broadcast_per_worker(
-        "broadcast_all",
-        3,
-        |builder| {
-            let input = builder.input::<i64>("data").unwrap();
-            let broadcast = input.broadcast("bcast");
-            broadcast.output("out").unwrap();
-        },
-        vec![(0, vec![10, 20, 30])],
-        "out",
-    )
-    .await;
+    for workers in [1, 3] {
+        let per_worker = run_broadcast_timed_per_worker(
+            &format!("broadcast_all_{workers}"),
+            workers,
+            |builder| {
+                let input = builder.input::<i64>("data").unwrap();
+                let broadcast = input.broadcast("bcast");
+                broadcast.output("out").unwrap();
+            },
+            vec![(0, vec![10, 20, 30])],
+            "out",
+        )
+        .await;
 
-    // Every worker should get all 3 items.
-    for (w, data) in per_worker.iter().enumerate() {
-        let mut sorted: Vec<i64> = data.clone();
-        sorted.sort();
-        assert_eq!(sorted, vec![10, 20, 30], "worker {w} should have all items");
+        assert_eq!(per_worker.len(), workers);
+        // Every worker should get all 3 items.
+        for (w, data) in per_worker.iter().enumerate() {
+            let mut sorted: Vec<i64> = data.iter().map(|(_time, x)| *x).collect();
+            sorted.sort();
+            assert_eq!(sorted, vec![10, 20, 30], "worker {w} should have all items");
+            let mut timed = data.clone();
+            timed.sort();
+            assert_eq!(
+                timed,
+                vec![(0, 10), (0, 20), (0, 30)],
+                "worker {w} of {workers}: each record once, at its time"
+            );
+        }
     }
 }
 
