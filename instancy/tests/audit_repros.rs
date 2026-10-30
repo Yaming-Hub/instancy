@@ -1,12 +1,11 @@
 //! The correctness audit's repro tests.
 //!
-//! Each module holds the audit's integration tests for one area. They assert
-//! *correct* behaviour: each one failed on `main` when the audit was written,
-//! and all of them pass since port-counted progress
-//! (`docs/design/progress-accounting-design.md`, Appendix A, maps each file to
-//! the change that fixed it). They run with the rest of the suite. Many are
-//! races with their own deadlines: a repro that hangs gives up at its deadline
-//! with a panic, or is stopped by the test runner's timeout.
+//! Each module holds the audit's integration tests for one area. Each test
+//! asserts the correct behaviour for a bug the audit found
+//! (`docs/design/progress-accounting-design.md`, Appendix A, maps each file
+//! to the change that fixed it). They run with the rest of the suite. Many
+//! are races with their own deadlines: a repro that hangs gives up at its
+//! deadline with a panic, or is stopped by the test runner's timeout.
 //! `.config/nextest.toml` runs this binary in the `tcp-cluster` group (at most
 //! two of its tests at a time): several repros open TCP connections, and the
 //! timing-sensitive ones need the CPU.

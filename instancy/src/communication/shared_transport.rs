@@ -566,6 +566,11 @@ struct State {
     connections: BTreeMap<usize, PooledConnection>,
     next_conn_id: usize,
     registered: HashMap<DataflowId, DataflowRegistration>,
+    /// Ids a spawn has claimed (by its registration token) and not yet
+    /// registered: no other token may claim or register them. A claim
+    /// becomes the registration, is dropped (a refused spawn), or is retired
+    /// into `completed` (a spawn that failed after claiming).
+    claims: HashMap<DataflowId, u64>,
     pending_control: PendingControl,
     /// Dataflows that have unregistered (bounded): a [`DataflowId`]
     /// identifies one run, so a remembered id cannot register again, and
@@ -1136,11 +1141,21 @@ impl Inner {
         pending_control.take(dataflow_id);
     }
 
-    /// Why `dataflow_id` cannot be registered here: it is registered (by
-    /// another run) or it already ran here. `None` if the id is unknown.
-    fn id_unavailable(&self, state: &State, dataflow_id: &DataflowId) -> Option<TransportError> {
+    /// Why `token` cannot claim or register `dataflow_id` here: it is
+    /// registered, it already ran here, or another token claimed it. `None`
+    /// if the id is unknown here or `token`'s own claim.
+    fn id_unavailable(
+        &self,
+        state: &State,
+        dataflow_id: &DataflowId,
+        token: u64,
+    ) -> Option<TransportError> {
         let peer = &self.peer_node_id;
-        let reason = if state.registered.contains_key(dataflow_id) {
+        let claimed_by_other = state
+            .claims
+            .get(dataflow_id)
+            .is_some_and(|&claim| claim != token);
+        let reason = if state.registered.contains_key(dataflow_id) || claimed_by_other {
             format!("dataflow {dataflow_id} is already registered with peer {peer}")
         } else if state.completed.contains(dataflow_id) {
             format!(
@@ -1524,7 +1539,11 @@ impl SharedPeerManager {
                 return Err(invalid(format!("channel {ch_id} registered twice")).into());
             }
         }
-        if let Some(error) = self.id_unavailable(&dataflow_id) {
+        let unavailable = {
+            let state = self.inner.state();
+            self.inner.id_unavailable(&state, &dataflow_id, token)
+        };
+        if let Some(error) = unavailable {
             return Err(RegisterError::id_unavailable(error));
         }
 
@@ -1547,14 +1566,15 @@ impl SharedPeerManager {
         let (events_tx, events_rx) = tokio_mpsc::channel(8);
 
         let mut state = self.inner.state();
-        // Re-check: a concurrent registration of the same dataflow may have
-        // completed (or finished) while connections were established.
-        if let Some(error) = self.inner.id_unavailable(&state, &dataflow_id) {
+        // Re-check: a concurrent registration (or claim) of the same dataflow
+        // may have completed (or finished) while connections were established.
+        if let Some(error) = self.inner.id_unavailable(&state, &dataflow_id, token) {
             return Err(RegisterError::id_unavailable(error));
         }
         let State {
             connections,
             registered,
+            claims,
             pending_control,
             ..
         } = &mut *state;
@@ -1605,6 +1625,10 @@ impl SharedPeerManager {
             for (_, payload) in pending {
                 let _ = tx.try_send(payload);
             }
+        }
+        // The registration takes over this token's claim, if it holds one.
+        if claims.get(&dataflow_id) == Some(&token) {
+            claims.remove(&dataflow_id);
         }
         registered.insert(dataflow_id, reg);
         drop(state);
@@ -1707,11 +1731,42 @@ impl SharedPeerManager {
         self.inner.unregister(dataflow_id, Some(token));
     }
 
-    /// Why `dataflow_id` cannot be registered with this manager: it is
-    /// registered here (by another run) or already ran here. `None` if it can.
-    pub(crate) fn id_unavailable(&self, dataflow_id: &DataflowId) -> Option<TransportError> {
-        let state = self.inner.state();
-        self.inner.id_unavailable(&state, dataflow_id)
+    /// Claim `dataflow_id` for the registration `token` will make: no other
+    /// token can claim or register it until the claim is registered (it then
+    /// becomes the registration), dropped or retired.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::InvalidRegistration`] if the id is registered here,
+    /// already ran here, or another token claimed it.
+    pub(crate) fn claim(&self, dataflow_id: DataflowId, token: u64) -> Result<(), TransportError> {
+        let mut state = self.inner.state();
+        if let Some(error) = self.inner.id_unavailable(&state, &dataflow_id, token) {
+            return Err(error);
+        }
+        state.claims.insert(dataflow_id, token);
+        Ok(())
+    }
+
+    /// Drop `token`'s claim on `dataflow_id`, leaving the id available: the
+    /// claim of a spawn refused before it owned the id everywhere.
+    pub(crate) fn drop_claim(&self, dataflow_id: &DataflowId, token: u64) {
+        let mut state = self.inner.state();
+        if state.claims.get(dataflow_id) == Some(&token) {
+            state.claims.remove(dataflow_id);
+        }
+    }
+
+    /// Retire `token`'s claim on `dataflow_id`, if it still holds one (it did
+    /// not register): the id is remembered as finished, like a dataflow that
+    /// unregistered, so it can never be claimed or registered again.
+    pub(crate) fn retire_claim(&self, dataflow_id: &DataflowId, token: u64) {
+        let mut state = self.inner.state();
+        if state.claims.get(dataflow_id) == Some(&token) {
+            state.claims.remove(dataflow_id);
+            state.completed.insert(*dataflow_id);
+            state.pending_control.take(dataflow_id);
+        }
     }
 
     /// A sender for `dataflow_id`'s payload frames (data and progress),

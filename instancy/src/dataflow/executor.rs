@@ -1686,7 +1686,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// returned as [`Error::OperatorPanic`], and siblings are told, as when
     /// the executor runs on the pool (see its `Future` implementation).
     #[cfg(any(test, feature = "test-utils"))]
-    pub fn run_contained(&mut self) -> Result<bool> {
+    pub(crate) fn run_contained(&mut self) -> Result<bool> {
         #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
         let _trace = crate::progress::trace::enter(&self.trace.recorder);
         let result =

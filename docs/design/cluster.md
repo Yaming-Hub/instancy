@@ -568,7 +568,8 @@ Frames still waiting in a shared manager's bridge queue (not yet on a
 connection's writer queue) are lost when an application drops the last
 reference to that manager outside a dataflow's teardown. (A failed
 `spawn_cluster` holds the managers until its `Cancel` has passed their
-bridges, so releasing per-job managers there loses nothing.) A peer that is
+bridges, bounded by its handshake timeout and as long as its tokio runtime
+runs, so releasing per-job managers there does not lose the `Cancel`.) A peer that is
 partitioned but whose connection never fails is not detected: the dataflow
 waits until the connection fails or the application reports the node down
 (`report_node_leave`). If a `Cancel` broadcast times out (its control queue

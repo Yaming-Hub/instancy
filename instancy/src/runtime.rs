@@ -596,13 +596,19 @@ enum SpawnAbortTarget {
 /// timeout, and a peer that already passed the ready barrier would run (and
 /// possibly report success) without this node.
 ///
-/// A spawn refused because its `DataflowId` belongs to another run (it is
-/// registered with a peer manager, or already ran there) is disarmed and
-/// sends nothing: under that id, a `Cancel` would reach the other run.
+/// In Shared mode a spawn first claims its `DataflowId` with every peer
+/// manager (in peer order), and the guard is armed only once it holds every
+/// claim. A spawn refused because another run holds the id (registered,
+/// claimed, or already ran there) drops only its own claims and sends
+/// nothing: under that id, a `Cancel` would reach the other run. A spawn that
+/// held its claims and then fails retires the claims it has not registered
+/// (synchronously, on drop): the id is never claimed again.
 ///
-/// In Shared mode the guard holds the peer managers until its `Cancel` has
-/// passed their bridges: whoever releases the managers last aborts the
-/// bridges, which would lose a `Cancel` still queued there.
+/// The guard holds the peer managers until its `Cancel` has passed their
+/// bridges (bounded by the timeout, and as long as the tokio runtime runs):
+/// whoever releases the managers last aborts the bridges, which would lose a
+/// `Cancel` still queued there. A disarmed guard sends nothing but still
+/// releases the managers the same way.
 #[cfg(feature = "transport")]
 struct SpawnAbortGuard {
     target: SpawnAbortTarget,
@@ -616,6 +622,9 @@ struct SpawnAbortGuard {
             >,
         >,
     >,
+    /// The registration token whose claims on the id this spawn holds (set
+    /// once it holds every claim): retired on drop unless registered.
+    claim_token: Option<u64>,
     dataflow_id: crate::dataflow::id::DataflowId,
     local_node_id: String,
     timeout: std::time::Duration,
@@ -633,10 +642,22 @@ impl SpawnAbortGuard {
         error
     }
 
-    /// The lifecycle coordinator now owns cancellation, or the spawn was
-    /// refused because its id belongs to another run: send nothing.
+    /// The lifecycle coordinator now owns cancellation and the registration:
+    /// send nothing, and leave the claims (now registrations) alone.
     fn disarm(&mut self) {
         self.target = SpawnAbortTarget::Nobody;
+        self.claim_token = None;
+    }
+
+    /// The spawn was refused because another run holds the id: drop this
+    /// spawn's own claims (the id stays the other run's) and send nothing.
+    fn refuse(&mut self, token: u64) {
+        if let Some(managers) = &self.managers {
+            for manager in managers.values() {
+                manager.drop_claim(&self.dataflow_id, token);
+            }
+        }
+        self.disarm();
     }
 }
 
@@ -645,7 +666,21 @@ impl Drop for SpawnAbortGuard {
     fn drop(&mut self) {
         let target = std::mem::replace(&mut self.target, SpawnAbortTarget::Nobody);
         let managers = self.managers.take();
+        // An admitted spawn that failed: its unregistered claims retire now,
+        // even if the tasks below never run.
+        if let (Some(managers), Some(token)) = (&managers, self.claim_token.take()) {
+            for manager in managers.values() {
+                manager.retire_claim(&self.dataflow_id, token);
+            }
+        }
         if matches!(target, SpawnAbortTarget::Nobody) {
+            if let Some(managers) = managers {
+                let timeout = self.timeout;
+                self.runtime_handle.spawn(async move {
+                    crate::communication::shared_transport::release_managers(managers, timeout)
+                        .await;
+                });
+            }
             return;
         }
         // Forwarded as a failure, so peers do not treat it as a graceful stop.
@@ -693,7 +728,10 @@ impl Drop for SpawnAbortGuard {
                 // The Cancel is queued on the managers' bridges: wait until
                 // each bridge has handed it to a connection writer before
                 // letting the managers go (the writers finish what they were
-                // handed, even once the managers are dropped).
+                // handed, even once the managers are dropped). Bounded by the
+                // timeout below; if it expires, or the tokio runtime shuts
+                // down first, the Cancel may be lost and peers fall back to
+                // their own handshake timeout.
                 if let Some(managers) = &managers {
                     join_all(managers.values().map(|manager| manager.flush()).collect()).await;
                 }
@@ -809,7 +847,8 @@ impl Drop for SharedRegistrationCleanup {
                     manager.unregister_registration(&dataflow_id, token).await;
                 }
                 // The spawn's abort guard holds the managers until its Cancel
-                // passed them, so releasing them here never loses it.
+                // has passed them (bounded by its timeout), so releasing them
+                // here does not lose it.
                 crate::communication::shared_transport::release_managers(peer_managers, timeout)
                     .await;
             });
@@ -2479,39 +2518,43 @@ impl RuntimeHandle {
         use cluster_lifecycle::{ClusterLifecycle, LifecycleMachine, teardown_signal};
 
         // Tells the peers if this spawn fails (or this future is dropped)
-        // before the lifecycle coordinator takes over.
+        // before the lifecycle coordinator takes over. In Shared mode it is
+        // armed only once the spawn holds its id (below).
+        let registration_token = crate::communication::shared_transport::new_registration_token();
         let mut abort_guard = SpawnAbortGuard {
-            target: match &transport_config {
-                ClusterSpawnTransport::Shared { peer_managers, .. } => {
-                    SpawnAbortTarget::Managers(Arc::clone(peer_managers))
-                }
-                // Dropping the connections closes them, which peers notice.
-                ClusterSpawnTransport::Dedicated { .. } => SpawnAbortTarget::Nobody,
-            },
+            // Dedicated: dropping the connections closes them, which peers
+            // notice.
+            target: SpawnAbortTarget::Nobody,
             managers: match &transport_config {
                 ClusterSpawnTransport::Shared { peer_managers, .. } => {
                     Some(Arc::clone(peer_managers))
                 }
                 ClusterSpawnTransport::Dedicated { .. } => None,
             },
+            claim_token: None,
             dataflow_id,
             local_node_id: local_node_id.to_string(),
             timeout: handshake_timeout,
             runtime_handle: runtime_handle.clone(),
             reason: None,
         };
-        // A DataflowId identifies one run. If it is registered with a peer
-        // manager (a running dataflow) or already ran there, refuse the spawn
-        // before anything else can fail, and send nothing: under that id, a
-        // Cancel would reach the other run.
+        // A DataflowId identifies one run. Claim it with every peer manager,
+        // in peer order, before anything else can fail. If another run holds
+        // it (registered, claimed, or already ran there), refuse the spawn:
+        // drop this spawn's own claims and send nothing, since under that id
+        // a Cancel would reach the other run. Holding every claim, the spawn
+        // owns the id: from here on a failure tells every peer.
         if let ClusterSpawnTransport::Shared { peer_managers, .. } = &transport_config {
-            if let Some(error) = peer_managers
-                .values()
-                .find_map(|manager| manager.id_unavailable(&dataflow_id))
-            {
-                abort_guard.disarm();
-                return Err(Error::Communication(error.into()));
+            let mut peers: Vec<&String> = peer_managers.keys().collect();
+            peers.sort();
+            for peer in peers {
+                if let Err(error) = peer_managers[peer].claim(dataflow_id, registration_token) {
+                    abort_guard.refuse(registration_token);
+                    return Err(Error::Communication(error.into()));
+                }
             }
+            abort_guard.claim_token = Some(registration_token);
+            abort_guard.target = SpawnAbortTarget::Managers(Arc::clone(peer_managers));
         }
         // `nodes` is public, so the topology may not have gone through
         // `multi_node`: reject duplicate node ids (which would create phantom
@@ -2825,12 +2868,12 @@ impl RuntimeHandle {
                 }
 
                 // Register with SharedPeerManagers, establishing missing pooled
-                // connections first, within the handshake timeout. The cleanup
-                // guard unregisters this spawn's registrations (and only
-                // those: a later dataflow may reuse the id) if this future is
-                // dropped mid-registration or spawn fails later.
-                let registration_token =
-                    crate::communication::shared_transport::new_registration_token();
+                // connections first, within the handshake timeout. Each
+                // registration takes over this spawn's claim on the id. The
+                // cleanup guard unregisters this spawn's registrations (and
+                // only those: they carry its token) if this future is dropped
+                // mid-registration or spawn fails later; the abort guard
+                // retires the claims that were not registered.
                 shared_registration_cleanup = Some(SharedRegistrationCleanup::new(
                     dataflow_id,
                     registration_token,
@@ -2853,9 +2896,9 @@ impl RuntimeHandle {
                     Ok(Ok(session)) => session,
                     Ok(Err(refused)) => {
                         if refused.id_unavailable {
-                            // A concurrent spawn of the same id holds it now:
-                            // send nothing under it.
-                            abort_guard.disarm();
+                            // Another run holds the id (not expected while
+                            // this spawn holds its claims): send nothing.
+                            abort_guard.refuse(registration_token);
                         }
                         return Err(Error::Communication(refused.error.into()));
                     }

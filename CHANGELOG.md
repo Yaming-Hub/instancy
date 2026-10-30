@@ -10,20 +10,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Test suite, docs and small fixes
 
 - **Fixed: a refused Shared spawn no longer cancels another run.** A
-  Shared `spawn_cluster` refused because its `DataflowId` is registered
-  with a peer manager (a running dataflow) or already ran there now sends
-  nothing under that id. It used to broadcast `Cancel` under it, failing
-  the run that owns the id: a running duplicate on every node, or a peer
-  still finishing the run whose id a retry reused. The id is checked before
-  anything else can fail, and again where registration races a concurrent
-  spawn of the same id. A spawn that fails with an unused id still tells
-  every peer.
+  Shared `spawn_cluster` now claims its `DataflowId` with every peer
+  manager before anything else can fail, and a spawn refused because
+  another run holds the id (registered, claimed by another spawn, or
+  already ran there) drops only its own claims and sends nothing under the
+  id. It used to broadcast `Cancel` under it, failing the run that owns the
+  id: a running duplicate on every node, a concurrent spawn of the same
+  id, or a peer still finishing the run whose id a retry reused. A spawn
+  that held its claims and then fails still tells every peer, and the id
+  is retired: it cannot be spawned again.
 - **Fixed: a failed spawn with per-job Shared managers no longer loses its
   `Cancel`.** When nothing else held the managers, releasing them could
   stop their bridges before the `Cancel` queued on them was written, so the
   peer waited out its handshake timeout. The spawn now holds the managers
-  until the `Cancel` has passed their bridges, and closes them (bounded)
-  if it releases the last reference, as a dataflow's teardown does.
+  until the `Cancel` has passed their bridges (bounded by the handshake
+  timeout), and closes them, bounded, if it releases the last reference, as
+  a dataflow's teardown does.
 - **Fixed: `SimpleRuntime` reports an operator panic as
   `Error::OperatorPanic`**, naming the operator, on `spawn` and
   `spawn_multi`, as `RuntimeHandle` does. It used to report
