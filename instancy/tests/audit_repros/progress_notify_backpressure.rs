@@ -15,7 +15,6 @@ use std::time::Duration;
 const BURST: u64 = 50;
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn downstream_aggregate_not_split_under_backpressure() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("audit-notify-backpressure");

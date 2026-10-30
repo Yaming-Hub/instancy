@@ -281,7 +281,6 @@ fn summarize(o: &BcastOutcome, expected_per_worker: usize) -> (Vec<usize>, Vec<u
 /// after targets 0..k accepted the batch makes the caller retry the whole
 /// batch -> targets 0..k see it twice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn broadcast_partial_delivery_duplicates() {
     let o = run_broadcast(1024, 2, 1, 3000, 4, Duration::from_secs(60)).await;
     let (totals, distincts, ok) = summarize(&o, 3000 * 4);
@@ -300,7 +299,6 @@ async fn broadcast_partial_delivery_duplicates() {
 /// only releases its T::minimum() capability once its input is exhausted, so
 /// a lost sentinel can wedge completion cluster-wide.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn broadcast_close_sentinel_loss_hangs() {
     let mut hangs = 0;
     let runs = 5;
@@ -321,7 +319,6 @@ async fn broadcast_close_sentinel_loss_hangs() {
 }
 /// Control for the sentinel-loss test: same topology/data, generous capacity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn broadcast_control_capacity_1024() {
     let o = run_broadcast(1024, 2, 1, 1, 4, Duration::from_secs(15)).await;
     let (totals, distincts, ok) = summarize(&o, 4);

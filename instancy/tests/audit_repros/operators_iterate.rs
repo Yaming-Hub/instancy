@@ -76,7 +76,6 @@ fn run_multi(
 ///
 /// input [0,0,1]: iter0 -> inc [1,1,2] -> distinct [1,2] -> ... both reach 5.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn distinct_inside_iterate_body() {
     let out = run_multi(
         "distinct_in_loop",
@@ -103,7 +102,6 @@ fn distinct_inside_iterate_body() {
 /// Identity `delay_batch` (buffer until the frontier passes t) inside an
 /// iterate body must not change the result of the loop.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn identity_delay_inside_iterate_body() {
     let out = run_multi(
         "delay_in_loop",
@@ -142,7 +140,6 @@ fn collatz_steps(mut x: i64) -> i64 {
 /// the loop body, 1/2/4 workers, several epochs; outputs must be at the right
 /// outer epoch and identical to a sequential oracle.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn collatz_map_exchange_matches_oracle() {
     let mut data = Vec::new();
     let mut expected = Vec::new();
@@ -196,7 +193,6 @@ fn collatz_map_exchange_matches_oracle() {
 /// while records of that epoch are still circulating, so a per-epoch `count`
 /// after the loop emits exactly one value per epoch. Single worker.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn count_after_long_running_loop_single_value_per_epoch() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("count_after_loop");
@@ -242,7 +238,6 @@ fn count_after_long_running_loop_single_value_per_epoch() {
 /// Exchange inside the loop body fed by a generic `unary` operator (instead of
 /// `map`). Must behave exactly like the `map` version.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn unary_then_exchange_inside_iterate_two_workers() {
     let build = |b: &mut DataflowBuilder<u64>| {
         b.input::<i64>("in")?
@@ -274,7 +269,6 @@ fn unary_then_exchange_inside_iterate_two_workers() {
 /// Exchange sourced directly by the input (no `map` in between), followed by a
 /// plain map-only loop. Common "partition then iterate" shape.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn input_exchange_then_iterate_two_workers() {
     let build = |b: &mut DataflowBuilder<u64>| {
         b.input::<i64>("in")?
@@ -300,7 +294,6 @@ fn input_exchange_then_iterate_two_workers() {
 /// Loop followed by an exchange (e.g. to aggregate the loop's results by key):
 /// the exchange is sourced by the loop's `leave` operator.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn iterate_then_exchange_two_workers() {
     let build = |b: &mut DataflowBuilder<u64>| {
         b.input::<i64>("in")?
@@ -326,7 +319,6 @@ fn iterate_then_exchange_two_workers() {
 /// Exchange on the feedback path fed by `branch` (the idiomatic way to split
 /// done/again). Must behave exactly like the single-worker run.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn branch_then_exchange_inside_iterate_two_workers() {
     let build = |b: &mut DataflowBuilder<u64>| {
         b.input::<i64>("in")?
@@ -351,7 +343,6 @@ fn branch_then_exchange_inside_iterate_two_workers() {
 /// Broadcast inside a loop body, 2 workers: every record is cloned to both
 /// workers each iteration, so a value that loops k times appears 2^k times.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn broadcast_inside_iterate_two_workers() {
     let build = |b: &mut DataflowBuilder<u64>| {
         b.input::<i64>("in")?
@@ -379,7 +370,6 @@ fn broadcast_inside_iterate_two_workers() {
 /// global tracker, force-closes after its idle sweeps, and the records routed
 /// back to it in the next iteration are dropped.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn loop_data_crossing_sweep_not_lost_two_workers() {
     let n: i64 = std::env::var("AUDIT_LOOP_N")
         .ok()
@@ -432,7 +422,6 @@ fn loop_data_crossing_sweep_not_lost_two_workers() {
 /// counts slow-map invocations per iteration (value range) and per worker
 /// thread, and reports them when the dataflow fails to complete.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn diag_loop_data_crossing_sweep_counters() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -582,13 +571,11 @@ fn staged_loop(drop_seven: bool, threshold: i64) -> Vec<i64> {
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn staged_loop_control_without_drops() {
     assert_eq!(staged_loop_with_drops(false), vec![10, 10]);
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn staged_loop_with_dropped_records_terminates() {
     // 1 -> ... -> 7 (dropped); 8 -> 9 -> 10 (exits)
     assert_eq!(staged_loop_with_drops(true), vec![10]);
@@ -598,7 +585,6 @@ fn staged_loop_with_dropped_records_terminates() {
 /// they entered on (final value 11 is routed to worker 1; all input enters on
 /// worker 0).
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn staged_loop_exit_on_other_worker_terminates() {
     assert_eq!(staged_loop(false, 11), vec![11, 11]);
 }
@@ -609,7 +595,6 @@ fn staged_loop_exit_on_other_worker_terminates() {
 /// global tracker, force-closes after its idle sweeps, and records later routed
 /// to it are dropped.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn backpressured_loop_data_not_lost_two_workers() {
     let n: i64 = std::env::var("AUDIT_BP_N")
         .ok()

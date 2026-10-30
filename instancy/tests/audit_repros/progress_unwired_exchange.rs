@@ -95,19 +95,16 @@ fn expected() -> Vec<u64> {
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn map_exchange_iterate_two_workers_completes() {
     assert_eq!(run(2, Src::Map).unwrap(), expected());
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn input_exchange_iterate_two_workers_completes() {
     assert_eq!(run(2, Src::Input).unwrap(), expected());
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn notify_exchange_iterate_two_workers_completes() {
     assert_eq!(run(2, Src::Notify).unwrap(), expected());
 }

@@ -95,42 +95,36 @@ fn run(workers: usize, mode: u8) -> Vec<(String, String)> {
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn baseline_one_exchange_two_workers_frontier_passes_zero() {
     let stuck = run(2, 1);
     assert!(stuck.is_empty(), "probes stuck at <= 0: {stuck:?}");
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn two_exchanges_one_output_single_worker_frontier_passes_zero() {
     let stuck = run(1, 2);
     assert!(stuck.is_empty(), "probes stuck at <= 0: {stuck:?}");
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn two_exchanges_one_output_two_workers_frontier_passes_zero() {
     let stuck = run(2, 2);
     assert!(stuck.is_empty(), "probes stuck at <= 0: {stuck:?}");
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn baseline_no_exchange_single_worker() {
     let stuck = run(1, 0);
     assert!(stuck.is_empty(), "probes stuck at <= 0: {stuck:?}");
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn baseline_no_exchange_two_workers() {
     let stuck = run(2, 0);
     assert!(stuck.is_empty(), "probes stuck at <= 0: {stuck:?}");
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn baseline_one_exchange_single_worker() {
     let stuck = run(1, 1);
     assert!(stuck.is_empty(), "probes stuck at <= 0: {stuck:?}");

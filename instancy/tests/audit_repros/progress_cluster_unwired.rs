@@ -181,13 +181,11 @@ fn expected() -> Vec<u64> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn tcp_map_exchange_iterate_completes() {
     assert_eq!(run(true).await.unwrap(), expected());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn tcp_input_exchange_iterate_completes() {
     assert_eq!(run(false).await.unwrap(), expected());
 }

@@ -41,7 +41,6 @@ fn group<T: Ord + Clone, D: Clone>(v: &[(T, Vec<D>)]) -> BTreeMap<T, Vec<Vec<D>>
 /// out while time-0 records are still buffered in `map`'s pending output, after
 /// the source has already released its capability.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn count_emits_single_result_per_time_under_backpressure() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("gap_count");
@@ -74,7 +73,6 @@ fn count_emits_single_result_per_time_under_backpressure() {
 /// Same as above but with an external input + explicit advance_to, the common
 /// streaming shape (input -> map -> count).
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn count_emits_single_result_per_epoch_with_input_advance() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("gap_count_input");
@@ -118,7 +116,6 @@ fn count_emits_single_result_per_epoch_with_input_advance() {
 /// small epochs: input -> map -> count. Every epoch must produce exactly one
 /// count.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn count_per_epoch_default_capacities_high_volume() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("gap_default_caps");
@@ -166,7 +163,6 @@ fn count_per_epoch_default_capacities_high_volume() {
 /// A probe attached directly to an input stream must advance when the input
 /// frontier is advanced (and become done when the input closes).
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn probe_on_input_stream_advances() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("probe_input");
@@ -203,7 +199,6 @@ fn probe_on_input_stream_advances() {
 /// A probe placed *after* a capability-holding operator (unary_notify) must not
 /// report time t as done while that operator can still emit data at t.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn probe_after_notify_operator_waits_for_its_output() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("probe_after_notify");
@@ -256,7 +251,6 @@ fn probe_after_notify_operator_waits_for_its_output() {
 /// per-time `reduce` after `delay_batch` still sees every record exactly once
 /// when many epochs are delayed into one window.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn delay_batch_window_then_count_is_exact() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("delay_window_count");
@@ -291,7 +285,6 @@ fn delay_batch_window_then_count_is_exact() {
 /// Single worker: input -> map -> exchange -> output with more batches than
 /// one exchange-channel capacity (1024 envelopes) buffered at once.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn single_worker_exchange_more_than_channel_capacity() {
     let n: u64 = std::env::var("AUDIT_SW_N")
         .ok()

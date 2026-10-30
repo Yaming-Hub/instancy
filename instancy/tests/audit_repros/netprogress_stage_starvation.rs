@@ -68,13 +68,11 @@ fn run(cap: usize) -> (bool, usize) {
 
 /// Control: default-sized exchange channel, same traffic.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn control_large_exchange_channel_completes() {
     assert_eq!(run(1024), (true, 50));
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn upstream_stage_backpressure_starves_downstream_stage() {
     let (ok, n) = run(1);
     assert!(ok, "livelock: dataflow never completed, delivered {n}/50");
@@ -84,7 +82,6 @@ fn upstream_stage_backpressure_starves_downstream_stage() {
 /// Default channel capacity (1024): a burst of more envelopes than the
 /// exchange channel holds, all routed to the sending worker itself.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn default_capacity_burst_to_self_through_exchange() {
     burst(2);
 }
@@ -92,7 +89,6 @@ fn default_capacity_burst_to_self_through_exchange() {
 /// Same burst with a single worker (exchange degenerates to a local channel,
 /// but stages are still split at the exchange edge).
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn default_capacity_burst_single_worker() {
     burst(1);
 }
@@ -104,13 +100,11 @@ fn burst(workers: usize) {
 /// Controls: same burst without the exchange edge (single stage), and a
 /// small burst through the exchange.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn control_burst_without_exchange_completes() {
     burst_with(1, 5000, false);
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn control_small_burst_through_exchange_completes() {
     burst_with(1, 100, true);
 }

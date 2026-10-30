@@ -120,7 +120,6 @@ fn run_ext(
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn input_exchange_late_records_to_idle_worker_are_delivered() {
     let (got, join) = run(false, 1);
     eprintln!("got {got:?} join {join:?}");
@@ -132,7 +131,6 @@ fn input_exchange_late_records_to_idle_worker_are_delivered() {
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn map_exchange_late_records_to_idle_worker_are_delivered() {
     let (got, join) = run(true, 1);
     eprintln!("got {got:?} join {join:?}");
@@ -144,7 +142,6 @@ fn map_exchange_late_records_to_idle_worker_are_delivered() {
 /// so it does not spuriously complete and late records are delivered. This
 /// isolates the exact-zero cancellation as the trigger.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn input_exchange_two_initial_records_control() {
     let (got, join) = run(false, 2);
     eprintln!("got {got:?} join {join:?}");
@@ -155,7 +152,6 @@ fn input_exchange_two_initial_records_control() {
 /// Correctly wired `map -> exchange`; worker 0's progress broadcast is delayed
 /// by a slow sibling operator, so worker 1 transiently sums to zero.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn map_exchange_slow_sibling_late_records_delivered() {
     let mut losses = 0;
     let mut sample = Vec::new();

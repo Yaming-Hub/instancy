@@ -300,7 +300,6 @@ fn report(name: &str, l: &Late) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn late_matrix_more_shapes() {
     let sleep = Duration::from_millis(2);
     let mut any = Vec::new();
@@ -324,7 +323,6 @@ async fn late_matrix_more_shapes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn late_matrix() {
     let sleep = Duration::from_millis(2);
     let mut any = Vec::new();

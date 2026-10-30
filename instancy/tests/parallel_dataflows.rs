@@ -241,7 +241,6 @@ async fn shared_pool_parallel_dataflows_with_exchange() {
 
 /// Stress variant: many dataflows on a single thread, verifying no starvation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore] // stress test — run with `cargo test --ignored`
 async fn stress_shared_pool_many_dataflows() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 1,
@@ -553,7 +552,6 @@ async fn shared_transport_parallel_cluster_dataflows() {
 
 /// Stress test: more parallel cluster dataflows with higher data volume.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore] // stress test — run with `cargo test --ignored`
 async fn stress_parallel_cluster_dataflows() {
     let num_dataflows = 5;
     let num_epochs = 20u64;

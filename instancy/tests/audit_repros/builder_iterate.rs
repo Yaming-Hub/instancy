@@ -32,7 +32,6 @@ fn join_spawned<T: instancy::progress::timestamp::Timestamp>(
 /// the parent graph, so the body's feedback factories are shifted by one slot
 /// and the inner loop's feedback edge has no factory.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn audit_builder_nested_iterate_without_exchange() {
     let builder = DataflowBuilder::<u64>::new("nested-no-exchange");
     let input = builder.input::<i64>("data").unwrap();
@@ -83,7 +82,6 @@ fn audit_builder_nested_iterate_without_exchange() {
 /// throw-away inner BuilderState; the port metadata/wiring is never merged, so
 /// the named output is unreachable via `take_output`.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn audit_builder_output_inside_iterate_body_is_lost() {
     let builder = DataflowBuilder::<u64>::new("output-in-loop");
     let input = builder.input::<i64>("data").unwrap();
@@ -122,7 +120,6 @@ fn audit_builder_output_inside_iterate_body_is_lost() {
 /// `probe()` inside an iterate body: the probe is registered only in the inner
 /// state and never merged, so it is never wired to a tracker.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn audit_builder_probe_inside_iterate_never_done() {
     let probe_slot: Arc<Mutex<Option<instancy::dataflow::probe::ProbeHandle<Product<u64, u32>>>>> =
         Arc::new(Mutex::new(None));

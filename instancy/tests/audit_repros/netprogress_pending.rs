@@ -116,7 +116,6 @@ fn run_once(per_worker: u64) -> (Vec<u64>, u64) {
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn notification_fires_while_consumed_exchange_data_is_still_buffered() {
     let per_worker = 300;
     let mut failures = Vec::new();
@@ -141,7 +140,6 @@ fn notification_fires_while_consumed_exchange_data_is_still_buffered() {
 /// no capability, so while records sit in local channels / `pending_output`
 /// under backpressure the notify operator's frontier is already past 0.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn single_worker_notification_fires_while_data_buffered_in_local_channel() {
     fn build1(builder: &mut DataflowBuilder<u64>) -> Result<()> {
         builder

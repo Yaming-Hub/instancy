@@ -223,14 +223,12 @@ async fn run_ext(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn tcp_input_exchange_idle_node_does_not_drop_late_records() {
     let got = run(false, 1).await.unwrap();
     assert_eq!(got.len(), 6, "records lost: {got:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn tcp_map_exchange_idle_node_does_not_drop_late_records() {
     for round in 0..10 {
         let got = run(true, 1).await.unwrap();
@@ -241,7 +239,6 @@ async fn tcp_map_exchange_idle_node_does_not_drop_late_records() {
 /// Control: two records consumed by B before going idle. Once A's progress
 /// frames arrive B's sum is `+1` (A's input capability) and B stays alive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn tcp_map_exchange_control_two_initial_records() {
     let mut losses = 0;
     for _ in 0..10 {
@@ -255,7 +252,6 @@ async fn tcp_map_exchange_control_two_initial_records() {
 
 /// Frequency probe for the wired (map -> exchange) case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn tcp_map_exchange_loss_frequency() {
     let mut losses = 0;
     for _ in 0..20 {
@@ -271,7 +267,6 @@ async fn tcp_map_exchange_loss_frequency() {
 /// Amplified race: correctly wired `map -> exchange`, with a slow sibling
 /// operator on node A delaying A's progress broadcast.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn tcp_map_exchange_slow_sibling_loses_records() {
     let mut losses = 0;
     let mut sample = Vec::new();

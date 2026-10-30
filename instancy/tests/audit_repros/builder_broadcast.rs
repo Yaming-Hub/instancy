@@ -73,7 +73,6 @@ fn run(use_broadcast: bool, workers: usize) -> Option<(u64, Vec<usize>)> {
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn audit_builder_exchange_epoch_completes_while_input_open() {
     let got = run(false, 2);
     eprintln!("exchange: {got:?}");
@@ -81,7 +80,6 @@ fn audit_builder_exchange_epoch_completes_while_input_open() {
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn audit_builder_broadcast_epoch_never_completes_while_input_open_multi() {
     let got = run(true, 2);
     eprintln!("broadcast (2 workers): {got:?}");
@@ -92,7 +90,6 @@ fn audit_builder_broadcast_epoch_never_completes_while_input_open_multi() {
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn audit_builder_broadcast_epoch_never_completes_while_input_open_single() {
     let got = run(true, 1);
     eprintln!("broadcast (1 worker): {got:?}");
@@ -107,7 +104,6 @@ fn audit_builder_broadcast_epoch_never_completes_while_input_open_single() {
 /// the loop body is merged (merge uses add_operator without capabilities), and
 /// broadcast registers no in-flight binding either.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn audit_builder_broadcast_inside_iterate_multi() {
     use instancy::dataflow::dataflow_builder::IterateResult;
     use instancy::order::Product;

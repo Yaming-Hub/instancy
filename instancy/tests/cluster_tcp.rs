@@ -537,7 +537,6 @@ async fn tcp_multi_epoch_exchange() {
 /// Sends 100_000 records through a 2-node exchange to verify stability
 /// under load with real TCP connections.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore] // stress test — run with `cargo test --ignored`
 async fn stress_tcp_exchange_high_volume() {
     let topology = ClusterTopology::multi_node(vec![
         NodeConfig::new("node-a", 1),
@@ -612,7 +611,6 @@ async fn stress_tcp_exchange_high_volume() {
 /// Creates and destroys 10 independent clusters to verify no resource leaks
 /// or port conflicts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore] // stress test — run with `cargo test --ignored`
 async fn stress_tcp_repeated_creation() {
     for iteration in 0..10 {
         let topology = ClusterTopology::multi_node(vec![
@@ -679,7 +677,6 @@ async fn stress_tcp_repeated_creation() {
 
 /// Stress test: three-node cluster with high volume from all nodes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-#[ignore] // stress test — run with `cargo test --ignored`
 async fn stress_tcp_three_nodes_high_volume() {
     let topology = ClusterTopology::multi_node(vec![
         NodeConfig::new("alpha", 1),
@@ -769,7 +766,6 @@ async fn stress_tcp_three_nodes_high_volume() {
 
 /// Stress test: multi-epoch with exchange across 2 nodes, many epochs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore] // stress test — run with `cargo test --ignored`
 async fn stress_tcp_many_epochs() {
     let topology = ClusterTopology::multi_node(vec![
         NodeConfig::new("node-a", 1),
