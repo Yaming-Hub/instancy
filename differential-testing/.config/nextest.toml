@@ -1,0 +1,11 @@
+[profile.default]
+retries = 0
+test-threads = 1
+fail-fast = false
+# Final 120-second bound if engine code, input submission or teardown blocks.
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[profile.soak]
+retries = 0
+test-threads = 1
+slow-timeout = { period = "300s", terminate-after = 12 }

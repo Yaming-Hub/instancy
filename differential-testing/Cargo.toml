@@ -1,0 +1,21 @@
+[package]
+name = "instancy-differential"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Local-only differential comparison of instancy against timely-dataflow"
+
+# Standalone workspace root: never a member of the instancy repository workspace.
+[workspace]
+
+[dependencies]
+instancy = { path = "../instancy", default-features = false }
+timely = { git = "https://github.com/TimelyDataflow/timely-dataflow", rev = "492787b7cff9463aab8a793a306a619c4175885b", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
+
+[features]
+# instancy in cluster mode (two loopback-TCP nodes) against the same timely
+# reference. Off by default: the default build is the in-process experiment.
+cluster = ["instancy/transport"]
+# Release builds with instancy's progress checker compiled in.
+release-check = ["instancy/progress-check"]
