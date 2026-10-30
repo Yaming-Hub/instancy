@@ -280,6 +280,8 @@ This model opens the lane up.
 | `NoCorruptAccepted` | A corrupted record is never accepted. |
 | `NoNeedlessDrop` | The transport never drops a lane frame while it could still deliver it (writer up, connection healthy, peer reading). |
 | `NoSpuriousFail` | With no fault and no worker failure, no run fails. A requested stop drains to success. |
+| `NoFalseLoss` | A delayed send return does not report its already-consumed record lost. |
+| `NoLateEnqueue`, `NoLateSuccess` | A record whose admission occurs after retirement is neither queued nor reported accepted. |
 | `NoCollateralFail` | A failed connection fails only the runs that used it, in either direction. |
 | `FreshRetryOk`, `ReuseRejected` | Safety only: on a healthy transport a retry with a fresh id never fails or is refused; one that reuses the id is never accepted. |
 | `Termination` | Every run ends and unregisters, and per job every connection closes, on both nodes: no failure leaves a node waiting forever. |
@@ -298,6 +300,8 @@ This model opens the lane up.
 | `RunIds` | `"pr9"`: a finished id is refused, its late frames dropped, queued frames bound to their registration (52314fb) | `"old"` |
 | `RejectCancel` | `FALSE`: a refused spawn sends nothing under another run's id (R53) | `TRUE`: `a7c4b1c`, which still broadcasts `Cancel` |
 | `Crc` | `TRUE`: frame checksums, always on from protocol v6 | `FALSE` |
+| `SendOutcome` | `"admission"`: order enqueue with retirement and preserve that result | `"recheck"`: re-read retirement after enqueue; `"unchecked"`: no admission check; `"atomic"`: historical abstraction with no delayed return |
+| `LateAttempt` | `FALSE` for ordinary runs | `TRUE`: node a starts one extra send before retirement but attempts its enqueue afterwards |
 | `Conns`, `Runs`, `Concurrent`, `Crosswise`, `Reuse`, `Faults`, `MaxFaults`, `FaultsRun1`, `MaxStops`, `MaxFails`, `PerJob` | bounds and modelling options | — |
 
 ### Results
@@ -331,6 +335,61 @@ Bounds: two nodes, one record per node and run, at most one fault, one requested
 | `ct_reuse_old` | `NoCrossRun` | **Fails as expected** (before 52314fb). A retry that reuses the id takes run 1's late frames as its own. |
 | `ct_nocrc` | `NoCorruptAccepted` | **Fails as expected.** Without checksums, a corrupted record is accepted. |
 | `ct_reuse_cancel` | `NoSpuriousFail` | **Fails: open on `a7c4b1c`, fixed by R53.** Node a finishes run 1 on b's ack while b's last step is pending. a's retry reuses the id and is refused, but its spawn guard broadcasts a failing `Cancel` under that id, and b's run 1 fails. One run ends `Ok` on a and `Err` on b, with no fault and no worker failure. |
+
+### Enqueue versus send return
+
+The original `Send` action queued data and progress atomically and did not
+represent the caller returning from the send or its post-enqueue retirement
+check. That abstraction could not expose a detector which falsely rejects a
+record after the peer has consumed it and retired.
+
+`SendOutcome` now permits a pending return: the peer and transport keep running
+before `ReturnSend`. The old recheck then fails `NoFalseLoss`. The admission
+variant instead models one atomic ordering point for testing retirement and
+enqueueing; a later return preserves that result. This atomic action is the
+implementation obligation of a local admission/retirement gate, not a proof
+that any proposed Rust lock has been implemented correctly.
+
+The extra late send is deliberately invalid, so its scenarios omit
+`NoSpuriousFail`: rejecting it is required. The model pauses node a's extra
+attempt between an earlier live observation and the enqueue attempt, while
+node b may complete and queue an acknowledgement. Two negative reachability
+properties show that the delayed-return and rejected-late-send states are
+reachable. They do not independently prove rejection: the admission-mode
+action explicitly rejects an enqueue after retirement, and the no-false-loss
+check is selected by the send-result rule. The model compares these specified
+rules, not the implementation of a Rust lock.
+
+`ConsumeRec` still abstracts receipt and consumption together and does not
+report a receiver-side error when a record arrives after the receiver's
+workers finished. In particular, this extension does not verify the separate
+case of a record admitted before retirement but left unconsumed by a finished
+operator. That obligation remains with the real inbound-loss checks and their
+tests. Admission here means ordering ahead of the acknowledgement, not proof
+of delivery. The unchecked late-send scenario also checks `NoLossOk`, without
+claiming to model that receiver-side failure path.
+
+These focused runs use two nodes, one connection, one run, no transport fault
+or requested stop, TLC 2.19, one worker and a 1 GiB heap. The times below include
+TLC startup; each run had a 120-second outer limit.
+
+| Scenario | Expected and observed | Distinct states | Seconds |
+|---|---|---:|---:|
+| `ct_send_return_recheck` | `NoFalseLoss` violated: peer consumed the record and retired before the pending return reports failure | 1,829 | 3.5 |
+| `ct_send_return_admission` | Safety and fair `Termination` pass | 2,395 | 4.1 |
+| `ct_send_return_witness` | `NeverDeliveredBeforeReturn` violated: the guarded design still allows that interleaving | 1,821 | 2.9 |
+| `ct_send_late_admission` | No late enqueue or accepted late send | 3,430 | 2.6 |
+| `ct_send_late_witness` | `NeverLateRejected` violated: a late attempt is rejected | 2,696 | 2.8 |
+| `ct_send_late_unchecked` | `NoLateSuccess` violated when admission is unchecked (`NoLossOk` also checked) | 2,708 | 2.7 |
+
+The unchecked-late row was rerun after adding `NoLossOk`; the other focused
+rows retain their first-run results with unchanged spec/config content.
+
+The existing `ct_pr9` control was also rerun with the historical `"atomic"`
+abstraction: 8,709 states, 2.8 seconds, pass. The large concurrent/crosswise
+scenarios were not rerun for this extension. Existing result rows above retain
+their earlier provenance. No Rust execution, payload-capacity scheduling,
+three-worker behavior or memory-model ordering is proved by these small models.
 
 ### What it shows, and what it does not
 

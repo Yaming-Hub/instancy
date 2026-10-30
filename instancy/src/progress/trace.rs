@@ -536,7 +536,7 @@ pub(crate) fn scope_location(scope: usize, source: bool, node: usize, port: usiz
     )
 }
 
-/// How a push ended.
+/// How a push ended. The values are fixed: older dumps use 4 too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum Outcome {
@@ -545,8 +545,9 @@ pub(crate) enum Outcome {
     Closed = 2,
     /// Records refused: the peer had already finished (retired link).
     LostAfterFinish = 3,
-    /// Records enqueued, then the link was found retired.
-    LostWhileFinishing = 4,
+    // 4 is reserved: `lost-while-finishing` in older dumps, records enqueued
+    // and then reported lost because the link retired before the push
+    // returned. A push no longer reports an enqueued record lost.
     Failed = 5,
 }
 
@@ -557,15 +558,8 @@ impl Outcome {
             crate::error::Error::ChannelClosed => Outcome::Closed,
             #[cfg(feature = "transport")]
             crate::error::Error::Communication(crate::error::CommunicationError::DataLoss {
-                detail,
                 ..
-            }) => {
-                if detail.contains("while the peer was finishing") {
-                    Outcome::LostWhileFinishing
-                } else {
-                    Outcome::LostAfterFinish
-                }
-            }
+            }) => Outcome::LostAfterFinish,
             _ => Outcome::Failed,
         }
     }
@@ -583,6 +577,7 @@ impl Outcome {
             1 => "backpressure",
             2 => "closed",
             3 => "lost-after-finish",
+            // Reserved (see `Outcome`).
             4 => "lost-while-finishing",
             _ => "failed",
         }
@@ -1511,7 +1506,7 @@ const DECISIONS: [&str; 5] = [
 ];
 
 /// The dump header's `legend`: how to read the events.
-const LEGEND: &str = r#"{"t_ns":"nanoseconds since the process's first recorded event, on one monotonic clock (std::time::Instant) shared by every ring of the process: events of different rings and nodes are ordered by it","seq":"the ring's event number, from 0; a ring keeps its newest `capacity` events","commit":"a worker's commit sequence number: its n-th non-empty commit, from 1","frames":"frames with changes each network lane got for this commit (a commit over the progress batch cap is split, positives first)","frames_before":"frames with changes each network lane got for the worker's earlier commits","lane_batch":"a batch's position on the lane from `from`, from 1: an in-process lane carries one batch per commit (lane_batch = commit); a network lane one per frame (frames_before < lane_batch <= frames_before + frames of the commit); markers (seal, abandon, end-of-stream, ack) are never counted","lane-state":"a peer's seal (sealed) or the end of its lane (closed; closed without sealed: abandoned), as this worker applied it, after lane_batches batches","skipped":"decisions since the previous recorded one that were not recorded: not-ready or shut-down decisions made before every hosted operator was shut down or exhausted (S2b cannot hold then), or identical to the previous recorded one (outcome, flags, lane states and view activity)","decision-count":"a non-zero raw count in the worker's scope (what exact zero judges) at the decision just before it","decision-lane":"after a success, residual or S3 decision: each peer lane's applied position and state","loc":"src: an operator output (capabilities); tgt: an operator input (records); loc_node is the node in the scope (the operator index in scope 0)","seed":"an initial capability seeded when the tracker was initialized; `operator` is the operator seeded","scope":"as a field: the progress scope (0: the root); as an event: a location in the worker's scope (S2b, what its exact zero judges), recorded when its tracker was initialized (no scope event: every location)","frame":"net-send: the data frames this channel's push enqueued so far, this one included if it was enqueued (outcome accepted or lost-while-finishing); net-recv (data): the data frames the channel received so far, this one included","data_channel_id":"2^63 + (exchange * total_workers + src) * total_workers + dst, where `exchange` indexes exchange_edges, which gives the edge","progress_channel_id":"2^62 + src * total_workers + dst","untraced":"events at sites that ran outside any traced worker, process-wide, by site","snapshot_t_ns":"when the ring was read for this dump: it holds every event it recorded before then, unless counted as overwritten or torn","goodbye-sent":"recorded before the end-of-stream frames to that peer are queued","lane_drops":"commits and markers a network lane dropped (its link was retired, the frame did not encode, or the outbox closed)"}"#;
+const LEGEND: &str = r#"{"t_ns":"nanoseconds since the process's first recorded event, on one monotonic clock (std::time::Instant) shared by every ring of the process: events of different rings and nodes are ordered by it","seq":"the ring's event number, from 0; a ring keeps its newest `capacity` events","commit":"a worker's commit sequence number: its n-th non-empty commit, from 1","frames":"frames with changes each network lane got for this commit (a commit over the progress batch cap is split, positives first)","frames_before":"frames with changes each network lane got for the worker's earlier commits","lane_batch":"a batch's position on the lane from `from`, from 1: an in-process lane carries one batch per commit (lane_batch = commit); a network lane one per frame (frames_before < lane_batch <= frames_before + frames of the commit); markers (seal, abandon, end-of-stream, ack) are never counted","lane-state":"a peer's seal (sealed) or the end of its lane (closed; closed without sealed: abandoned), as this worker applied it, after lane_batches batches","skipped":"decisions since the previous recorded one that were not recorded: not-ready or shut-down decisions made before every hosted operator was shut down or exhausted (S2b cannot hold then), or identical to the previous recorded one (outcome, flags, lane states and view activity)","decision-count":"a non-zero raw count in the worker's scope (what exact zero judges) at the decision just before it","decision-lane":"after a success, residual or S3 decision: each peer lane's applied position and state","loc":"src: an operator output (capabilities); tgt: an operator input (records); loc_node is the node in the scope (the operator index in scope 0)","seed":"an initial capability seeded when the tracker was initialized; `operator` is the operator seeded","scope":"as a field: the progress scope (0: the root); as an event: a location in the worker's scope (S2b, what its exact zero judges), recorded when its tracker was initialized (no scope event: every location)","frame":"net-send: the data frames this channel's push enqueued so far, this one included if it was enqueued (outcome accepted); net-recv (data): the data frames the channel received so far, this one included","data_channel_id":"2^63 + (exchange * total_workers + src) * total_workers + dst, where `exchange` indexes exchange_edges, which gives the edge","progress_channel_id":"2^62 + src * total_workers + dst","untraced":"events at sites that ran outside any traced worker, process-wide, by site","snapshot_t_ns":"when the ring was read for this dump: it holds every event it recorded before then, unless counted as overwritten or torn","goodbye-sent":"recorded before the end-of-stream frames to that peer are queued","lane_drops":"commits and markers a network lane dropped (its link was retired, the frame did not encode, or the outbox closed)"}"#;
 
 /// The flags of a [`Kind::Decision`].
 pub(crate) mod decision {
@@ -2016,7 +2011,7 @@ mod tests {
             entry,
             pending: Mutex::new(Vec::new()),
         };
-        let text = "records sent while the peer was finishing: \"quoted\"";
+        let text = "records sent after the peer finished: \"quoted\"";
         recorder.note(Note::Loss, text);
         let snap = ring.snapshot();
         let mut joined = String::new();

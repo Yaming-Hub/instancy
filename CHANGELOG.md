@@ -329,6 +329,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CommunicationError::DataLoss` variant (downstream exhaustive matches must
   handle it). A premature completion elsewhere in the cluster now makes some
   node fail instead of every node returning `Ok` with missing output.
+- A push whose records were enqueued before the peer finished no longer
+  fails with `DataLoss` when the peer finishes before the push returns. The
+  push used to check the link again after enqueueing, but the peer could
+  already have read the records. Record sends and the link's retirement are
+  now ordered by a per-link lock: a record is either enqueued ahead of the
+  peer's acknowledgement or refused with `DataLoss`.
 - A link that fails while a node's workers are still running (EOF, corrupt
   frame or control message, send failure, transport error) now cancels the
   dataflow on that node and on every reachable peer, instead of silently

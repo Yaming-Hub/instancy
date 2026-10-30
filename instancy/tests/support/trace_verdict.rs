@@ -577,7 +577,8 @@ fn missing_plus(workers: &[&Ring], verdict: &mut Verdict) {
     }
 }
 
-/// Outcomes that put records on their way.
+/// Outcomes that put records on their way. `lost-while-finishing` appears
+/// only in older dumps: records enqueued, then reported lost.
 fn delivered(outcome: &str) -> bool {
     matches!(outcome, "accepted" | "lost-while-finishing")
 }

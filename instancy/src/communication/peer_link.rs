@@ -16,15 +16,19 @@
 //! other for this dataflow, so later transport failures on that link are
 //! benign. Data must never be sent on a retired link: the peer has finished
 //! (or we have), so the data could never be consumed. `NetworkPush` treats
-//! that as data loss and fails the dataflow.
+//! that as data loss and fails the dataflow. Record sends and retirement are
+//! ordered by the link's admission lock (see
+//! [`PeerLinkState::try_send_data`]): a record is either enqueued before the
+//! link retires, and so ahead of anything queued after retirement such as the
+//! acknowledgement, or refused.
 //!
 //! [`InboundBridges`] tracks the tasks that deliver data frames from peers to
 //! local operators. They report frames that can no longer be delivered (the
 //! receiving operator already finished) as [`LinkEvent::InboundDataLost`],
 //! and teardown lets them finish draining before the dataflow completes.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -127,6 +131,10 @@ pub(crate) fn report_link_event(events: &LifecycleEventSender, peer: &str, event
 #[derive(Debug, Default)]
 pub(crate) struct PeerLinkState {
     retired: AtomicBool,
+    /// Orders record sends with retirement: a record send holds it shared
+    /// while it checks the link and enqueues, [`retire`](Self::retire) holds
+    /// it exclusively while it marks the link retired.
+    admission: RwLock<()>,
     /// A data push to the peer found its queue closed: it backs off on a
     /// frame that can never leave.
     push_blocked: AtomicBool,
@@ -136,17 +144,22 @@ pub(crate) struct PeerLinkState {
 }
 
 impl PeerLinkState {
-    /// Whether the link no longer carries anything either side needs.
+    /// Whether the link no longer carries anything either side needs. Once
+    /// true, it stays true.
     ///
-    /// Sequentially consistent with [`retire`](Self::retire): a data push
-    /// that enqueues a frame and then still sees the link unretired knows
-    /// the frame was enqueued before anything the coordinator queues after
-    /// retiring the link (such as the acknowledgement).
+    /// Reading it before or after enqueueing a record says nothing about
+    /// where the record sits relative to the acknowledgement: records are
+    /// checked under the admission lock, by
+    /// [`try_send_data`](Self::try_send_data).
     pub(crate) fn is_retired(&self) -> bool {
         self.retired.load(Ordering::SeqCst)
     }
 
     /// Mark the link retired. Idempotent.
+    ///
+    /// Waits for record sends that are enqueueing to finish, so each record
+    /// is enqueued before anything the caller queues once this returns (such
+    /// as the acknowledgement), or refused.
     pub(crate) fn retire(&self) {
         traced! {
             if let Some(recorder) = self.recorder() {
@@ -156,7 +169,36 @@ impl PeerLinkState {
                 );
             }
         }
+        // The lock guards no data, only the order of sends and retirement,
+        // so a poisoned lock is still a valid one.
+        let _admission = self
+            .admission
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         self.retired.store(true, Ordering::SeqCst);
+    }
+
+    /// Enqueue a frame carrying records on `sender`, the transport queue to
+    /// this link's peer, unless the link is retired.
+    ///
+    /// The check and the enqueue happen under the admission lock, so
+    /// [`retire`](Self::retire) falls wholly before or after them: an
+    /// enqueued record is ahead of anything queued after retirement, and a
+    /// record for a retired link is returned as `Closed`, never enqueued.
+    /// The lock is held only for the nonblocking `try_send`.
+    pub(crate) fn try_send_data(
+        &self,
+        sender: &FrameSender,
+        frame: Frame,
+    ) -> Result<(), tokio_mpsc::error::TrySendError<Frame>> {
+        let _admission = self
+            .admission
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.is_retired() {
+            return Err(tokio_mpsc::error::TrySendError::Closed(frame));
+        }
+        sender.try_send(frame)
     }
 
     /// Record this link's events into `recorder` (the flight recorder).
@@ -509,5 +551,54 @@ mod tests {
         }
         handle.await.unwrap();
         assert_eq!(seen, (0..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn record_sends_release_the_admission_lock_and_stop_at_retirement() {
+        use tokio_mpsc::error::TrySendError;
+        let link = PeerLinkState::default();
+        let (tx, mut rx) = tokio_mpsc::channel::<Frame>(1);
+        let sender = FrameSender::Direct(tx);
+        link.try_send_data(&sender, frame(1)).unwrap();
+        assert!(link.admission.try_write().is_ok(), "released after a send");
+        assert!(matches!(
+            link.try_send_data(&sender, frame(2)),
+            Err(TrySendError::Full(f)) if f.channel_id == 2
+        ));
+        assert!(link.admission.try_write().is_ok(), "released when full");
+        assert_eq!(rx.try_recv().unwrap().channel_id, 1);
+
+        link.retire();
+        // Room in the queue, but the link is retired.
+        assert!(matches!(
+            link.try_send_data(&sender, frame(3)),
+            Err(TrySendError::Closed(f)) if f.channel_id == 3
+        ));
+        assert!(link.admission.try_write().is_ok(), "released when refused");
+        assert!(rx.try_recv().is_err(), "nothing enqueued after retirement");
+    }
+
+    #[test]
+    fn a_poisoned_admission_lock_still_retires_the_link() {
+        let link = Arc::new(PeerLinkState::default());
+        let poisoner = Arc::clone(&link);
+        let _ = std::thread::spawn(move || {
+            let _admission = poisoner.admission.write().unwrap();
+            panic!("panic while holding the admission lock");
+        })
+        .join();
+        assert!(link.admission.is_poisoned());
+
+        let (tx, mut rx) = tokio_mpsc::channel::<Frame>(4);
+        let sender = FrameSender::Direct(tx);
+        link.try_send_data(&sender, frame(1)).unwrap();
+        link.retire();
+        assert!(link.is_retired());
+        assert!(matches!(
+            link.try_send_data(&sender, frame(2)),
+            Err(tokio_mpsc::error::TrySendError::Closed(_))
+        ));
+        assert_eq!(rx.try_recv().unwrap().channel_id, 1);
+        assert!(rx.try_recv().is_err(), "nothing enqueued after retirement");
     }
 }

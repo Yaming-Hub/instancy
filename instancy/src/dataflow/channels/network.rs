@@ -423,30 +423,26 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkPush<T, D> {
     /// this push still exists), so records sent to it would never be
     /// consumed: that is data loss, not a benign race, and fails the
     /// dataflow. Control signals for a finished peer are irrelevant and
-    /// discarded. The link is checked again after enqueueing: a data frame
-    /// that raced with retirement may sit behind the acknowledgement the
-    /// coordinator queued, and the peer may tear down before reading it.
+    /// discarded. Records are checked against retirement only as they are
+    /// enqueued, under the link's admission lock
+    /// (`PeerLinkState::try_send_data`): an enqueued record is ahead of the
+    /// acknowledgement the coordinator queues after retiring the link, so
+    /// the link retiring before this returns does not make it lost.
     fn send_frame(&self, payload: Vec<u8>, is_data: bool) -> std::result::Result<(), Error> {
-        if self.peer_retired() {
-            return if is_data {
-                Err(self.data_lost("records sent after the peer finished"))
-            } else {
-                Ok(())
-            };
+        if !is_data && self.peer_retired() {
+            return Ok(());
         }
         let frame = Frame {
             dataflow_id: self.dataflow_id,
             channel_id: self.channel_id,
             payload,
         };
-        match self.sender.try_send(frame) {
-            Ok(()) => {
-                std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-                if is_data && self.peer_retired() {
-                    return Err(self.data_lost("records sent while the peer was finishing"));
-                }
-                Ok(())
-            }
+        let sent = match &self.outbox {
+            Some(outbox) if is_data => outbox.link().try_send_data(&self.sender, frame),
+            _ => self.sender.try_send(frame),
+        };
+        match sent {
+            Ok(()) => Ok(()),
             Err(tokio_mpsc::error::TrySendError::Full(_)) => Err(Error::Backpressure),
             Err(tokio_mpsc::error::TrySendError::Closed(_)) if self.peer_retired() => {
                 if is_data {
@@ -491,7 +487,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkPush<T, D> {
         if let Payload::Data { time, data } = &envelope.payload {
             let channel = self.channel_id;
             let outcome = Outcome::of(sent);
-            if matches!(outcome, Outcome::Accepted | Outcome::LostWhileFinishing) {
+            if outcome == Outcome::Accepted {
                 self.trace_frames = self.trace_frames.wrapping_add(1);
             }
             let frame = self.trace_frames as usize;
@@ -2096,6 +2092,97 @@ mod tests {
             // Control signals and empty batches for a finished peer are irrelevant.
             push.push(Envelope::watermark(4)).unwrap();
             push.push(Envelope::data(5, Vec::new())).unwrap();
+        }
+
+        /// The channel and payload of the next frame on `rx`.
+        async fn next_frame(rx: &mut tokio_mpsc::Receiver<Frame>) -> (u64, Vec<u8>) {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("a frame arrives")
+                .expect("the queue is open");
+            (frame.channel_id, frame.payload)
+        }
+
+        /// Records a push enqueued before the link retired are ahead of the
+        /// acknowledgement queued after it, whether or not the peer read them
+        /// first; a record after retirement is refused, not queued behind it.
+        #[tokio::test]
+        async fn admitted_records_precede_the_retirement_ack() {
+            const ACK_CHANNEL: u64 = 1;
+            let encoded = |envelope: Envelope<u64, u64, ()>| {
+                let mut buf = Vec::new();
+                encode_envelope(&u64::codec(), &u64::codec(), &envelope, &mut buf).unwrap();
+                buf
+            };
+            let ack = || {
+                (
+                    ACK_CHANNEL,
+                    crate::progress::network_progress::encode_progress_ack(),
+                )
+            };
+            for read_before_retirement in [false, true] {
+                // The push and the outbox share one transport queue, as in a
+                // cluster dataflow.
+                let (tx, mut rx) = tokio_mpsc::channel(8);
+                let (events, _events) = tokio_mpsc::unbounded_channel();
+                let (outbox, _forwarder) = spawn_peer_outbox(
+                    "node-b",
+                    crate::communication::cluster_transport::FrameSender::Direct(tx.clone()),
+                    events,
+                    &tokio::runtime::Handle::current(),
+                );
+                let mut push = push_to(&outbox, tx);
+                push.push(Envelope::data(1, vec![10, 11])).unwrap();
+                push.push(Envelope::data(2, vec![12])).unwrap();
+                let mut before = Vec::new();
+                if read_before_retirement {
+                    before.push(next_frame(&mut rx).await);
+                    before.push(next_frame(&mut rx).await);
+                }
+
+                outbox.link().retire();
+                let (channel_id, payload) = ack();
+                outbox
+                    .send(Frame {
+                        dataflow_id: push.dataflow_id,
+                        channel_id,
+                        payload,
+                    })
+                    .unwrap();
+                let late = push.push(Envelope::data(3, vec![13]));
+                assert!(
+                    matches!(
+                        late,
+                        Err(Error::Communication(
+                            crate::error::CommunicationError::DataLoss { .. }
+                        ))
+                    ),
+                    "{late:?}"
+                );
+
+                let mut after = Vec::new();
+                loop {
+                    let frame = next_frame(&mut rx).await;
+                    let is_ack = frame.0 == ACK_CHANNEL;
+                    after.push(frame);
+                    if is_ack {
+                        break;
+                    }
+                }
+                assert!(rx.try_recv().is_err(), "nothing behind the ack");
+                let records = vec![
+                    (push.channel_id, encoded(Envelope::data(1, vec![10, 11]))),
+                    (push.channel_id, encoded(Envelope::data(2, vec![12]))),
+                ];
+                if read_before_retirement {
+                    assert_eq!(before, records);
+                    assert_eq!(after, vec![ack()]);
+                } else {
+                    let mut expected = records;
+                    expected.push(ack());
+                    assert_eq!(after, expected);
+                }
+            }
         }
 
         /// The flight recorder (`progress::trace`): records pushed to a
