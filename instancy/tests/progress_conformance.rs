@@ -61,9 +61,10 @@
 //!
 //! With `INSTANCY_TRACE_DIR` set, every run records the progress flight
 //! recorder ([`instancy::progress::trace`]), and a case whose outcome does
-//! not match the golden file dumps the traces of its dataflows there. The
-//! failure message names the dump directory and the analyser's verdict
-//! (`tests/support/trace_verdict.rs`).
+//! not match the golden file dumps the traces of its dataflows there. A run
+//! that hangs is dumped before it is cancelled, so its dump lists the inputs
+//! the workers' views are stuck at. The failure message names the dump
+//! directory and the analyser's verdict (`tests/support/trace_verdict.rs`).
 #![cfg(all(
     feature = "transport",
     feature = "test-utils",
@@ -404,8 +405,7 @@ enum Failure {
     NotRejected,
     /// The progress checker recorded a violation: the check, its kind and
     /// where (an operator port, as `name[in i]` or `name[out i]`; `None` for
-    /// violations about a whole worker). In the golden file's "sometimes"
-    /// column a location of `*` matches any location.
+    /// violations about a whole worker).
     Violation(Check, &'static str, Option<&'static str>),
     /// The progress checker did not observe the run.
     Blind(&'static str),
@@ -470,16 +470,6 @@ impl Failure {
                 }
             }
         })
-    }
-
-    /// Whether this (expected) failure accepts the observed failure `seen`.
-    fn accepts(self, seen: Failure) -> bool {
-        match (self, seen) {
-            (Failure::Violation(c1, k1, Some("*")), Failure::Violation(c2, k2, _)) => {
-                c1 == c2 && k1 == k2
-            }
-            _ => self == seen,
-        }
     }
 }
 
@@ -1376,11 +1366,12 @@ fn observe(result: RunResult, collectors: [Vec<Collector>; 2]) -> Observed {
     }
 }
 
-/// Wait for `join` with a timeout; on timeout call `cancel` and give the run
-/// a moment to stop.
+/// Wait for `join` with a timeout. On timeout, call `hung` while the run
+/// still hangs, then `cancel`, and give the run a moment to stop.
 fn wait(
     join: impl FnOnce() -> Result<()> + Send + 'static,
     timeout: Duration,
+    hung: impl FnOnce(),
     cancel: impl FnOnce(),
 ) -> RunResult {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1391,10 +1382,27 @@ fn wait(
         Ok(Ok(())) => RunResult::Ok,
         Ok(Err(e)) => RunResult::Err(e.to_string()),
         Err(_) => {
+            hung();
             cancel();
             let _ = rx.recv_timeout(Duration::from_secs(5));
             RunResult::Hang
         }
+    }
+}
+
+/// Dump the flight recorder's traces of every dataflow `case` started since
+/// `mark`, while it hangs: cancelling it retires the workers' views, whose
+/// stuck inputs a dump lists. ([`dump_traces`] finds these dumps later.)
+fn dump_hung(case: &Case, mark: u64, timeout: Duration) {
+    let ids: BTreeSet<DataflowId> = check::oracles_since(mark)
+        .into_iter()
+        .filter_map(|oracle| oracle.dataflow)
+        .collect();
+    for id in ids {
+        let _ = check::dump_traces(
+            id,
+            &format!("conformance case {case}: no outcome within {timeout:?}, before cancelling"),
+        );
     }
 }
 
@@ -1420,13 +1428,15 @@ fn build_cfg(case: &Case) -> BuildCfg {
 /// A cancel function for a run.
 type Cancel = Arc<dyn Fn() + Send + Sync>;
 
-/// Inputs and outputs of a multi-worker spawn, then wait.
+/// Inputs and outputs of a multi-worker spawn, then wait (`mark`: from
+/// before the spawn).
 fn drive_multi(
     case: &Case,
     mut multi: MultiSpawnedDataflow<u64>,
     cancel: Cancel,
     timeout: Duration,
     input_workers: usize,
+    mark: u64,
 ) -> Observed {
     let (first, second) = input_values(case.shape);
     let take_inputs = |multi: &mut MultiSpawnedDataflow<u64>, name: &str| {
@@ -1470,13 +1480,19 @@ fn drive_multi(
     } else {
         drop(fed_rx);
     }
-    let result = wait(move || multi.join_blocking(), timeout, move || cancel());
+    let result = wait(
+        move || multi.join_blocking(),
+        timeout,
+        || dump_hung(case, mark, timeout),
+        move || cancel(),
+    );
     drop(keep_inputs_open);
     observe(result, collectors)
 }
 
-/// Run the case once on the in-process transports.
-fn run_local(case: &Case, timeout: Duration) -> Observed {
+/// Run the case once on the in-process transports (`mark`: from before the
+/// run).
+fn run_local(case: &Case, timeout: Duration, mark: u64) -> Observed {
     let cfg = build_cfg(case);
     let workers = case.total_workers();
     let build = move |b: &mut DataflowBuilder<u64>| build_shape(cfg, b);
@@ -1501,6 +1517,7 @@ fn run_local(case: &Case, timeout: Duration) -> Observed {
                     Arc::new(move || cancel.cancel()),
                     timeout,
                     workers,
+                    mark,
                 ),
                 Err(e) => Observed {
                     result: RunResult::Err(e.to_string()),
@@ -1541,6 +1558,7 @@ fn run_local(case: &Case, timeout: Duration) -> Observed {
                     Arc::new(move || token.cancel()),
                     timeout,
                     input_workers,
+                    mark,
                 ),
                 Err(e) => Observed {
                     result: RunResult::Err(e.to_string()),
@@ -1610,7 +1628,8 @@ fn peer_manager(peer: &str, halves: Halves) -> Arc<HashMap<String, SharedPeerMan
     Arc::new(HashMap::from([(peer.to_string(), manager)]))
 }
 
-fn run_cluster(case: &Case, timeout: Duration) -> Observed {
+/// Run the case once on a two-node cluster (`mark`: from before the run).
+fn run_cluster(case: &Case, timeout: Duration, mark: u64) -> Observed {
     let cfg = build_cfg(case);
     let topology = ClusterTopology::multi_node(vec![
         NodeConfig::new("node-a", 1),
@@ -1774,6 +1793,7 @@ fn run_cluster(case: &Case, timeout: Duration) -> Observed {
             }
         },
         timeout,
+        || dump_hung(case, mark, timeout),
         move || token.cancel(),
     );
     let observed = observe(result, collectors);
@@ -1957,8 +1977,7 @@ const GOLDEN_PATH: &str = concat!(
 struct Golden {
     /// Failures every recorded run showed: the case must show each of them.
     always: BTreeSet<Failure>,
-    /// Failures only some recorded runs showed, plus the margin (see
-    /// [`merge_observations`]): the case may show them.
+    /// Failures only some recorded runs showed: the case may show them.
     sometimes: BTreeSet<Failure>,
     /// The audit findings that explain the failures (from the table).
     audits: String,
@@ -1969,7 +1988,7 @@ impl Golden {
     fn unexpected(&self, observed: &BTreeSet<Failure>) -> Vec<Failure> {
         observed
             .iter()
-            .filter(|f| !self.always.contains(f) && !self.sometimes.iter().any(|s| s.accepts(**f)))
+            .filter(|f| !self.always.contains(f) && !self.sometimes.contains(f))
             .copied()
             .collect()
     }
@@ -2049,30 +2068,19 @@ fn audits_for(case: &Case, failures: impl IntoIterator<Item = Failure>) -> Strin
     audits.join(", ")
 }
 
-/// A V4 `exhausted-input-frontier` report, anywhere.
-const V4_EXHAUSTED_ANYWHERE: Failure =
-    Failure::Violation(Check::V4, "exhausted-input-frontier", Some("*"));
-
 /// A case's golden line from the failures each recorded run showed: those
-/// every run showed are `always`, the others `sometimes`. The one margin: a
-/// case that may hang may also report V4 `exhausted-input-frontier`
-/// anywhere, because whether that report (1 s and 256 propagations after
-/// the inputs are exhausted) beats the hang timeout is a matter of timing.
+/// every run showed are `always`, the others `sometimes`.
 fn merge_observations(case: &Case, runs: &[BTreeSet<Failure>]) -> Golden {
     let mut always: BTreeSet<Failure> = runs.first().cloned().unwrap_or_default();
     for run in runs {
         always.retain(|f| run.contains(f));
     }
-    let mut sometimes: BTreeSet<Failure> = runs
+    let sometimes: BTreeSet<Failure> = runs
         .iter()
         .flatten()
         .filter(|f| !always.contains(f))
         .copied()
         .collect();
-    if always.contains(&Failure::Hang) || sometimes.contains(&Failure::Hang) {
-        sometimes.retain(|f| !V4_EXHAUSTED_ANYWHERE.accepts(*f));
-        sometimes.insert(V4_EXHAUSTED_ANYWHERE);
-    }
     let audits = audits_for(case, always.iter().chain(&sometimes).copied());
     Golden {
         always,
@@ -2149,8 +2157,8 @@ fn observe_case(case: &Case, timeout: Duration) -> (Outcome, Duration, Vec<Dataf
     let split_before = check::split_commits();
     let started = std::time::Instant::now();
     let observed = match case.transport {
-        Transport::InProcess | Transport::Mock => run_local(case, timeout),
-        Transport::Dedicated | Transport::Shared => run_cluster(case, timeout),
+        Transport::InProcess | Transport::Mock => run_local(case, timeout, mark),
+        Transport::Dedicated | Transport::Shared => run_cluster(case, timeout, mark),
     };
     // Let late reports of a run that was cut short land in the log.
     std::thread::sleep(Duration::from_millis(10));
@@ -2514,7 +2522,7 @@ fn staged_and_simple_workers_have_one_global_view_each() {
             Workers::Three,
             Cap::Default,
         );
-        let observed = run_local(&case, timeout());
+        let observed = run_local(&case, timeout(), mark);
         if let RunResult::Err(e) = &observed.result {
             panic!("{case}: {e}");
         }
@@ -2630,7 +2638,7 @@ fn regenerate_golden_file() {
         "// commit message, the audit finding that explains it.".to_string(),
         "//".to_string(),
         "// <case> | <failures every recorded run showed> | <failures some runs".to_string(),
-        "// showed, plus the margin> | <audit findings>".to_string(),
+        "// showed> | <audit findings>".to_string(),
     ];
     let (mut exact, mut variable, mut clean) = (0, 0, 0);
     for case in full_matrix() {

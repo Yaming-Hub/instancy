@@ -12,7 +12,7 @@
 //! |---|---|
 //! | [`Check::V1`] | Every batch a worker consumes at input `(op, port)` and time `t` is at or after that worker's input frontier: data never arrives behind the frontier. |
 //! | [`Check::V3`] | Recorded, never panics: a logic call emitted output, retained a capability or asked for a notification at a time it does not justify. Production code enforces this and fails the operator (`ProgressError::Unjustified`). |
-//! | [`Check::V4`] | A worker never force-closes, seals, or reports completion while work it holds is outstanding; an input whose every channel is exhausted gets an empty frontier within a bounded number of propagations. |
+//! | [`Check::V4`] | A worker never force-closes, seals, or reports completion while work it holds is outstanding. |
 //! | [`Check::V5`] | The non-zero counts left in a worker's view once they are final: it succeeded, or every worker's seal is applied (a proven residual). A negative count means a missing `+n`, a positive one a leak. |
 //! | [`Check::V6`] | Wire rules: split progress batches are positives-first, and nothing follows a progress end-of-stream. (Frames carry no per-sender sequence number to check order with.) |
 //! | [`Check::V7`] | The oracle. It measures where work physically is, independently of the accounting under test, and asserts that no worker's view claims a location is done while work is still there. At successful completion every store must be empty. |
@@ -91,7 +91,13 @@
 //! Known limits: the `OutputHandle` buffer and data inside a user closure are
 //! transient within one activation and are not measured. An oracle checks
 //! one process: a cluster whose nodes run in different processes is checked
-//! by none (see `REGISTRATION_GRACE`).
+//! by none (see `REGISTRATION_GRACE`). A frontier that never empties is not
+//! a finding. Once every channel into an input is exhausted and no record is
+//! left there, a view may still have a non-empty frontier there until it has
+//! applied every worker's last commits, however long a busy worker takes to
+//! send them; a count that never cancels keeps it there for good, and the
+//! dataflow hangs. Timeouts report hangs; the flight recorder's dumps list
+//! such inputs, to show where a hang is stuck (see `settled_inputs`).
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -118,8 +124,7 @@ pub enum Check {
     /// time the logic call does not justify. Production code enforces it
     /// (`ProgressError::Unjustified`); the checker records it.
     V3,
-    /// Termination: completion or force-close with work outstanding, or an
-    /// exhausted input whose frontier never empties.
+    /// Termination: completion or force-close with work outstanding.
     V4,
     /// Residual: non-zero counts in a worker's view once they are final (it
     /// succeeded, or every worker's seal is applied).
@@ -553,10 +558,16 @@ pub(crate) fn record(
         Some(id) if crate::progress::trace::enabled() => Some((id, violation.to_string())),
         _ => None,
     };
-    // The flight recorder's dump: under an oracle's lock, deferred until it
-    // is released (see `DeferDumps`); otherwise written here, before a
-    // panic can end the process, holding `dumps_in_flight` from before the
-    // violation is logged, as a `DeferDumps` would.
+    // The flight recorder's dump waits for this thread's outermost
+    // `DeferDumps`: under an oracle's lock, until it is released; otherwise
+    // `own`, which writes it below, before a panic can end the process.
+    // Writing a dump reads oracles and may drop the last handle on one,
+    // which applies its queue: the dumps that triggers must be deferred too,
+    // not take `dumps_in_flight` again. A thread that can no longer defer
+    // (its thread-locals are gone) writes it directly, holding
+    // `dumps_in_flight` from before the violation is logged, as a
+    // `DeferDumps` would.
+    let own = dump.is_some().then(DeferDumps::new);
     let _ = DEFERRED_DUMPS.try_with(|d| {
         if let Some(deferred) = d.borrow_mut().as_mut() {
             deferred.extend(dump.take());
@@ -578,6 +589,7 @@ pub(crate) fn record(
     if let Some((id, text)) = dump {
         crate::progress::trace::trigger(id, crate::progress::trace::Trigger::Checker, &text);
     }
+    drop(own);
     if let Some(message) = message {
         panic!("instancy progress check failed: {message}");
     }
@@ -871,6 +883,8 @@ pub(crate) trait Sink: Send + Sync + 'static {
     fn failed(&self, what: String);
     /// Name the dataflow's operators (see [`Oracle::register_names`]).
     fn register_names_vec(&self, operators: Vec<(usize, String)>);
+    /// This oracle's lines of [`settled_inputs`], appended to `out`.
+    fn settled_inputs(&self, out: &mut Vec<String>);
 }
 
 /// Creates (or finds) the oracle of one nested scope of a dataflow, in the
@@ -1012,7 +1026,7 @@ pub(crate) fn oracle_scoped<T: Timestamp>(
                 // Same id, different dataflow shape: keep them apart.
                 let oracle = Arc::new(Oracle::<T>::new(Some(id), total_workers));
                 let sink: Arc<dyn Sink> = oracle.clone();
-                watch(&sink);
+                watch(id, &sink);
                 oracle.coverage_gap(
                     None,
                     "another dataflow with this id and a different shape is running; \
@@ -1025,7 +1039,7 @@ pub(crate) fn oracle_scoped<T: Timestamp>(
     }
     let oracle = Arc::new(Oracle::<T>::new(Some(id), total_workers));
     let sink: Arc<dyn Sink> = oracle.clone();
-    watch(&sink);
+    watch(id, &sink);
     let typed: Arc<dyn Any + Send + Sync> = oracle.clone();
     registry.insert(
         id_key,
@@ -1045,11 +1059,6 @@ pub(crate) fn oracle_scoped<T: Timestamp>(
 /// the rest are counted in [`OracleStats::suppressed`].
 const LOGGED_PER_KIND: u64 = 4;
 
-/// A view may keep a non-empty frontier at a fully exhausted input for at
-/// most this many publications and this long before V4 fires.
-const EXHAUSTED_GRACE: u64 = 256;
-const EXHAUSTED_GRACE_TIME: std::time::Duration = std::time::Duration::from_secs(1);
-
 /// Zero counts are dropped every this many publications.
 const PRUNE_EVERY: u64 = 1024;
 
@@ -1068,9 +1077,6 @@ struct View<T: Timestamp> {
     label: &'static str,
     targets: LocMap<Antichain<T>>,
     sources: LocMap<Antichain<T>>,
-    /// Publications with a non-empty frontier at a fully exhausted input,
-    /// and when the first of them happened.
-    stuck: LocMap<(u64, std::time::Instant)>,
     /// Whether all counted work has been checked against this view's
     /// frontiers. After that, new work is checked as it is counted, and a
     /// publication rescans only the work its changed frontiers constrain.
@@ -1280,7 +1286,6 @@ enum Event<T: Timestamp> {
         view: u64,
         targets: Vec<(Loc, Antichain<T>)>,
         sources: Vec<(Loc, Antichain<T>)>,
-        at: std::time::Instant,
     },
     Exhausted(Loc),
     WorkerFinished {
@@ -1304,9 +1309,10 @@ const MAX_QUEUED: usize = 1 << 16;
 /// How often the background thread applies the live oracles' queues.
 const POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(1);
 
-/// The oracles the background thread applies queues for.
-fn live() -> MutexGuard<'static, Vec<Weak<dyn Sink>>> {
-    static LIVE: Mutex<Vec<Weak<dyn Sink>>> = Mutex::new(Vec::new());
+/// The oracles the background thread applies queues for, with their
+/// dataflows.
+fn live() -> MutexGuard<'static, Vec<(DataflowId, Weak<dyn Sink>)>> {
+    static LIVE: Mutex<Vec<(DataflowId, Weak<dyn Sink>)>> = Mutex::new(Vec::new());
     LIVE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -1314,8 +1320,8 @@ fn live() -> MutexGuard<'static, Vec<Weak<dyn Sink>>> {
 const CHECK_THREAD: &str = "instancy-progress-check";
 
 /// Have the background thread apply `sink`'s queue (starting the thread on
-/// first use).
-fn watch(sink: &Arc<dyn Sink>) {
+/// first use); `sink` is an oracle of dataflow `id`.
+fn watch(id: DataflowId, sink: &Arc<dyn Sink>) {
     static POLLER: OnceLock<()> = OnceLock::new();
     POLLER.get_or_init(|| {
         std::thread::Builder::new()
@@ -1323,7 +1329,7 @@ fn watch(sink: &Arc<dyn Sink>) {
             .spawn(poll)
             .expect("spawn the progress checker thread");
     });
-    live().push(Arc::downgrade(sink));
+    live().push((id, Arc::downgrade(sink)));
 }
 
 /// The background thread: apply every live oracle's queue, then sleep.
@@ -1340,8 +1346,8 @@ fn poll() {
             let dumps = DeferDumps::new();
             let sinks: Vec<Arc<dyn Sink>> = {
                 let mut live = live();
-                live.retain(|sink| sink.strong_count() > 0);
-                live.iter().filter_map(Weak::upgrade).collect()
+                live.retain(|(_, sink)| sink.strong_count() > 0);
+                live.iter().filter_map(|(_, sink)| sink.upgrade()).collect()
             };
             for sink in sinks {
                 // A bug in the checker must not stop it checking other
@@ -1367,10 +1373,33 @@ fn poll() {
 /// Apply the queues of every live oracle (before reading the log). The
 /// caller holds [`pass`].
 fn drain_all() {
-    let sinks: Vec<Arc<dyn Sink>> = live().iter().filter_map(Weak::upgrade).collect();
+    let sinks: Vec<Arc<dyn Sink>> = live()
+        .iter()
+        .filter_map(|(_, sink)| sink.upgrade())
+        .collect();
     for sink in sinks {
         sink.drain();
     }
+}
+
+/// The inputs of dataflow `id` that are settled, every channel into them
+/// exhausted and no record left there, while some worker's view still has a
+/// non-empty frontier there: one line per input and view, for the flight
+/// recorder's dumps. That is not a violation: a view keeps such a frontier
+/// until it has applied every worker's last commits. If it never empties,
+/// the dataflow hangs, and this list shows where. It reads each oracle's
+/// state as last applied and records nothing.
+pub(crate) fn settled_inputs(id: DataflowId) -> Vec<String> {
+    let sinks: Vec<Arc<dyn Sink>> = live()
+        .iter()
+        .filter(|(of, _)| *of == id)
+        .filter_map(|(_, sink)| sink.upgrade())
+        .collect();
+    let mut out = Vec::new();
+    for sink in sinks {
+        sink.settled_inputs(&mut out);
+    }
+    out
 }
 
 /// Excludes the background thread's passes (see [`poll`]).
@@ -1504,8 +1533,7 @@ impl<T: Timestamp> Oracle<T> {
                 view,
                 targets,
                 sources,
-                at,
-            } => self.publish_locked(state, view, targets, sources, at, found),
+            } => self.publish_locked(state, view, targets, sources, found),
             Event::Exhausted(loc) => *state.exhausted.entry(loc).or_insert(0) += 1,
             Event::WorkerFinished { worker, ok } => {
                 self.worker_finished_locked(state, worker, ok, found)
@@ -1641,7 +1669,6 @@ impl<T: Timestamp> Oracle<T> {
                 label,
                 targets: LocMap::default(),
                 sources: LocMap::default(),
-                stuck: LocMap::default(),
                 scanned: false,
             },
         );
@@ -1660,7 +1687,7 @@ impl<T: Timestamp> Oracle<T> {
     }
 
     /// Publish a view's frontiers (those that changed) and check the view
-    /// against all counted work (V7) and exhausted inputs (V4).
+    /// against all counted work (V7).
     pub(crate) fn publish(
         &self,
         view: u64,
@@ -1671,22 +1698,18 @@ impl<T: Timestamp> Oracle<T> {
             view,
             targets: targets.into_iter().collect(),
             sources: sources.into_iter().collect(),
-            at: std::time::Instant::now(),
         });
     }
 
-    /// `publish`, applied (`at`: when it was published).
-    #[allow(clippy::too_many_arguments)]
+    /// `publish`, applied.
     fn publish_locked(
         &self,
         state: &mut State<T>,
         view: u64,
         targets: Vec<(Loc, Antichain<T>)>,
         sources: Vec<(Loc, Antichain<T>)>,
-        at: std::time::Instant,
         found: &mut Vec<Found>,
     ) {
-        let total_workers = self.total_workers;
         let Some(v) = state.views.get_mut(&view) else {
             return;
         };
@@ -1752,66 +1775,6 @@ impl<T: Timestamp> Oracle<T> {
             }
             if let Some(v) = state.views.get_mut(&view) {
                 v.scanned = true;
-            }
-        }
-        // V4: a fully exhausted input must get an empty frontier.
-        if state.registered.len() == total_workers {
-            let exhausted: Vec<Loc> = state
-                .exhausted
-                .iter()
-                .filter(|(loc, n)| {
-                    state
-                        .consumers
-                        .get(*loc)
-                        .is_some_and(|c| *c > 0 && **n >= *c)
-                })
-                .map(|(loc, _)| *loc)
-                .collect();
-            // Records still at the input (in a channel or an input buffer, of
-            // any worker: the location is shared) legitimately hold its
-            // frontier; the grace starts once it is physically empty.
-            let occupied: BTreeSet<Loc> = state
-                .counts
-                .iter()
-                .filter(|((store, loc, _), times)| {
-                    !store.at_output() && exhausted.contains(loc) && times.values().any(|n| *n != 0)
-                })
-                .map(|((_, loc, _), _)| *loc)
-                .collect();
-            let v = state.views.get_mut(&view).expect("view exists");
-            for loc in exhausted {
-                let Some(frontier) = v.targets.get(&loc) else {
-                    continue;
-                };
-                if frontier.is_empty() || occupied.contains(&loc) {
-                    v.stuck.remove(&loc);
-                    continue;
-                }
-                let (count, since) = v.stuck.entry(loc).or_insert((0, at));
-                if *count == u64::MAX {
-                    // Already reported.
-                    continue;
-                }
-                *count += 1;
-                if *count >= EXHAUSTED_GRACE
-                    && at.saturating_duration_since(*since) >= EXHAUSTED_GRACE_TIME
-                {
-                    *count = u64::MAX;
-                    found.push(Found {
-                        check: Check::V4,
-                        kind: "exhausted-input-frontier",
-                        worker: Some(v.worker),
-                        site: Some((loc, false)),
-                        detail: format!(
-                            "every channel into input {loc:?} is exhausted and no record \
-                             is left there, but the {} view still has frontier {:?} there \
-                             after {EXHAUSTED_GRACE} propagations and \
-                             {EXHAUSTED_GRACE_TIME:?}",
-                            v.label,
-                            frontier.elements()
-                        ),
-                    });
-                }
             }
         }
     }
@@ -2248,6 +2211,55 @@ impl<T: Timestamp> Sink for Oracle<T> {
 
     fn register_names_vec(&self, operators: Vec<(usize, String)>) {
         self.register_names(operators);
+    }
+
+    fn settled_inputs(&self, out: &mut Vec<String>) {
+        let state = self.lock();
+        if let Some(reason) = &state.halted {
+            out.push(format!("none listed: checking stopped ({reason})"));
+            return;
+        }
+        if state.registered.len() < self.total_workers {
+            out.push(format!(
+                "none listed: {} of {} workers registered",
+                state.registered.len(),
+                self.total_workers
+            ));
+            return;
+        }
+        // Records still at an input (in a channel or an input buffer, of any
+        // worker) hold its frontier.
+        let occupied: BTreeSet<Loc> = state
+            .counts
+            .iter()
+            .filter(|((store, _, _), times)| !store.at_output() && times.values().any(|n| *n != 0))
+            .map(|((_, loc, _), _)| *loc)
+            .collect();
+        let mut settled: Vec<Loc> = state
+            .exhausted
+            .iter()
+            .filter(|(loc, n)| {
+                !occupied.contains(*loc)
+                    && state
+                        .consumers
+                        .get(*loc)
+                        .is_some_and(|c| *c > 0 && **n >= *c)
+            })
+            .map(|(loc, _)| *loc)
+            .collect();
+        settled.sort_unstable();
+        for loc in settled {
+            for v in state.views.values() {
+                if let Some(frontier) = v.targets.get(&loc).filter(|f| !f.is_empty()) {
+                    out.push(format!(
+                        "{}: frontier {:?} in worker {}'s view",
+                        site_name(&state.names, (loc, false)),
+                        frontier.elements(),
+                        v.worker
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -2777,31 +2789,83 @@ mod tests {
         assert!(kinds.contains(&"frontier-ahead-of-work"), "{kinds:?}");
     }
 
-    /// An exhausted input whose frontier never empties is reported once,
-    /// however long it stays stuck.
+    /// A worker slow to send its last commit leaves another worker's view
+    /// with a non-empty frontier at an input whose every channel is exhausted
+    /// and that holds no record, for as long as it takes (here over a second,
+    /// and hundreds of publications). That is no finding: once the commit
+    /// arrives, the frontier empties and the run completes cleanly.
     #[test]
-    fn exhausted_input_is_reported_once() {
-        // Provokes violations on purpose.
-        let _expect = expect_violations();
+    fn a_slow_last_commit_at_a_settled_input_is_no_finding() {
+        let id = DataflowId::new();
+        let oracle = oracle::<u64>(id, 2).expect("checking is on in tests");
+        for worker in 0..2 {
+            oracle.register_worker(worker);
+            oracle.register_channel((1, 0), (2, 0));
+        }
+        let views = [
+            oracle.attach_view(0, "worker tracker"),
+            oracle.attach_view(1, "worker tracker"),
+        ];
+        // Worker 0 consumes the records at the input, and both channels
+        // into it end.
+        oracle.count(Store::Channel, (2, 0), Some(0), &1, 3, 0);
+        oracle.consumed((2, 0), Some(0), &1, 3, 0);
+        oracle.exhausted((2, 0), 0);
+        oracle.exhausted((2, 0), 1);
+        // Worker 0 has not sent the commit with that consumption yet:
+        // worker 1's view still waits at the input.
+        let started = std::time::Instant::now();
+        let mut publications = 0;
+        while publications < 300 || started.elapsed() < std::time::Duration::from_millis(1200) {
+            oracle.publish(views[1], [((2, 0), frontier(1))], []);
+            publications += 1;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // The commit arrives.
+        for view in views {
+            oracle.publish(view, [((2, 0), Antichain::new())], []);
+        }
+        oracle.worker_finished(0, true);
+        oracle.worker_finished(1, true);
+        assert!(violations_for(id).is_empty(), "{:?}", violations_for(id));
+        assert!(oracle.stats().end_state_checked);
+    }
+
+    /// The flight recorder's dumps list an input whose every channel is
+    /// exhausted and that holds no record, while a view's frontier there is
+    /// not empty: where a hang would be stuck.
+    #[test]
+    fn a_dump_lists_settled_inputs_with_a_frontier() {
+        use crate::progress::trace;
         let id = DataflowId::new();
         let oracle = oracle::<u64>(id, 1).expect("checking is on in tests");
         oracle.register_worker(0);
         oracle.register_channel((1, 0), (2, 0));
-        oracle.exhausted((2, 0), 0);
+        oracle.register_names([(1, "a".into()), (2, "b".into())]);
         let view = oracle.attach_view(0, "worker tracker");
-        for _ in 0..EXHAUSTED_GRACE + 10 {
-            oracle.publish(view, [((2, 0), frontier(0))], []);
-        }
-        std::thread::sleep(EXHAUSTED_GRACE_TIME);
-        for _ in 0..EXHAUSTED_GRACE + 10 {
-            oracle.publish(view, [((2, 0), frontier(0))], []);
-        }
-        let reported = violations_for(id)
-            .iter()
-            .filter(|v| v.kind == "exhausted-input-frontier")
-            .count();
-        assert_eq!(reported, 1);
+        oracle.count(Store::Channel, (2, 0), None, &0, 1, 0);
+        oracle.exhausted((2, 0), 0);
+        oracle.publish(view, [((2, 0), frontier(0))], []);
+        oracle.drain();
+        assert!(settled_inputs(id).is_empty(), "a record is still there");
+        oracle.consumed((2, 0), None, &0, 1, 0);
+        oracle.drain();
+        let dir = std::env::temp_dir().join(format!("instancy-settled-{}", id.as_uuid()));
+        let recorder = trace::recorder_for_test(id, "n", Some(0), "", 1, &dir);
+        let root = recorder
+            .trigger(trace::Trigger::Explicit, "the test asked")
+            .expect("a dump");
+        let listed = "b[in 0]: frontier [0] in worker 0's view";
+        let reason = std::fs::read_to_string(root.join("reason.txt")).unwrap();
+        assert!(reason.contains(listed), "{reason}");
+        let header: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("header.json")).unwrap())
+                .unwrap();
+        assert_eq!(header["settled_inputs"], serde_json::json!([listed]));
+        drop(recorder);
+        let _ = std::fs::remove_dir_all(&dir);
     }
+
     /// A location whose violations stop being described (it broke an
     /// invariant on every record) does not hide another location's.
     #[test]

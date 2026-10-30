@@ -325,6 +325,8 @@ A failed worker never seals. Its lane ends unsealed (with an abandon marker on a
 
 `progress/check.rs` is an independent oracle, compiled into debug builds (and release builds with the `progress-check` feature). It measures where work physically is (channels, operator stores, live capabilities) without reading any ledger, and checks every worker's published frontiers against it: late data (V1), unjustified output (V3), sealing or completing with work held (V4), residuals (V5), wire rules (V6) and the occupancy oracle (V7). It panics on a violation by default; `INSTANCY_PROGRESS_CHECK` selects the mode.
 
+A frontier that never empties is not a checker finding. Once every channel into an input is exhausted and no record is left there, a worker's view may keep a non-empty frontier there until it has applied every worker's last commits, however long a busy worker takes to send them. A count that never cancels keeps it there for good, and the dataflow hangs; timeouts report hangs, and the flight recorder's dumps list such inputs (§11.6.6).
+
 #### 11.6.6 Diagnosing a Progress Failure
 
 A progress failure that shows up once in CI rarely reproduces locally. Examples are an S3 data loss ("records sent after the peer finished"), a proven residual and a checker finding. The flight recorder (`progress/trace.rs`) makes one CI artifact enough to attribute such a failure. Like the checker, it is compiled only into debug builds and builds with the `progress-check` or `test-utils` feature, never into a release build without them. It records only when `INSTANCY_TRACE_DIR` names a dump directory. CI sets it for the `test` and conformance jobs. It uploads the `test` job's dumps when that job fails, and the conformance job's whenever there are any: a case that passes only on a later attempt (flaky) still leaves the dump of its failed attempt.
@@ -365,7 +367,7 @@ A dataflow that was dumped writes a final dump when it ends. The conformance har
 
 A dump goes to `$INSTANCY_TRACE_DIR/<dataflow-id>/` and contains:
 
-- `header.json`: the reason, a legend for every field, operator and edge names, and how a network channel id decodes;
+- `header.json`: the reason, a legend for every field, operator and edge names, how a network channel id decodes and, in builds with the checker, the inputs whose every channel is exhausted and that hold no record but whose frontier is not empty in some worker's view (also in `reason.txt`): in a hang, they show where it is stuck;
 - `reason.txt`;
 - one JSON-lines file per ring: `<node>-w<worker>.jsonl` and `<node>-bridge-<peer>.jsonl`.
 
