@@ -252,9 +252,11 @@ Real progress batches are capped below both reserved counts, so the markers
 are unambiguous. The acknowledgement travels on the sender's payload lane,
 not the priority control channel: the receiver of an ack has therefore
 already received (demultiplexed into its inbound queues) every data frame the
-acknowledging node sent before it. A data push that races with retirement
-re-checks the link after enqueueing and fails instead (see step 3), so no
-data frame can follow the ack unnoticed.
+acknowledging node sent before it. A data push and the link's retirement are
+ordered by a per-link admission lock: a record is enqueued before the link
+retires, and so ahead of the ack, or refused (see step 3), so no data frame
+can follow the ack. A record enqueued before retirement is not reported lost
+when the link retires before its push returns.
 
 **Protocol.**
 

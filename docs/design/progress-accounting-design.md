@@ -811,6 +811,7 @@ Nothing PCP sends blocks: the outbox is unbounded.
 
 **`DataLoss` checks stay, as assertions of S3.** They come from #291, and PCP keeps all of them. Under PCP none of them should fire.
 - Sender side: records sent to a retired peer, including after the post-enqueue retirement re-check (`network.rs:349-371`).
+  - *Superseded:* the post-enqueue re-check was replaced by admission ordered with retirement. A push now checks the link only while enqueueing its records, under a per-link lock that retirement takes exclusively. Records are either queued before the link retires, and so ahead of the acknowledgement, or refused before they are enqueued. A record enqueued before retirement is no longer reported lost when the link retires before its push returns.
 - Receiver side, reported as `InboundDataLost`: records arriving after the channel's close marker or after the receiving operator finished (`network.rs:588-616`), and records left unconsumed when the pull is dropped (`:667-695`).
 
 In §5.9's prototype runs, the completion changes alone (exact zero and no force-close in acyclic dataflows) already stopped them firing in #291's early-finisher scenarios.

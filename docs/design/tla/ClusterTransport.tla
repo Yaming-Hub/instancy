@@ -44,6 +44,11 @@
 (* goodbye ("ack") at once. A link is retired by the peer's goodbye or its *)
 (* ack of ours; a Cancel stops a node waiting for that peer; a requested   *)
 (* stop drains; a forwarded failure is fatal.                              *)
+(* A send may remain on the caller's stack after enqueue: the peer can     *)
+(* consume it and retire before its result is returned. SendOutcome splits *)
+(* those steps to check the retirement detector. The guarded variant      *)
+(* orders the retirement test and enqueue together; it does not infer     *)
+(* delivery from a later retirement flag.                                 *)
 (*                                                                         *)
 (* Simplified, not checked here: the lifecycle machine's soft failures     *)
 (* (deferred until the link fully closes or a grace timer expires, then    *)
@@ -85,7 +90,12 @@ CONSTANTS
     RejectCancel,   \* TRUE: a spawn refused for a reused DataflowId still
                     \* broadcasts Cancel under that id (SpawnAbortGuard, a7c4b1c);
                     \* FALSE: it sends nothing under an id that is another run's
-    Crc             \* TRUE: frame checksums (always on from protocol v6)
+    Crc,            \* TRUE: frame checksums (always on from protocol v6)
+    SendOutcome,    \* "atomic": old abstraction; "recheck": inspect retirement
+                    \* after enqueue; "admission": check atomically with enqueue;
+                    \* "unchecked": accept even a deliberately late send
+    LateAttempt     \* TRUE: one extra send may start before retirement and
+                    \* attempt its actual enqueue after retirement
 
 N == {"a", "b"}
 Other(n) == IF n = "a" THEN "b" ELSE "a"
@@ -125,7 +135,9 @@ vars == <<rs, cs, br, rel, mem, pend, cnt>>
 \*  a requested stop; ended: its link ended for good after its workers
 \*  succeeded; pf: it failed on the peer's Cancel; obf: its lane failed;
 \*  tx, rx: lane sequence numbers; rb: the earlier design's reorder buffer;
-\*  ob: its outbox; cross: ghost, it took another run's frame.
+\*  ob: its outbox; cross: ghost, it took another run's frame;
+\*  sending: the normal enqueue happened but the caller has not returned;
+\*  late: the deliberately invalid extra send's phase (test scenarios only).
 RunInit(r) ==
     LET live == r = 1 \/ Concurrent IN
     [st |-> IF live THEN "run" ELSE "off", reg |-> IF live THEN "reg" ELSE "none",
@@ -133,7 +145,7 @@ RunInit(r) ==
      sent |-> FALSE, v |-> 0, cap |-> FALSE, gd |-> 0,
      bye |-> FALSE, ack |-> FALSE, gc |-> FALSE, cx |-> FALSE, ended |-> FALSE,
      pf |-> FALSE, obf |-> FALSE, tx |-> 0, rx |-> 0, rb |-> {}, ob |-> <<>>,
-     cross |-> FALSE]
+     cross |-> FALSE, sending |-> FALSE, late |-> "none"]
 
 \* One node's end of one connection.
 \*  wst: its writer is up, shut (FIN sent) or dead; rds: its reader is up or
@@ -161,7 +173,9 @@ Init ==
     \* f, s, x: faults, stops, failures. faulted: connections a fault hit.
     \* needless: a lane frame was dropped though its connection could still
     \* carry it. bad: a run took a corrupted frame.
-    /\ cnt = [f |-> 0, s |-> 0, x |-> 0, faulted |-> {}, needless |-> FALSE, bad |-> FALSE]
+    /\ cnt = [f |-> 0, s |-> 0, x |-> 0, faulted |-> {}, needless |-> FALSE, bad |-> FALSE,
+              falseLoss |-> FALSE, lateQueued |-> FALSE, lateRejected |-> FALSE,
+              lateAccepted |-> FALSE]
 
 ---------------------------------------------------------------------------
 (* Helpers *)
@@ -471,16 +485,67 @@ Send(n, r) ==
     LET rec == rs[n][r] IN
     /\ rec.st = "run" /\ ~rec.sent
     /\ rs[Other(n)][r].st = "run"
+    /\ ~Retired(rec)
     /\ rs' = [rs EXCEPT ![n][r].sent = TRUE,
+                        ![n][r].sending = SendOutcome # "atomic",
                         ![n][r].ob = @ \o <<Frame("data", Id(r), r, -1, FALSE),
                                             Frame("p1", Id(r), r, -1, FALSE),
                                             Frame("p2", Id(r), r, -1, FALSE)>>]
     /\ UNCHANGED <<cs, br, rel, mem, pend, cnt>>
 
+\* The enqueue already happened. Other nodes, bridges and the coordinator
+\* have been free to run while this caller has not returned. Rechecking a
+\* now-retired link may reject the very record the peer already consumed.
+ReturnSend(n, r) ==
+    LET rec == rs[n][r]
+        lost == SendOutcome = "recheck" /\ Retired(rec)
+    IN
+    /\ rec.st = "run" /\ rec.sending
+    /\ rs' = [rs EXCEPT ![n][r].sending = FALSE,
+                        ![n][r].st = IF lost THEN "fail" ELSE @]
+    /\ cnt' = [cnt EXCEPT !.falseLoss = @ \/ (lost /\ rs[Other(n)][r].gd = 1)]
+    /\ UNCHANGED <<cs, br, rel, mem, pend>>
+
+\* Deliberately invalid application: after the ordinary record, start one
+\* more send before the link retires, then delay its enqueue until after.
+\* This is separate from transport faults and is enabled only in the
+\* late-send scenarios; it must fail, not silently accept data behind ack.
+ArmLateSend(n, r) ==
+    LET rec == rs[n][r] IN
+    /\ LateAttempt /\ n = "a" /\ rec.st = "run" /\ rec.sent /\ ~rec.sending
+    /\ ~Retired(rec) /\ rec.late = "none"
+    /\ rs' = [rs EXCEPT ![n][r].late = "armed"]
+    /\ UNCHANGED <<cs, br, rel, mem, pend, cnt>>
+
+EnqueueLateSend(n, r) ==
+    LET rec == rs[n][r]
+        reject == SendOutcome = "admission"
+    IN
+    /\ rec.st = "run" /\ rec.late = "armed" /\ Retired(rec)
+    /\ rs' = [rs EXCEPT ![n][r].late = IF reject THEN "rejected" ELSE "pending",
+                        ![n][r].st = IF reject THEN "fail" ELSE @,
+                        ![n][r].ob = IF reject THEN @
+                                      ELSE Append(@, Frame("data", Id(r), r, -1, FALSE))]
+    /\ cnt' = [cnt EXCEPT !.lateQueued = @ \/ ~reject,
+                         !.lateRejected = @ \/ reject]
+    /\ UNCHANGED <<cs, br, rel, mem, pend>>
+
+ReturnLateSend(n, r) ==
+    LET rec == rs[n][r]
+        reject == SendOutcome = "recheck"
+    IN
+    /\ rec.st = "run" /\ rec.late = "pending"
+    /\ rs' = [rs EXCEPT ![n][r].late = IF reject THEN "rejected" ELSE "accepted",
+                        ![n][r].st = IF reject THEN "fail" ELSE @]
+    /\ cnt' = [cnt EXCEPT !.lateAccepted = @ \/ ~reject,
+                         !.lateRejected = @ \/ reject]
+    /\ UNCHANGED <<cs, br, rel, mem, pend>>
+
 \* The workers succeed once the view is exactly zero; the goodbye follows.
 Workers(n, r) ==
     LET rec == rs[n][r] IN
     /\ rec.st = "run" /\ rec.sent /\ rec.cap /\ rec.v = 0
+    /\ ~rec.sending /\ rec.late \notin {"armed", "pending"}
     /\ rs' = [rs EXCEPT ![n][r].st = "done",
                         ![n][r].ob = Append(@, Frame("bye", Id(r), r, -1, FALSE))]
     /\ UNCHANGED <<cs, br, rel, mem, pend, cnt>>
@@ -626,7 +691,8 @@ Next ==
     \/ \E n \in N :
          \/ \E r \in Runs : Send(n, r) \/ Bridge(n, r) \/ Workers(n, r) \/ Teardown(n, r)
                             \/ Cleanup(n, r) \/ RequestStop(n, r) \/ GapTimeout(n, r)
-                            \/ BarrierTimeout(n, r)
+                            \/ BarrierTimeout(n, r) \/ ReturnSend(n, r)
+                            \/ ArmLateSend(n, r) \/ EnqueueLateSend(n, r) \/ ReturnLateSend(n, r)
          \/ LocalFail(n) \/ Start(n) \/ Release(n)
          \/ \E c \in Conns : Write(n, c) \/ Read(n, c) \/ ReadErr(n, c) \/ CleanEofA(n, c)
                              \/ CloseOut(n, c) \/ WriteErr(n, c) \/ Corrupt(n, c)
@@ -641,6 +707,8 @@ Fairness ==
     /\ \A n \in N :
         /\ WF_vars(Start(n)) /\ WF_vars(Release(n))
         /\ \A r \in Runs : /\ WF_vars(Send(n, r)) /\ WF_vars(Bridge(n, r))
+                           /\ WF_vars(ReturnSend(n, r))
+                           /\ WF_vars(EnqueueLateSend(n, r)) /\ WF_vars(ReturnLateSend(n, r))
                            /\ WF_vars(Workers(n, r)) /\ WF_vars(Teardown(n, r))
                            /\ WF_vars(Cleanup(n, r)) /\ WF_vars(BarrierTimeout(n, r))
         /\ \A c \in Conns : /\ WF_vars(Write(n, c)) /\ WF_vars(Read(n, c))
@@ -658,6 +726,8 @@ TypeOK ==
          /\ rs[n][r].reg \in {"none", "reg", "gone"}
          /\ rs[n][r].pin \in Conns
          /\ rs[n][r].v \in -2..2 /\ rs[n][r].gd \in 0..2
+         /\ rs[n][r].sending \in BOOLEAN
+         /\ rs[n][r].late \in {"none", "armed", "pending", "rejected", "accepted"}
     /\ \A n \in N, c \in Conns :
          /\ cs[n][c].wst \in {"up", "shut", "dead"} /\ cs[n][c].rds \in {"up", "done"}
          /\ cs[n][c].pool \in {"live", "peerclosed", "gone"}
@@ -682,6 +752,19 @@ NoNeedlessDrop == ~cnt.needless
 \* stop drains, so it is still a success.
 NoSpuriousFail ==
     cnt.f = 0 /\ cnt.x = 0 => \A n \in N, r \in Runs : rs[n][r].st # "fail"
+
+\* A post-enqueue check must not report the already-consumed record lost.
+NoFalseLoss == ~cnt.falseLoss
+
+\* Admission after retirement is rejected, not queued behind an ack.
+NoLateEnqueue == ~cnt.lateQueued
+NoLateSuccess == ~cnt.lateAccepted
+
+\* Reachability witnesses, deliberately false in their named scenarios.
+NeverLateRejected == ~cnt.lateRejected
+NeverDeliveredBeforeReturn ==
+    ~(\E n \in N, r \in Runs :
+        rs[n][r].sending /\ Retired(rs[n][r]) /\ rs[Other(n)][r].gd = 1)
 
 \* A failed connection fails only the runs that use it (PR9 containment).
 NoCollateralFail ==

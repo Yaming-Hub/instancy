@@ -186,10 +186,19 @@ $ctBase = [ordered]@{
     MaxFaults = '0'; FaultsRun1 = 'FALSE'; MaxStops = '0'; MaxFails = '0'; PerJob = 'TRUE'
     Pin = 'TRUE'; WriteErrClose = 'TRUE'; Split = 'TRUE'; CleanEof = '"keep"'; Linger = 'TRUE'
     RunIds = '"pr9"'; RejectCancel = 'FALSE'; Crc = 'TRUE'
+    SendOutcome = '"atomic"'; LateAttempt = 'FALSE'
 }
 $ctSafety = @('TypeOK', 'NoLossOk', 'NoCrossRun', 'NoCorruptAccepted', 'NoNeedlessDrop', 'NoSpuriousFail')
 $allFaults = '{"reset", "writeerr", "corrupt"}'
 $ctScenarios = @(
+    # ---- Split enqueue and caller return; one run and one connection ----
+    @{ n = 'ct_send_return_recheck'; e = 'violated:NoFalseLoss'; d = 'A frame is consumed and the peer retires before the sender returns: the post-enqueue retirement recheck reports false loss.'; o = @{ SendOutcome = '"recheck"' }; inv = @('TypeOK', 'NoLossOk', 'NoFalseLoss') }
+    @{ n = 'ct_send_return_admission'; e = 'pass'; d = 'Admission is ordered with retirement; a later caller return cannot reject an already-admitted frame. Both runs finish.'; o = @{ SendOutcome = '"admission"' }; spec = 'LiveSpec'; prop = @('Termination'); inv = $ctSafety + 'NoFalseLoss' }
+    @{ n = 'ct_send_return_witness'; e = 'violated:NeverDeliveredBeforeReturn'; d = 'The guarded design still permits receipt and retirement while a send return is pending; the passing result is not obtained by forbidding that interleaving.'; o = @{ SendOutcome = '"admission"' }; inv = @('TypeOK', 'NoFalseLoss', 'NeverDeliveredBeforeReturn') }
+    @{ n = 'ct_send_late_admission'; e = 'pass'; d = 'A deliberately late enqueue after an earlier live precheck is rejected atomically with retirement; it cannot queue behind ack or return success.'; o = @{ SendOutcome = '"admission"'; LateAttempt = 'TRUE' }; inv = @('TypeOK', 'NoLossOk', 'NoCrossRun', 'NoCorruptAccepted', 'NoFalseLoss', 'NoLateEnqueue', 'NoLateSuccess') }
+    @{ n = 'ct_send_late_witness'; e = 'violated:NeverLateRejected'; d = 'A real late attempt is reachable and is rejected by the guarded admission rule.'; o = @{ SendOutcome = '"admission"'; LateAttempt = 'TRUE' }; inv = @('TypeOK', 'NoFalseLoss', 'NoLateEnqueue', 'NeverLateRejected') }
+    @{ n = 'ct_send_late_unchecked'; e = 'violated:NoLateSuccess'; d = 'Removing the retirement admission check lets the deliberately late send return success; late acceptance and receiver loss remain checked.'; o = @{ SendOutcome = '"unchecked"'; LateAttempt = 'TRUE' }; inv = @('TypeOK', 'NoLateSuccess', 'NoLossOk') }
+
     # ---- PR9: must pass ----
     @{ n = 'ct_pr9'; e = 'pass'; d = 'PR9, healthy transport, with a requested stop: nothing lost, crossed or dropped, no run fails, nothing hangs.'; o = @{ MaxStops = '1' } }
     @{ n = 'ct_pr9_faults'; e = 'pass'; d = 'PR9 with one reset, write error or corrupted frame, and a requested stop: never Ok with lost or corrupted data.'; o = @{ Faults = $allFaults; MaxFaults = '1'; MaxStops = '1' } }
