@@ -95,9 +95,10 @@ pub enum TokioMode {
     /// Returns an error if called inside an existing tokio context (e.g.,
     /// `#[tokio::main]` or `#[tokio::test]`), because dropping the owned
     /// runtime from within an async context would panic. Use [`TokioMode::Auto`]
-    /// or [`TokioMode::CurrentContext`] instead.
+    /// or [`TokioMode::CurrentContext`] instead. Also returns an error if
+    /// `worker_threads` is 0.
     Create {
-        /// Number of tokio async worker threads. Defaults to 2.
+        /// Number of tokio async worker threads (at least 1). Defaults to 2.
         worker_threads: usize,
     },
     /// Use an existing tokio runtime via its handle.
@@ -574,7 +575,8 @@ enum SpawnAbortTarget {
     /// Nobody to tell (dedicated connections before the transport exists:
     /// dropping them is the signal).
     Nobody,
-    /// Shared managers, before this dataflow registered with them.
+    /// Shared managers, before this dataflow registered with them (never
+    /// when the id belongs to another run: see [`SpawnAbortGuard`]).
     Managers(
         Arc<
             std::collections::HashMap<
@@ -593,9 +595,27 @@ enum SpawnAbortTarget {
 /// Without it, peers still in the handshake or ready barrier wait for their
 /// timeout, and a peer that already passed the ready barrier would run (and
 /// possibly report success) without this node.
+///
+/// A spawn refused because its `DataflowId` belongs to another run (it is
+/// registered with a peer manager, or already ran there) is disarmed and
+/// sends nothing: under that id, a `Cancel` would reach the other run.
+///
+/// In Shared mode the guard holds the peer managers until its `Cancel` has
+/// passed their bridges: whoever releases the managers last aborts the
+/// bridges, which would lose a `Cancel` still queued there.
 #[cfg(feature = "transport")]
 struct SpawnAbortGuard {
     target: SpawnAbortTarget,
+    /// The Shared peer managers, released (and, if this is the last
+    /// reference, closed) only after the `Cancel` passed them.
+    managers: Option<
+        Arc<
+            std::collections::HashMap<
+                String,
+                crate::communication::shared_transport::SharedPeerManager,
+            >,
+        >,
+    >,
     dataflow_id: crate::dataflow::id::DataflowId,
     local_node_id: String,
     timeout: std::time::Duration,
@@ -613,7 +633,8 @@ impl SpawnAbortGuard {
         error
     }
 
-    /// The lifecycle coordinator now owns cancellation.
+    /// The lifecycle coordinator now owns cancellation, or the spawn was
+    /// refused because its id belongs to another run: send nothing.
     fn disarm(&mut self) {
         self.target = SpawnAbortTarget::Nobody;
     }
@@ -623,6 +644,7 @@ impl SpawnAbortGuard {
 impl Drop for SpawnAbortGuard {
     fn drop(&mut self) {
         let target = std::mem::replace(&mut self.target, SpawnAbortTarget::Nobody);
+        let managers = self.managers.take();
         if matches!(target, SpawnAbortTarget::Nobody) {
             return;
         }
@@ -668,11 +690,21 @@ impl Drop for SpawnAbortGuard {
                     }
                     SpawnAbortTarget::Nobody => {}
                 }
+                // The Cancel is queued on the managers' bridges: wait until
+                // each bridge has handed it to a connection writer before
+                // letting the managers go (the writers finish what they were
+                // handed, even once the managers are dropped).
+                if let Some(managers) = &managers {
+                    join_all(managers.values().map(|manager| manager.flush()).collect()).await;
+                }
             };
             let _ = tokio::time::timeout(timeout, notify).await;
             // Releasing the transport now lets a dedicated session flush the
             // Cancel (its writers drain their queues) and close.
             drop(target);
+            if let Some(managers) = managers {
+                crate::communication::shared_transport::release_managers(managers, timeout).await;
+            }
         });
     }
 }
@@ -732,6 +764,9 @@ struct SharedRegistrationCleanup {
         >,
     >,
     runtime_handle: tokio::runtime::Handle,
+    /// Bounds closing the managers if this cleanup releases the last
+    /// reference to them.
+    timeout: std::time::Duration,
 }
 
 #[cfg(feature = "transport")]
@@ -746,12 +781,14 @@ impl SharedRegistrationCleanup {
             >,
         >,
         runtime_handle: &tokio::runtime::Handle,
+        timeout: std::time::Duration,
     ) -> Self {
         Self {
             dataflow_id,
             token,
             peer_managers: Some(peer_managers),
             runtime_handle: runtime_handle.clone(),
+            timeout,
         }
     }
 
@@ -766,10 +803,15 @@ impl Drop for SharedRegistrationCleanup {
         if let Some(peer_managers) = self.peer_managers.take() {
             let dataflow_id = self.dataflow_id;
             let token = self.token;
+            let timeout = self.timeout;
             self.runtime_handle.spawn(async move {
                 for manager in peer_managers.values() {
                     manager.unregister_registration(&dataflow_id, token).await;
                 }
+                // The spawn's abort guard holds the managers until its Cancel
+                // passed them, so releasing them here never loses it.
+                crate::communication::shared_transport::release_managers(peer_managers, timeout)
+                    .await;
             });
         }
     }
@@ -1054,6 +1096,11 @@ impl RuntimeHandle {
         // Resolve the tokio runtime handle.
         let (tokio_handle, owned_runtime) = match config.tokio_mode {
             TokioMode::Create { worker_threads } => {
+                if worker_threads == 0 {
+                    return Err(Error::Runtime(RuntimeError::InvalidConfig(
+                        "TokioMode::Create needs at least one tokio worker thread".to_string(),
+                    )));
+                }
                 if tokio::runtime::Handle::try_current().is_ok() {
                     return Err(Error::Runtime(RuntimeError::InvalidConfig(
                         "TokioMode::Create cannot be used inside an existing tokio context \
@@ -2441,12 +2488,31 @@ impl RuntimeHandle {
                 // Dropping the connections closes them, which peers notice.
                 ClusterSpawnTransport::Dedicated { .. } => SpawnAbortTarget::Nobody,
             },
+            managers: match &transport_config {
+                ClusterSpawnTransport::Shared { peer_managers, .. } => {
+                    Some(Arc::clone(peer_managers))
+                }
+                ClusterSpawnTransport::Dedicated { .. } => None,
+            },
             dataflow_id,
             local_node_id: local_node_id.to_string(),
             timeout: handshake_timeout,
             runtime_handle: runtime_handle.clone(),
             reason: None,
         };
+        // A DataflowId identifies one run. If it is registered with a peer
+        // manager (a running dataflow) or already ran there, refuse the spawn
+        // before anything else can fail, and send nothing: under that id, a
+        // Cancel would reach the other run.
+        if let ClusterSpawnTransport::Shared { peer_managers, .. } = &transport_config {
+            if let Some(error) = peer_managers
+                .values()
+                .find_map(|manager| manager.id_unavailable(&dataflow_id))
+            {
+                abort_guard.disarm();
+                return Err(Error::Communication(error.into()));
+            }
+        }
         // `nodes` is public, so the topology may not have gone through
         // `multi_node`: reject duplicate node ids (which would create phantom
         // workers) and zero-worker nodes before anything indexes into them.
@@ -2770,6 +2836,7 @@ impl RuntimeHandle {
                     registration_token,
                     Arc::clone(&peer_managers),
                     runtime_handle,
+                    handshake_timeout,
                 ));
                 let registered = tokio::time::timeout(
                     handshake_timeout,
@@ -2784,7 +2851,14 @@ impl RuntimeHandle {
                 .await;
                 let mut session = match registered {
                     Ok(Ok(session)) => session,
-                    Ok(Err(e)) => return Err(Error::Communication(e.into())),
+                    Ok(Err(refused)) => {
+                        if refused.id_unavailable {
+                            // A concurrent spawn of the same id holds it now:
+                            // send nothing under it.
+                            abort_guard.disarm();
+                        }
+                        return Err(Error::Communication(refused.error.into()));
+                    }
                     Err(_) => {
                         return Err(Error::Communication(
                             crate::communication::transport::TransportError::Io(
@@ -3769,7 +3843,7 @@ impl SimpleRuntime {
         std::thread::Builder::new()
             .name(format!("dataflow-{}", name))
             .spawn(move || {
-                let result = executor.run();
+                let result = executor.run_contained();
                 notifier.complete(result);
             })
             .map_err(|e| {

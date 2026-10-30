@@ -1891,16 +1891,11 @@ impl ClusterLifecycle {
             // releasing it closes the connections. Wait (bounded) until what
             // we queued on them, such as our goodbye, our acknowledgements or
             // our Cancel, has been written: peers may still be waiting for it.
-            // (`into_inner`, unlike `try_unwrap`, hands the managers to
-            // exactly one of several dataflows releasing them at once.)
-            if let Some(owned) = Arc::into_inner(managers) {
-                let timeout = self.cancel_broadcast_timeout;
-                let mut closes = tokio::task::JoinSet::new();
-                for manager in owned.into_values() {
-                    closes.spawn(manager.close(timeout));
-                }
-                while closes.join_next().await.is_some() {}
-            }
+            crate::communication::shared_transport::release_managers(
+                managers,
+                self.cancel_broadcast_timeout,
+            )
+            .await;
         }
         self.progress_handles = None;
         self.dispatcher = None;

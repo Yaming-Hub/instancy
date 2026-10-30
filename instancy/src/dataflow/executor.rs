@@ -1681,6 +1681,35 @@ impl<T: Timestamp> DataflowExecutor<T> {
         result
     }
 
+    /// Like [`run`](Self::run), for an executor on a thread of its own
+    /// (`SimpleRuntime::spawn`): an operator panic stops the executor and is
+    /// returned as [`Error::OperatorPanic`], and siblings are told, as when
+    /// the executor runs on the pool (see its `Future` implementation).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn run_contained(&mut self) -> Result<bool> {
+        #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+        let _trace = crate::progress::trace::enter(&self.trace.recorder);
+        let result =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_loop())) {
+                Ok(result) => result,
+                Err(payload) => {
+                    self.wake_handle.clear_waker();
+                    let error = operator_panic_error(payload, Some(self.worker_index));
+                    traced! {
+                        self.trace_exit(None, Some(&error), true);
+                    }
+                    if let (Some(ctrl), Error::OperatorPanic { operator, .. }) =
+                        (self.control_sender.as_ref(), &error)
+                    {
+                        ctrl.broadcast_error(operator.clone(), error.to_string());
+                    }
+                    Err(error)
+                }
+            };
+        self.update_wall_time_metric();
+        result
+    }
+
     #[cfg(any(test, feature = "test-utils"))]
     fn run_loop(&mut self) -> Result<bool> {
         loop {

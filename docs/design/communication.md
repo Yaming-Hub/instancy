@@ -158,6 +158,12 @@ impl ConnectionManager for TcpConnectionManager {
 
 ### 6.3 Connection Pooling
 
+> **Current state:** `ConnectionPool` (`communication::connection`) is a
+> standalone utility; neither transport mode uses it. Shared mode keeps its
+> own fixed pool per peer (§6.3.1), and Dedicated mode takes connections the
+> application already established (`PeerConnection`). The scaling pool below
+> describes `ConnectionPool` only.
+
 The `ConnectionPool` is the library-internal component that manages established connections. It calls `ConnectionManager::establish()` when it needs a new connection and dynamically scales the number of connections per peer based on load.
 
 **Pool lifecycle:**
@@ -231,12 +237,11 @@ pub struct PoolConfig {
 - When load is low, idle connections above the minimum are reclaimed after `idle_timeout`.
 - The application's `ConnectionManager` is the single point of control for all connection establishment — the pool just tells it when to create or destroy connections.
 
-> **Design invariant: Factory is always required.** Both dedicated and shared
-> transport modes use the connection factory. In dedicated mode the pool
-> leases a connection exclusively to one dataflow and returns it on
-> completion. In shared mode connections are multiplexed across dataflows.
-> Either way, every connection is established through the same factory.
-> The library is **transport-agnostic** — `ConnectionFactory` returns
+> **Design invariant: the application establishes every connection.**
+> Shared mode establishes its connections through the application's
+> `ConnectionFactory`, and multiplexes them across dataflows. Dedicated mode
+> takes connections the application already established, one set per
+> dataflow. The library is **transport-agnostic** — `ConnectionFactory` returns
 > `(AsyncRead, AsyncWrite)` byte streams and works with any transport:
 > TCP, TLS, Unix sockets, named pipes, QUIC, etc. instancy ships a default
 > `TcpConnectionFactory` for plain TCP; applications that need other
@@ -321,7 +326,7 @@ A manager may carry thousands of dataflows. Its per-dataflow state is a registra
 
 A `DataflowId` identifies one run of a dataflow, as an execution-attempt id does in other distributed engines (Flink's `ExecutionAttemptID`, MapReduce's `TaskAttemptID`); timely never reuses a dataflow's identifier either. Frames carry only the `DataflowId`, and pooled connections outlive dataflows, so a run that reused the id of an earlier one could receive that run's late frames as its own: data, progress, a seal, an end-of-stream, numbered from 0 like its own, which is a wrong result no check would catch. A retry therefore needs a fresh `DataflowId`. Shared mode enforces this as far as it can:
 
-- each manager remembers the ids of the dataflows that unregistered (the most recent 16,384), and refuses to register one again (`TransportError::InvalidRegistration`): the spawn fails loudly, and its peers fail through its `Cancel` or the handshake timeout;
+- each manager remembers the ids of the dataflows that unregistered (the most recent 16,384), and refuses to register one again, or one that is registered already (`TransportError::InvalidRegistration`). The spawn is refused before anything else, and it sends nothing under the id: a `Cancel` would reach the run that owns it. A peer that did register the id freshly fails at its handshake timeout;
 - the late frames of a remembered id are dropped instead of being buffered for a registration;
 - the payload frames a dataflow queued before it unregistered carry its registration token, and the bridge drops them, so they are never numbered into another registration's lane; and a cleanup removes only its own registration.
 
@@ -477,13 +482,16 @@ An `operator_index` (usize) is only unique **within** a single dataflow's operat
 
 ### Connection factory is required
 
-The connection model has been unified around a required application-provided connection factory. Both dedicated and shared modes now acquire connections from the same pool, which gives both modes the same reconnection and reuse story.
+Shared mode acquires its connections from an application-provided connection factory. (Dedicated mode still takes pre-established connections: the Dedicated part of the design below was not adopted.)
 
 ## Design: Connection Factory Required
 
 > **Partly superseded:** Shared mode no longer scales its pool, redials in the
-> background or reports `ReorderTimeout`; it is fail-stop with a fixed pool and
-> pinned lanes (see §6.3.1). The factory requirement below still holds.
+> background or reports `ReorderTimeout`; it is fail-stop with a fixed pool of
+> `SharedConnectionConfig::connections` connections (filled by
+> `ensure_connections()` when a dataflow registers) and pinned lanes (see
+> §6.3.1). Dedicated mode still takes `PeerConnection`s. The factory
+> requirement for Shared mode still holds.
 
 **Item:** `connection-factory-required`
 **Priority:** P1

@@ -92,7 +92,7 @@ Runtime construction settings.
 
 Controls how instancy gets a Tokio runtime for async I/O and transport tasks.
 
-- `TokioMode::Create { worker_threads }` — create an owned Tokio runtime.
+- `TokioMode::Create { worker_threads }` — create an owned Tokio runtime (`worker_threads` at least 1).
 - `TokioMode::External(handle)` — reuse a caller-owned runtime.
 - `TokioMode::CurrentContext` — require an active Tokio context.
 - `TokioMode::Auto` — prefer the current Tokio runtime, otherwise create one.

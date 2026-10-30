@@ -1135,6 +1135,69 @@ impl Inner {
         }
         pending_control.take(dataflow_id);
     }
+
+    /// Why `dataflow_id` cannot be registered here: it is registered (by
+    /// another run) or it already ran here. `None` if the id is unknown.
+    fn id_unavailable(&self, state: &State, dataflow_id: &DataflowId) -> Option<TransportError> {
+        let peer = &self.peer_node_id;
+        let reason = if state.registered.contains_key(dataflow_id) {
+            format!("dataflow {dataflow_id} is already registered with peer {peer}")
+        } else if state.completed.contains(dataflow_id) {
+            format!(
+                "dataflow {dataflow_id} already ran with peer {peer}: a DataflowId \
+                 identifies one run, so a retry needs a fresh DataflowId"
+            )
+        } else {
+            return None;
+        };
+        Some(TransportError::InvalidRegistration { reason })
+    }
+}
+
+/// A refused [`SharedPeerManager::register`].
+#[derive(Debug)]
+pub(crate) struct RegisterError {
+    pub(crate) error: TransportError,
+    /// The id belongs to another run here (registered, or already ran): a
+    /// refused spawn must send nothing under it, which would reach that run.
+    pub(crate) id_unavailable: bool,
+}
+
+impl RegisterError {
+    fn id_unavailable(error: TransportError) -> Self {
+        Self {
+            error,
+            id_unavailable: true,
+        }
+    }
+}
+
+impl From<TransportError> for RegisterError {
+    fn from(error: TransportError) -> Self {
+        Self {
+            error,
+            id_unavailable: false,
+        }
+    }
+}
+
+/// Release a dataflow's or a spawn's reference to its peer managers. If it
+/// was the last one (per-job managers), close them: wait, bounded by
+/// `timeout`, until what was queued on them has been written to the
+/// connections, since peers may still be waiting for it. (`into_inner`,
+/// unlike `try_unwrap`, hands the managers to exactly one of several holders
+/// releasing them at once.)
+pub(crate) async fn release_managers(
+    managers: Arc<HashMap<String, SharedPeerManager>>,
+    timeout: Duration,
+) {
+    if let Some(owned) = Arc::into_inner(managers) {
+        let mut closes = tokio::task::JoinSet::new();
+        for manager in owned.into_values() {
+            closes.spawn(manager.close(timeout));
+        }
+        while closes.join_next().await.is_some() {}
+    }
 }
 
 /// A random registration token (see [`DataflowRegistration::token`]).
@@ -1423,11 +1486,13 @@ impl SharedPeerManager {
             Arc::new(AtomicBool::new(false)),
         )
         .await
+        .map_err(|refused| refused.error)
     }
 
     /// [`Self::register_dataflow`] with the registration's token (see
     /// [`Self::unregister_registration`]) and the flag that holds the
-    /// channels open until a read-side event was handed on.
+    /// channels open until a read-side event was handed on. A refusal says
+    /// whether the id belonged to another run (see [`RegisterError`]).
     #[allow(clippy::type_complexity)]
     pub(crate) async fn register(
         &self,
@@ -1441,40 +1506,26 @@ impl SharedPeerManager {
             HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>,
             tokio_mpsc::Receiver<PeerIoNotice>,
         ),
-        TransportError,
+        RegisterError,
     > {
         let invalid = |reason: String| TransportError::InvalidRegistration { reason };
         if channel_capacity == 0 {
-            return Err(invalid("channel capacity must be at least 1".into()));
+            return Err(invalid("channel capacity must be at least 1".into()).into());
         }
         let mut seen = HashSet::with_capacity(channel_ids.len());
         for &ch_id in channel_ids {
             if ch_id == PROBE_CHANNEL_ID {
                 return Err(invalid(format!(
                     "channel {PROBE_CHANNEL_ID} is reserved for connection probes"
-                )));
+                ))
+                .into());
             }
             if !seen.insert(ch_id) {
-                return Err(invalid(format!("channel {ch_id} registered twice")));
+                return Err(invalid(format!("channel {ch_id} registered twice")).into());
             }
         }
-        let peer = &self.inner.peer_node_id;
-        let unavailable = |state: &State| {
-            if state.registered.contains_key(&dataflow_id) {
-                Some(invalid(format!(
-                    "dataflow {dataflow_id} is already registered with peer {peer}"
-                )))
-            } else if state.completed.contains(&dataflow_id) {
-                Some(invalid(format!(
-                    "dataflow {dataflow_id} already ran with peer {peer}: a DataflowId \
-                     identifies one run, so a retry needs a fresh DataflowId"
-                )))
-            } else {
-                None
-            }
-        };
-        if let Some(error) = unavailable(&self.inner.state()) {
-            return Err(error);
+        if let Some(error) = self.id_unavailable(&dataflow_id) {
+            return Err(RegisterError::id_unavailable(error));
         }
 
         self.ensure_connections().await?;
@@ -1498,8 +1549,8 @@ impl SharedPeerManager {
         let mut state = self.inner.state();
         // Re-check: a concurrent registration of the same dataflow may have
         // completed (or finished) while connections were established.
-        if let Some(error) = unavailable(&state) {
-            return Err(error);
+        if let Some(error) = self.inner.id_unavailable(&state, &dataflow_id) {
+            return Err(RegisterError::id_unavailable(error));
         }
         let State {
             connections,
@@ -1521,7 +1572,8 @@ impl SharedPeerManager {
                     "no connection to peer {} survived registration",
                     self.inner.peer_node_id
                 ),
-            )));
+            ))
+            .into());
         };
         conn.pinned += 1;
         let mut reg = DataflowRegistration {
@@ -1655,6 +1707,13 @@ impl SharedPeerManager {
         self.inner.unregister(dataflow_id, Some(token));
     }
 
+    /// Why `dataflow_id` cannot be registered with this manager: it is
+    /// registered here (by another run) or already ran here. `None` if it can.
+    pub(crate) fn id_unavailable(&self, dataflow_id: &DataflowId) -> Option<TransportError> {
+        let state = self.inner.state();
+        self.inner.id_unavailable(&state, dataflow_id)
+    }
+
     /// A sender for `dataflow_id`'s payload frames (data and progress),
     /// bound to its current registration: frames it sends after that
     /// registration ends are dropped. `None` if the dataflow is not
@@ -1772,17 +1831,19 @@ impl SharedTransportSession {
             channel_capacity,
         )
         .await
+        .map_err(|refused| refused.error)
     }
 
     /// [`Self::new`] registering with `token` (see
-    /// [`SharedPeerManager::unregister_registration`]).
+    /// [`SharedPeerManager::unregister_registration`]). A refusal says whether
+    /// the id belonged to another run on some peer's manager.
     pub(crate) async fn with_token(
         dataflow_id: DataflowId,
         token: u64,
         peer_managers: &HashMap<String, SharedPeerManager>,
         channel_ids: &[u64],
         channel_capacity: usize,
-    ) -> Result<Self, TransportError> {
+    ) -> Result<Self, RegisterError> {
         let hold_channels = Arc::new(AtomicBool::new(false));
         let mut payload_senders = HashMap::new();
         let mut control_senders = HashMap::new();

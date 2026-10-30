@@ -566,7 +566,9 @@ the ack. It then detects the link loss (EOF on its connection) and still
 reports its own local result.
 Frames still waiting in a shared manager's bridge queue (not yet on a
 connection's writer queue) are lost when an application drops the last
-reference to that manager outside a dataflow's teardown. A peer that is
+reference to that manager outside a dataflow's teardown. (A failed
+`spawn_cluster` holds the managers until its `Cancel` has passed their
+bridges, so releasing per-job managers there loses nothing.) A peer that is
 partitioned but whose connection never fails is not detected: the dataflow
 waits until the connection fails or the application reports the node down
 (`report_node_leave`). If a `Cancel` broadcast times out (its control queue
@@ -675,10 +677,10 @@ tx.send(MembershipEvent::NodeJoined { node_id: "node-2".into(), logical_workers:
 
 When the runtime receives a `MembershipEvent::NodeJoined` event:
 
-1. **Clear "down" state**: If the node was previously marked as down, the peer registry clears it. This allows future `spawn_cluster` calls to include the node.
+1. **Clear "down" state**: If the node was previously marked as down, the peer registry clears it, so a later `spawn_cluster` that includes the node is no longer cancelled at once.
 2. **Connection on demand**: New connections to the node are established lazily — the connection pool calls `ConnectionManager` the first time a dataflow needs to communicate with the node.
-3. **Topology update**: The live `ClusterTopology` is updated with the new node. Already-running dataflows are **not** affected.
-4. **Worker assignment**: New logical worker indices are allocated for the joining node's workers in subsequent `spawn_cluster` calls.
+3. **Topology update**: The live `ClusterTopology` (`RuntimeHandle::current_topology()`) gains the node; a rejoin with a different worker count updates the node's count. Already-running dataflows are **not** affected.
+4. **Spawning on the new topology**: `spawn_cluster` runs on the topology passed to it, not on the live one. To include the new node, pass a topology that contains it, for example `current_topology()`. Worker indices follow node-id order, so adding a node can renumber the workers of the nodes that sort after it; every node of one dataflow must use the same topology (the handshake checks this).
 
 **Important**: Existing in-flight data is NOT migrated. Only new dataflows (or re-spawned dataflows) take advantage of the expanded topology. This ensures progress tracking remains consistent — a timestamp that has already been produced cannot change its routing.
 
@@ -692,11 +694,11 @@ When the runtime receives a `MembershipEvent::NodeLeft` event:
 
 #### Consistency Guarantees
 
-- **Progress safety**: A departed node's outstanding capabilities are treated as "released" — the frontier advances past any timestamps that only the lost node could produce. This is safe because no more data at those timestamps will arrive.
-- **At-most-once by default**: If a node fails mid-computation, records being processed by that node may be lost. Applications requiring exactly-once semantics must use the checkpoint/recovery mechanism.
+- **Progress safety**: A dataflow that loses a node is cancelled; it never completes. instancy does not release a departed node's capabilities, because records only that node held would be lost.
+- **No silent loss**: A dataflow that loses a node fails; it never reports success with records missing. instancy has no checkpointing: an application that needs the result re-runs the dataflow, with a fresh `DataflowId`.
 - **No split-brain**: The application is the single source of truth for cluster membership. The runtime trusts the membership events and does not perform its own consensus or health probing.
-- **Zero-worker events ignored**: `NodeJoined` events with `logical_workers == 0` are silently dropped.
-- **Idempotent**: Duplicate join events for an existing node or leave events for an unknown node are handled gracefully.
+- **Zero-worker events ignored**: `NodeJoined` events with `logical_workers == 0` are dropped (with a warning).
+- **Idempotent**: Duplicate join events for an existing node or leave events for an unknown node are handled gracefully. A repeated join with a different worker count updates the node's count.
 
 #### Example: Kubernetes Integration
 
