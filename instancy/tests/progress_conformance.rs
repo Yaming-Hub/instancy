@@ -495,8 +495,8 @@ const ERROR_SIGNATURES: &[(&str, &str)] = &[
     // The single-worker in-flight symmetry assertion (`subgraph.rs`): a
     // `-count` without a matching `+count`.
     ("went negative", "inflight-negative"),
-    // `SimpleRuntime`: a worker thread died (the same assertion; the panic
-    // message does not reach the error).
+    // A worker's executor stopped without reporting a result (an operator
+    // panic is reported as `OperatorPanic`, with its message).
     ("terminated unexpectedly", "worker-died"),
     // A cluster node's records reached a peer operator that had finished
     // (PR8's data-loss detection).

@@ -73,7 +73,6 @@ fn run(
 
 /// Control: record enters on worker 0 and leaves on worker 0 (even exit value).
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn control_loop_exit_on_entering_worker_completes() {
     let (join, all) = run(10);
     assert!(matches!(join, Ok(Ok(()))), "control: join={join:?}");
@@ -82,7 +81,6 @@ fn control_loop_exit_on_entering_worker_completes() {
 
 /// Record enters the loop on worker 0 and leaves it on worker 1 (odd exit value).
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn loop_exit_on_other_worker_never_converges() {
     let (join, all) = run(11);
     assert!(

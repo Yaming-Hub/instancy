@@ -106,7 +106,6 @@ fn run_multi(batch: Vec<u64>) -> (Vec<(u64, Vec<u64>)>, String) {
 /// Control: same dataflow and timing, but no slow record, so worker 1's `+n`
 /// is broadcast promptly — worker 0 produces the correct counts.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn control_multi_worker_without_slow_producer_is_correct() {
     let (d0, info) = run_multi(vec![0, 2]);
     assert_eq!(d0, vec![(1000, vec![2]), (2000, vec![1])], "{info}");
@@ -117,7 +116,6 @@ fn control_multi_worker_without_slow_producer_is_correct() {
 /// While worker 1 sleeps in "slow", worker 0's tracker sum is
 /// w1-input-cap(+1) + w0-notify-cap@1000(+1) + inflight(-2) == 0.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn multi_worker_transient_negative_inflight_completes_prematurely() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
@@ -158,7 +156,6 @@ fn multi_worker_transient_negative_inflight_completes_prematurely() {
 /// Same, two nodes over an in-memory transport: node B's progress for the
 /// batch it sent to node A is delayed by a slow operator in the same sweep.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn cluster_transient_negative_inflight_completes_prematurely() {
     let topology = ClusterTopology::multi_node(vec![
         NodeConfig::new("node-a", 1),

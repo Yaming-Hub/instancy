@@ -403,6 +403,30 @@ async fn shutdown_async_waits_for_every_in_flight_dataflow() {
 }
 
 // ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+/// An owned tokio runtime with no worker threads is a configuration error,
+/// reported as one instead of a panic inside tokio.
+#[test]
+fn owned_tokio_runtime_with_zero_threads_is_an_error_not_a_panic() {
+    let result = std::panic::catch_unwind(|| {
+        RuntimeHandle::new(RuntimeConfig {
+            tokio_mode: instancy::runtime::TokioMode::Create { worker_threads: 0 },
+            ..RuntimeConfig::default()
+        })
+        .map(drop)
+    });
+    match result {
+        Ok(Err(Error::Runtime(instancy::RuntimeError::InvalidConfig(message)))) => {
+            assert!(message.contains("worker thread"), "{message}");
+        }
+        Ok(other) => panic!("expected an InvalidConfig error, got {other:?}"),
+        Err(_) => panic!("RuntimeHandle::new panicked"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // External cancellation token bridge
 // ---------------------------------------------------------------------------
 
@@ -919,10 +943,10 @@ mod cluster {
         sa.send(0, vec![1, 2, 3]).unwrap();
         sb.send(0, vec![4, 5, 6]).unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
-        // Hold node A's completion unresolved until node B stops: resolving it
-        // tears node A's bridges down, which races the cancellation message to
-        // node B (cluster teardown ordering is out of scope here).
-        let completion_a = a.join().unwrap();
+        // Node A's completion is polled while its runtime drops: resolving it
+        // tears node A's bridges down, which must not race the cancellation
+        // message to node B.
+        let completion_a = tokio::spawn(a.join().unwrap());
 
         let rt_a = nodes.rt_a;
         tokio::task::spawn_blocking(move || drop(rt_a))
@@ -940,7 +964,8 @@ mod cluster {
             .unwrap_or_else(|_| panic!("{transport:?}: node-b kept running"));
         let ra = tokio::time::timeout(TIMEOUT, completion_a)
             .await
-            .unwrap_or_else(|_| panic!("{transport:?}: node-a completion never resolved"));
+            .unwrap_or_else(|_| panic!("{transport:?}: node-a completion never resolved"))
+            .expect("node-a completion task");
         assert!(
             is_runtime_shutdown(&ra),
             "{transport:?}: node-a should report RuntimeShutdown, got {ra:?}"

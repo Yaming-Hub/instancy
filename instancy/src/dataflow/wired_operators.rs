@@ -1080,6 +1080,51 @@ pub(crate) mod tests {
         )
     }
 
+    fn is_record_after_shutdown(error: &Error) -> bool {
+        matches!(
+            error,
+            Error::Progress(crate::error::ProgressError::RecordAfterShutdown { .. })
+        )
+    }
+
+    /// A record that reaches an operator after it shut down fails the worker
+    /// instead of being dropped: on the operator's next activation, and in
+    /// the check the decision module makes before reporting success.
+    #[test]
+    fn record_reaching_a_shut_down_operator_is_an_error() {
+        let ch_in = make_channel::<u64, i32>();
+        let ch_out = make_channel::<u64, i32>();
+        let mut push_in = ch_in.pusher;
+        let mut op = unary(
+            "shut-down",
+            1,
+            StageId::new(0),
+            |input: &mut InputHandle<u64, i32>, output: &mut OutputHandle<u64, i32>| {
+                while let Some((time, data)) = input.next() {
+                    output.push_vec(time, data);
+                }
+                Ok(())
+            },
+            input(ch_in.puller),
+            output(ch_out.pusher),
+        );
+        // Its input frontier empties: the final call, then it may shut down.
+        op.update_port_frontier(0, &Antichain::<u64>::new());
+        op.activate().unwrap();
+        assert!(op.can_shut_down());
+        op.shut_down();
+        assert!(op.check_after_shutdown().is_ok(), "nothing has arrived yet");
+        assert_eq!(op.activate().unwrap(), ActivationOutcome::Done);
+
+        push_in.push(Envelope::data(0, vec![1])).unwrap();
+        let error = op.activate().unwrap_err();
+        assert!(is_record_after_shutdown(&error), "{error}");
+
+        push_in.push(Envelope::data(0, vec![2])).unwrap();
+        let error = op.check_after_shutdown().unwrap_err();
+        assert!(is_record_after_shutdown(&error), "{error}");
+    }
+
     #[test]
     fn output_before_the_consumed_time_is_rejected() {
         let ch_in = make_channel::<u64, i32>();

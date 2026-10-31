@@ -151,7 +151,17 @@ async fn spawn(
     managers_a: &Managers,
     managers_b: &Managers,
 ) -> Run {
-    let (a, b) = spawn_both(DataflowId::new(), rt_a, rt_b, managers_a, managers_b).await;
+    spawn_id(DataflowId::new(), rt_a, rt_b, managers_a, managers_b).await
+}
+
+async fn spawn_id(
+    df: DataflowId,
+    rt_a: &RuntimeHandle,
+    rt_b: &RuntimeHandle,
+    managers_a: &Managers,
+    managers_b: &Managers,
+) -> Run {
+    let (a, b) = spawn_both(df, rt_a, rt_b, managers_a, managers_b).await;
     let (mut a, mut b) = (a.unwrap(), b.unwrap());
     let out_a = a.take_output::<u64>(0, "results").unwrap();
     let out_b = b.take_output::<u64>(0, "results").unwrap();
@@ -496,4 +506,268 @@ async fn reusing_a_finished_dataflow_id_fails_the_spawn_loudly() {
     let (ra, rb, got) = retry.finish().await;
     assert!(ra.is_ok() && rb.is_ok(), "a={ra:?} b={rb:?}");
     assert_eq!(got, (0..10).collect::<Vec<_>>());
+}
+
+/// Spawn dataflow `df` on node-a only, with `build`; bounded.
+async fn spawn_a<F>(
+    df: DataflowId,
+    rt_a: &RuntimeHandle,
+    managers_a: &Managers,
+    build: F,
+) -> Spawned
+where
+    F: Fn(&mut DataflowBuilder<u64>) -> Result<()> + Send + 'static,
+{
+    let handle = tokio::runtime::Handle::current();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        rt_a.spawn_cluster_async(
+            "spawn-failure",
+            topology(),
+            "node-a",
+            df,
+            ClusterSpawnTransport::shared(managers_a.clone(), 1024),
+            Duration::from_secs(10),
+            build,
+            &handle,
+            SpawnOptions::new(),
+        ),
+    )
+    .await
+    .expect("HANG: a refused spawn took longer than 5 s")
+}
+
+/// A spawn refused because its `DataflowId` is registered here already (a
+/// duplicate of a running dataflow) sends nothing under the id: the running
+/// dataflow is not cancelled, on either node, and finishes with every record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_refused_duplicate_spawn_leaves_the_running_dataflow_alone() {
+    let (_broker, managers_a, managers_b) = brokered(1);
+    let (rt_a, rt_b) = (runtime(), runtime());
+    let df = DataflowId::new();
+    let run = spawn_id(df, &rt_a, &rt_b, &managers_a, &managers_b).await;
+    assert!(run.feed(0, (0..10).collect()));
+    match spawn_a(df, &rt_a, &managers_a, build).await {
+        Err(e) => assert!(e.to_string().contains("already registered"), "{e}"),
+        Ok(_) => panic!("a duplicate of a running DataflowId was accepted"),
+    }
+    // A Cancel sent under the id would have reached node-b's run by now.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        run.feed(1, (10..20).collect()),
+        "the running dataflow failed"
+    );
+    let (ra, rb, got) = run.finish().await;
+    assert!(ra.is_ok() && rb.is_ok(), "a={ra:?} b={rb:?}");
+    assert_eq!(got, (0..20).collect::<Vec<_>>());
+}
+
+/// A retry that reused an id: node-a's run of it has finished (its manager
+/// remembers the id), while node-b still has it registered (that run's last
+/// sweep). Spawning the id again on node-a is refused and sends nothing
+/// under it: node-b's registration receives no control frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_reuse_sends_nothing_under_the_id() {
+    use instancy::communication::transport_session::CONTROL_CHANNEL_ID;
+
+    let (_broker, managers_a, managers_b) = brokered(1);
+    let rt_a = runtime();
+    let df = DataflowId::new();
+    let (mut b_channels, _b_events) = managers_b["node-a"]
+        .register_dataflow(df, &[1], 4)
+        .await
+        .unwrap();
+    drop(
+        managers_a["node-b"]
+            .register_dataflow(df, &[1], 4)
+            .await
+            .unwrap(),
+    );
+    managers_a["node-b"].unregister_dataflow(&df).await;
+    match spawn_a(df, &rt_a, &managers_a, build).await {
+        Err(e) => assert!(e.to_string().contains("fresh DataflowId"), "{e}"),
+        Ok(_) => panic!("a finished DataflowId was accepted again"),
+    }
+    let control = b_channels.get_mut(&CONTROL_CHANNEL_ID).unwrap();
+    let received = tokio::time::timeout(Duration::from_millis(500), control.recv()).await;
+    assert!(
+        received.is_err(),
+        "node-b's registration of the id received a control frame: {received:?}"
+    );
+}
+
+fn failing_build(_b: &mut DataflowBuilder<u64>) -> Result<()> {
+    Err(instancy::Error::Runtime(
+        instancy::RuntimeError::InvalidConfig("deliberate build failure".into()),
+    ))
+}
+
+/// A spawn that fails on node-a (its dataflow does not build) fails that
+/// dataflow on node-b promptly, and nothing else: another dataflow running
+/// on the same managers keeps running and finishes with every record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_failed_spawn_leaves_other_dataflows_on_the_managers_running() {
+    let (_broker, managers_a, managers_b) = brokered(1);
+    let (rt_a, rt_b) = (runtime(), runtime());
+    let run = spawn(&rt_a, &rt_b, &managers_a, &managers_b).await;
+    assert!(run.feed(0, (0..10).collect()));
+    let df = DataflowId::new();
+    let handle = tokio::runtime::Handle::current();
+    let started = std::time::Instant::now();
+    let (a, b) = tokio::join!(
+        rt_a.spawn_cluster_async(
+            "spawn-failure",
+            topology(),
+            "node-a",
+            df,
+            ClusterSpawnTransport::shared(managers_a.clone(), 1024),
+            Duration::from_secs(10),
+            failing_build,
+            &handle,
+            SpawnOptions::new(),
+        ),
+        rt_b.spawn_cluster_async(
+            "spawn-failure",
+            topology(),
+            "node-b",
+            df,
+            ClusterSpawnTransport::shared(managers_b.clone(), 1024),
+            Duration::from_secs(10),
+            build,
+            &handle,
+            SpawnOptions::new(),
+        ),
+    );
+    let took = started.elapsed();
+    assert!(a.is_err(), "precondition");
+    assert!(
+        b.is_err() && took < Duration::from_secs(5),
+        "node-b's spawn must fail promptly (took {took:?}): {:?}",
+        b.as_ref().map(|_| ())
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(run.feed(1, (10..20).collect()), "the other dataflow failed");
+    let (ra, rb, got) = run.finish().await;
+    assert!(ra.is_ok() && rb.is_ok(), "a={ra:?} b={rb:?}");
+    assert_eq!(got, (0..20).collect::<Vec<_>>());
+}
+
+/// A build closure for node-a held at its first call until released (the
+/// spawn has claimed its id by then), which then builds normally or fails.
+#[allow(clippy::type_complexity)]
+fn held_build(
+    fail: bool,
+) -> (
+    impl Fn(&mut DataflowBuilder<u64>) -> Result<()> + Send + 'static,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let gate = Mutex::new(Some((entered_tx, release_rx)));
+    let closure = move |b: &mut DataflowBuilder<u64>| -> Result<()> {
+        if let Some((entered, release)) = gate.lock().unwrap().take() {
+            entered.send(()).unwrap();
+            release.recv_timeout(BOUND).unwrap();
+        }
+        if fail { failing_build(b) } else { build(b) }
+    };
+    (closure, entered_rx, release_tx)
+}
+
+/// Spawn `df` on `node` from a blocking thread (its build closure may block).
+fn spawn_blocking_on(
+    rt: RuntimeHandle,
+    node: &'static str,
+    df: DataflowId,
+    managers: &Managers,
+    build: impl Fn(&mut DataflowBuilder<u64>) -> Result<()> + Send + 'static,
+) -> tokio::task::JoinHandle<(RuntimeHandle, Spawned)> {
+    let handle = tokio::runtime::Handle::current();
+    let managers = managers.clone();
+    tokio::task::spawn_blocking(move || {
+        let spawned = rt.spawn_cluster(
+            "owner",
+            topology(),
+            node,
+            df,
+            ClusterSpawnTransport::shared(managers, 1024),
+            Duration::from_secs(10),
+            build,
+            &handle,
+            SpawnOptions::new(),
+        );
+        (rt, spawned)
+    })
+}
+
+/// Two spawns of one id on node-a: the first claims the id before its build
+/// closure runs, and owns it. The second, started while the first is held in
+/// its build closure, is refused and sends nothing: the first then runs with
+/// node-b and finishes with every record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_spawn_refused_while_another_holds_the_id_leaves_the_owner_alone() {
+    let (_broker, managers_a, managers_b) = brokered(1);
+    let df = DataflowId::new();
+    let (held, entered, release) = held_build(false);
+    let owner = spawn_blocking_on(runtime(), "node-a", df, &managers_a, held);
+    let peer = spawn_blocking_on(runtime(), "node-b", df, &managers_b, build);
+    tokio::task::spawn_blocking(move || entered.recv_timeout(BOUND))
+        .await
+        .unwrap()
+        .expect("the owner never reached its build closure");
+    let rt_second = runtime();
+    match spawn_a(df, &rt_second, &managers_a, build).await {
+        Err(e) => assert!(e.to_string().contains("already registered"), "{e}"),
+        Ok(_) => panic!("a second spawn of a claimed id was accepted"),
+    }
+    release.send(()).unwrap();
+    let ((_rt_a, a), (_rt_b, b)) = (owner.await.unwrap(), peer.await.unwrap());
+    let (mut a, mut b) = (a.expect("owner"), b.expect("node-b"));
+    drop(b.take_input::<u64>(0, "data").unwrap());
+    let run = Run {
+        out_a: a.take_output::<u64>(0, "results").unwrap(),
+        out_b: b.take_output::<u64>(0, "results").unwrap(),
+        input: a.take_input::<u64>(0, "data").unwrap(),
+        a,
+        b,
+    };
+    assert!(run.feed(0, (0..10).collect()));
+    let (ra, rb, got) = run.finish().await;
+    assert!(ra.is_ok() && rb.is_ok(), "a={ra:?} b={rb:?}");
+    assert_eq!(got, (0..10).collect::<Vec<_>>());
+}
+
+/// The owner of an id that fails after claiming it (its build fails) still
+/// tells its peers, and retires the id: node-b fails promptly with the
+/// owner's `Cancel`, and the id cannot be spawned again on node-a.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_owner_that_fails_after_claiming_tells_its_peers_and_retires_the_id() {
+    let (_broker, managers_a, managers_b) = brokered(1);
+    let df = DataflowId::new();
+    let (held, entered, release) = held_build(true);
+    let owner = spawn_blocking_on(runtime(), "node-a", df, &managers_a, held);
+    let peer = spawn_blocking_on(runtime(), "node-b", df, &managers_b, build);
+    tokio::task::spawn_blocking(move || entered.recv_timeout(BOUND))
+        .await
+        .unwrap()
+        .expect("the owner never reached its build closure");
+    let released = std::time::Instant::now();
+    release.send(()).unwrap();
+    let ((_rt_a, a), (_rt_b, b)) = (owner.await.unwrap(), peer.await.unwrap());
+    let took = released.elapsed();
+    assert!(a.is_err(), "precondition: the owner's build fails");
+    match &b {
+        Err(e) => assert!(e.to_string().contains("deliberate build failure"), "{e}"),
+        Ok(_) => panic!("node-b ran without node-a"),
+    }
+    assert!(
+        took < Duration::from_secs(5),
+        "node-b took {took:?} to fail (its handshake timeout is 10 s)"
+    );
+    let rt_retry = runtime();
+    match spawn_a(df, &rt_retry, &managers_a, build).await {
+        Err(e) => assert!(e.to_string().contains("fresh DataflowId"), "{e}"),
+        Ok(_) => panic!("a failed run's DataflowId was accepted again"),
+    }
 }

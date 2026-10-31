@@ -4,6 +4,8 @@
 [profile.ci]
 # A test that fails once has failed.
 retries = 0
+# Run every test even after a failure, so one run shows all of them.
+fail-fast = false
 # As many at a time as `cargo test --test-threads=4` ran before.
 test-threads = 4
 # A test still running after 120 s (4 periods of 30 s) is terminated and fails.
@@ -19,7 +21,9 @@ filter = 'binary(=cluster_teardown_adversarial) & test(=writer_only_failure_neve
 slow-timeout = { period = "30s", terminate-after = 6 }
 
 # Tests that open TCP connections: whole binaries where helper-based TCP
-# use is mixed with local tests, plus the library's transport tests.
+# use is mixed with local tests, plus the library's transport tests. The
+# audit repros join the group too: several open TCP connections, and the
+# timing-sensitive ones need the CPU (two at a time, as they always ran).
 [[profile.ci.overrides]]
-filter = 'binary(/^cluster/) | binary(/^(parallel_cluster_tcp|probe_cluster|inter_process|parallel_dataflows|operator_panic|output_receiver_drop|port_take_mode_mismatch|runtime_lifecycle|trace_recorder|seals|shared_transport_reliability|transport_frame_integrity|progress_conformance)$/) | (kind(lib) & test(/cluster|tcp|shared_transport|peer_link|interprocess|network_progress/)) | (kind(lib) & test(=communication::transport_session::tests::dropped_session_keeps_reading_so_its_last_frames_survive))'
+filter = 'binary(/^cluster/) | binary(/^(parallel_cluster_tcp|probe_cluster|inter_process|parallel_dataflows|operator_panic|output_receiver_drop|port_take_mode_mismatch|runtime_lifecycle|trace_recorder|seals|shared_transport_reliability|transport_frame_integrity|progress_conformance|audit_repros)$/) | (kind(lib) & test(/cluster|tcp|shared_transport|peer_link|interprocess|network_progress/)) | (kind(lib) & test(=communication::transport_session::tests::dropped_session_keeps_reading_so_its_last_frames_survive))'
 test-group = 'tcp-cluster'

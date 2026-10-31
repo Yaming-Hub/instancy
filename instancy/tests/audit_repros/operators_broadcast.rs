@@ -81,20 +81,17 @@ fn broadcast_then_count_emits_before_close(workers: usize) {
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn broadcast_then_count_emits_before_close_1_worker() {
     broadcast_then_count_emits_before_close(1);
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn broadcast_then_count_emits_before_close_2_workers() {
     broadcast_then_count_emits_before_close(2);
 }
 
 /// Control: same shape with `exchange` instead of `broadcast` (expected to pass).
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn exchange_then_count_emits_before_close_2_workers() {
     let rt = rt();
     let mut multi = rt
@@ -186,7 +183,6 @@ fn inputs(workers: usize) -> (Vec<Vec<(u64, Vec<u64>)>>, Vec<(u64, u64)>) {
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn broadcast_every_record_to_every_worker_exactly_once() {
     for workers in [2usize, 3, 4] {
         let (per, all) = inputs(workers);
@@ -206,7 +202,6 @@ fn broadcast_every_record_to_every_worker_exactly_once() {
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn rebalance_and_gather_lose_nothing() {
     for workers in [2usize, 3, 4] {
         let (per, all) = inputs(workers);
@@ -292,13 +287,11 @@ fn unary_async_then_exchange(with_map: bool) {
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn unary_async_then_exchange_loses_nothing() {
     unary_async_then_exchange(false);
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn unary_async_map_then_exchange_loses_nothing() {
     unary_async_then_exchange(true);
 }
@@ -306,7 +299,6 @@ fn unary_async_map_then_exchange_loses_nothing() {
 /// Per-key aggregation after exchange directly from an input (no map in
 /// between) in a multi-worker dataflow: counts per epoch must be exact.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn input_exchange_count_is_exact_per_epoch() {
     let workers = 3;
     let (per, all) = inputs(workers);
@@ -364,7 +356,6 @@ fn input_exchange_count_is_exact_per_epoch() {
 /// In-process control for the cluster backpressure test: 2 workers, 3000
 /// batches each holding records for both workers.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn exchange_high_volume_in_process_exactly_once() {
     let mut per = vec![Vec::new(), Vec::new()];
     let mut all = Vec::new();

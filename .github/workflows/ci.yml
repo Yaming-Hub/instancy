@@ -71,13 +71,6 @@ jobs:
         run: cargo nextest run -p instancy --all-features --lib --tests --profile ci --no-tests fail
       - name: Doc tests
         run: cargo test -p instancy --doc --all-features
-      # Every audit repro must pass. Each runs in its own child process with
-      # a 120 s timeout; two at a time, as more oversubscribe the runner.
-      - name: Audit repros
-        run: cargo test -p instancy --all-features --test audit_repros -- --ignored --exact audit_repros_match_table --nocapture
-        env:
-          AUDIT_REPROS_JOBS: 2
-          AUDIT_REPROS_REPORT: 1
       - name: Upload progress traces
         if: failure()
         uses: actions/upload-artifact@v4

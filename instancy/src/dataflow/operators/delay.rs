@@ -1,8 +1,8 @@
 //! Delay operator — time-based buffering.
 //!
 //! The `delay` operator reassigns timestamps on records and buffers them
-//! until the frontier advances past their original timestamp. This enables
-//! windowing, aggregation, and time-shifting patterns.
+//! until the frontier advances past their new (output) timestamp. This
+//! enables windowing, aggregation, and time-shifting patterns.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -17,8 +17,8 @@ use crate::progress::timestamp::Timestamp;
 
 /// A registered delay operator.
 ///
-/// Buffers data and releases it when the frontier advances past the
-/// original timestamp. Each record's output timestamp is determined
+/// Buffers data and releases it when the frontier advances past its
+/// output timestamp. Each record's output timestamp is determined
 /// by a user-provided delay function.
 pub struct DelayOperator<T: Timestamp, D, F> {
     /// Human-readable name.

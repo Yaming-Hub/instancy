@@ -209,13 +209,11 @@ async fn scenario(hold: bool) -> Vec<(u64, Vec<u64>)> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn control_startup_without_payload_delay() {
     assert_eq!(scenario(false).await, vec![(5, vec![3])]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn premature_notification_before_peer_initial_capabilities_arrive() {
     assert_eq!(
         scenario(true).await,

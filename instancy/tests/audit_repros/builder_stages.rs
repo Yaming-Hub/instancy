@@ -25,7 +25,6 @@ fn join_with_timeout(multi: instancy::runtime::MultiSpawnedDataflow<u64>) -> ins
 /// only wires intra-stage edges and cross-stage *exchange* edges, so this edge is
 /// never materialized: everything routed through `a` is silently dropped.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn audit_builder_cross_stage_pipeline_edge_drops_data() {
     let sink: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
     let rt = rt();
@@ -70,7 +69,6 @@ fn audit_builder_cross_stage_pipeline_edge_drops_data() {
 /// whose stage has a different parallelism. The stage-0 -> binary pipeline
 /// edge is not wired in the staged path.
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn audit_builder_cross_stage_binary_input_missing() {
     let sink: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
     let rt = rt();

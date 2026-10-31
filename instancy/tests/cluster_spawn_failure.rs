@@ -159,6 +159,46 @@ fn spawn_error(result: &Result<ClusterSpawnedDataflow<u64>>) -> Option<&Handshak
     }
 }
 
+/// Spawn `node` in Shared mode with per-job managers: nothing but the spawn
+/// holds them, so they are released with it.
+fn spawn_per_job<F>(
+    mesh: &mut FaultMesh,
+    topology: ClusterTopology,
+    node: &str,
+    id: DataflowId,
+    handshake_timeout: Duration,
+    build: F,
+) -> tokio::task::JoinHandle<Spawned>
+where
+    F: Fn(&mut DataflowBuilder<u64>) -> Result<()> + Send + 'static,
+{
+    let handle = tokio::runtime::Handle::current();
+    let node = node.to_string();
+    let managers = mesh.managers(&node);
+    tokio::task::spawn_blocking(move || {
+        let rt = runtime(2);
+        let start = Instant::now();
+        let r = rt.spawn_cluster(
+            "spawn-failure",
+            topology,
+            &node,
+            id,
+            ClusterSpawnTransport::shared(managers, 1024),
+            handshake_timeout,
+            build,
+            &handle,
+            SpawnOptions::new(),
+        );
+        (rt, r, start.elapsed())
+    })
+}
+
+fn failing_build(_b: &mut DataflowBuilder<u64>) -> Result<()> {
+    Err(Error::Runtime(RuntimeError::InvalidConfig(
+        "deliberate build failure".into(),
+    )))
+}
+
 /// node-b fails its ready barrier (short timeout) after sending its own
 /// `Ready`; node-a, slow to materialize, receives that `Ready`. node-a must
 /// not run without node-b: it fails to spawn, or its dataflow fails.
@@ -330,6 +370,159 @@ async fn failed_build_on_one_node_fails_peers_promptly() {
         );
         drop_runtimes(vec![rt_a, rt_b]).await;
         drop(managers);
+    }
+}
+
+/// `failed_build_on_one_node_fails_peers_promptly` in Shared mode, with
+/// node-a's managers per-job: its failed spawn holds the only reference to
+/// them, so releasing them must not lose the `Cancel` it queued on them.
+/// node-b (long handshake timeout) fails promptly in every round. Control:
+/// the same with node-a's managers retained.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn failed_build_with_per_job_managers_fails_peers_promptly() {
+    for retained in [false, true] {
+        for round in 0..10 {
+            let names = ["node-a", "node-b"];
+            let mut mesh = FaultMesh::new(&names, 2, true);
+            let mut managers = Vec::new();
+            let id = DataflowId::new();
+            let topo = topology(&names);
+            let ha = if retained {
+                spawn(
+                    &mut mesh,
+                    Mode::Shared,
+                    &mut managers,
+                    topo.clone(),
+                    "node-a",
+                    id,
+                    Duration::from_secs(10),
+                    failing_build,
+                )
+            } else {
+                spawn_per_job(
+                    &mut mesh,
+                    topo.clone(),
+                    "node-a",
+                    id,
+                    Duration::from_secs(10),
+                    failing_build,
+                )
+            };
+            let hb = spawn(
+                &mut mesh,
+                Mode::Shared,
+                &mut managers,
+                topo,
+                "node-b",
+                id,
+                Duration::from_secs(10),
+                slow_build(0),
+            );
+            let ((rt_a, ra, _), (rt_b, rb, b_took)) = (ha.await.unwrap(), hb.await.unwrap());
+            assert!(ra.is_err(), "precondition");
+            let what = format!("retained={retained} round {round}");
+            assert!(
+                rb.is_err() && b_took < Duration::from_secs(5),
+                "{what}: node-b waited {b_took:?} (handshake timeout is 10 s): {:?}",
+                rb.as_ref().map(|_| ())
+            );
+            if retained {
+                assert!(
+                    matches!(
+                        spawn_error(&rb),
+                        Some(
+                            HandshakeError::PeerCancelled { .. }
+                                | HandshakeError::PeerDisconnected { .. }
+                        )
+                    ),
+                    "{what}: node-b must learn that node-a failed: {:?}",
+                    rb.as_ref().map(|_| ())
+                );
+            }
+            drop_runtimes(vec![rt_a, rt_b]).await;
+            drop(managers);
+        }
+    }
+}
+
+/// node-a's ready barrier times out after its handshake (node-b is slow to
+/// materialize), with node-a's managers per-job: its `Cancel` goes through
+/// the dataflow's transport, and releasing the managers must not lose it.
+/// node-b must fail (at spawn, or its run) without waiting for its own 10 s
+/// timeout. Control: node-a's managers retained.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn barrier_failure_with_per_job_managers_fails_the_peer_promptly() {
+    for retained in [false, true] {
+        for round in 0..5 {
+            let names = ["node-a", "node-b"];
+            let mut mesh = FaultMesh::new(&names, 2, true);
+            let mut managers = Vec::new();
+            let id = DataflowId::new();
+            let topo = topology(&names);
+            let started = Instant::now();
+            let ha = if retained {
+                spawn(
+                    &mut mesh,
+                    Mode::Shared,
+                    &mut managers,
+                    topo.clone(),
+                    "node-a",
+                    id,
+                    Duration::from_millis(300),
+                    slow_build(0),
+                )
+            } else {
+                spawn_per_job(
+                    &mut mesh,
+                    topo.clone(),
+                    "node-a",
+                    id,
+                    Duration::from_millis(300),
+                    slow_build(0),
+                )
+            };
+            let hb = spawn(
+                &mut mesh,
+                Mode::Shared,
+                &mut managers,
+                topo,
+                "node-b",
+                id,
+                Duration::from_secs(10),
+                slow_build(1500),
+            );
+            let ((rt_a, ra, _), (rt_b, rb, _)) = (ha.await.unwrap(), hb.await.unwrap());
+            let what = format!("retained={retained} round {round}");
+            assert!(
+                ra.is_err(),
+                "{what}: precondition: node-a's barrier times out"
+            );
+            let outcome = match rb {
+                Err(_) => None,
+                Ok(mut cb) => {
+                    let _ob = cb.take_output::<u64>(0, "out").unwrap();
+                    Some(
+                        join_with_timeout(cb, Duration::from_secs(10))
+                            .await
+                            .unwrap(),
+                    )
+                }
+            };
+            let took = started.elapsed();
+            if let Some(jb) = &outcome {
+                assert!(
+                    matches!(jb, Some(Err(_))),
+                    "{what}: node-a never ran, so node-b must fail: {}",
+                    fmt_join(jb)
+                );
+            }
+            assert!(
+                took < Duration::from_secs(6),
+                "{what}: node-b took {took:?} to fail (its timeout is 10 s)"
+            );
+            drop_runtimes(vec![rt_a, rt_b]).await;
+            drop(managers);
+        }
     }
 }
 

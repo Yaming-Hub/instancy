@@ -85,7 +85,6 @@ fn expected() -> Vec<u64> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn two_exchanges_from_one_output_single_worker() {
     let (o1, o2) = run(1).await;
     assert_eq!(o1, expected());
@@ -93,7 +92,6 @@ async fn two_exchanges_from_one_output_single_worker() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn two_exchanges_from_one_output_two_workers() {
     let (o1, o2) = run(2).await;
     assert_eq!(o1, expected());

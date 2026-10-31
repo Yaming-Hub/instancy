@@ -136,7 +136,7 @@ let mut cluster_handle = rt.spawn_cluster(
 
 **Key points:**
 - Every node must call `spawn_cluster` with the same `DataflowId` concurrently
-- A `DataflowId` identifies one run: a retry uses a fresh `DataflowId::new()` (Shared mode rejects an id that already ran with a peer, because the earlier run's late frames could otherwise be taken for the new run's)
+- A `DataflowId` identifies one run: a retry uses a fresh `DataflowId::new()` (Shared mode rejects an id that already ran with a peer, or is running, because the earlier run's late frames could otherwise be taken for the new run's; the refused spawn sends nothing under that id, so it never disturbs the run that owns it)
 - The library performs a handshake to verify all nodes agree on the dataflow structure
 - Exchange operators automatically route data across nodes via the connections
 - `SpawnOptions` controls observability, cancellation, I/O mode, and priority

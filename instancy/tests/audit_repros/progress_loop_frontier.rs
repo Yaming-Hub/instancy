@@ -135,7 +135,6 @@ fn run(slow: bool) -> (Vec<(u64, u64)>, Vec<String>) {
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn loop_downstream_notification_fires_once_with_full_count() {
     let (recs, obs) = run(false);
     eprintln!("records: {recs:?}\nobs: {obs:?}");
@@ -147,7 +146,6 @@ fn loop_downstream_notification_fires_once_with_full_count() {
 }
 
 #[test]
-#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn loop_downstream_notification_fires_once_with_full_count_slow_body() {
     let (recs, obs) = run(true);
     eprintln!("records: {recs:?}\nobs: {obs:?}");

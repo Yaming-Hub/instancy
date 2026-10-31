@@ -1703,7 +1703,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ///
     /// # Example
     /// ```ignore
-    /// // Delay each item to the next 10-second window based on its value
+    /// // High-priority items keep their time; the rest move 10 units later
     /// let windowed = stream.delay("window", |t, item| {
     ///     if item.priority > 5 { *t } else { *t + 10 }
     /// });
@@ -1748,7 +1748,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// this fails the operator with an error.
     ///
     /// # Use cases
-    /// - **Fixed windowing**: `delay_batch("window", |t| t / 10 * 10)` groups into 10-unit windows
+    /// - **Fixed windowing**: `delay_batch("window", |t| (t / 10 + 1) * 10)` groups data
+    ///   into 10-unit windows, each emitted at its window's end
     /// - **Ordering guarantee**: `delay_batch("order", |t| *t)` (identity) buffers until frontier
     ///   confirms no more data at `t` will arrive
     /// - **Time shifting**: `delay_batch("shift", |t| t + 5)` shifts all data forward by 5 units

@@ -648,6 +648,72 @@ fn runtime_drop_racing_operator_panics() {
 }
 
 // ---------------------------------------------------------------------------
+// SimpleRuntime (each worker on a thread of its own)
+// ---------------------------------------------------------------------------
+
+/// An operator panic on a `SimpleRuntime` worker thread fails the dataflow
+/// with `OperatorPanic`, naming the operator, as on the pool.
+#[cfg(feature = "test-utils")]
+#[test]
+fn simple_runtime_panic_reports_operator() {
+    quiet_intentional_panics();
+    let rt = instancy::SimpleRuntime::new();
+    let builder = DataflowBuilder::<u64>::new("simple-panic");
+    builder
+        .input::<u64>("data")
+        .unwrap()
+        .map("boom-simple", |_t, v| boom(v))
+        .output("results")
+        .unwrap();
+    let mut handle = rt.spawn(builder.build().unwrap()).unwrap();
+    let sender = handle.take_input::<u64>("data").unwrap();
+    let receiver = handle.take_output::<u64>("results").unwrap();
+    sender.send(0, vec![1, POISON]).unwrap();
+    let result = within(TIMEOUT, move || handle.join_blocking()).expect("join never returned");
+    assert_operator_panic(result, "boom-simple", "SimpleRuntime::spawn");
+    assert!(sender.send(1, vec![1]).is_err(), "input still open");
+    within(TIMEOUT, move || receiver.collect_data()).expect("output never closed");
+}
+
+/// On `SimpleRuntime::spawn_multi`, one worker's panic fails the dataflow
+/// with `OperatorPanic` and stops its siblings.
+#[cfg(feature = "test-utils")]
+#[test]
+fn simple_runtime_multi_worker_panic_reports_operator() {
+    quiet_intentional_panics();
+    let rt = instancy::SimpleRuntime::new();
+    let mut multi = rt
+        .spawn_multi(
+            "simple-multi-panic",
+            3,
+            |builder: &mut DataflowBuilder<u64>| {
+                builder
+                    .input::<u64>("data")?
+                    .exchange("spread", |v: &u64| *v)
+                    .map("boom-simple-multi", |_t, v| boom(v))
+                    .output("results")?;
+                Ok(())
+            },
+        )
+        .unwrap();
+    let senders: Vec<_> = (0..3)
+        .map(|w| multi.take_input::<u64>(w, "data").unwrap())
+        .collect();
+    let receivers: Vec<_> = (0..3)
+        .map(|w| multi.take_output::<u64>(w, "results").unwrap())
+        .collect();
+    // Other workers keep their inputs open: only the failure can stop them.
+    senders[0].send(0, (0..20).collect()).unwrap();
+    let completion = multi.join();
+    let result = within(TIMEOUT, move || completion.wait()).expect("join never returned");
+    assert_operator_panic(result, "boom-simple-multi", "SimpleRuntime::spawn_multi");
+    for receiver in receivers {
+        within(TIMEOUT, move || receiver.collect_data()).expect("a worker's output never closed");
+    }
+    drop(senders);
+}
+
+// ---------------------------------------------------------------------------
 // Two-node loopback-TCP clusters (Dedicated and Shared transport)
 // ---------------------------------------------------------------------------
 
@@ -698,9 +764,8 @@ mod cluster {
         // Node A panics; node B keeps its input open, so only the failure ends it.
         sa.send(0, vec![POISON]).unwrap();
 
-        // Every worker on both nodes must stop. Waiting on the runtimes (rather
-        // than resolving a ClusterCompletion, which tears its node's bridges
-        // down) isolates this from cluster-teardown ordering.
+        // Every worker on both nodes must stop on its own: waiting on the
+        // runtimes checks that before either completion is resolved.
         tokio::time::timeout(TIMEOUT, async {
             nodes.rt_a.wait_idle().await;
             nodes.rt_b.wait_idle().await;
