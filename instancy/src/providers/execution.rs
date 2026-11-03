@@ -1,8 +1,9 @@
 //! Execution provider trait and implementations.
 //!
 //! The [`ExecutionProvider`] maps logical worker task submissions to physical
-//! threads. Different implementations enable testing (inline), production
-//! (worker pool), or custom execution strategies.
+//! threads: inline (for testing), on a worker thread pool, or by a custom
+//! strategy. [`RuntimeHandle`](crate::RuntimeHandle) does not use it: it
+//! schedules its dataflows through its own worker pool's executor registry.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,7 +13,7 @@ use crate::worker::WorkerId;
 
 /// Maps logical workers to physical execution resources.
 ///
-/// The default implementation uses the custom worker thread pool.
+/// [`WorkerPoolExecution`] submits tasks to a worker thread pool.
 /// Alternative implementations can pin workers to specific cores,
 /// use NUMA-aware scheduling, or run inline for testing.
 pub trait ExecutionProvider: Send + Sync + 'static {
@@ -26,9 +27,11 @@ pub trait ExecutionProvider: Send + Sync + 'static {
     fn shutdown(&self);
 }
 
-/// Worker pool execution provider: submits tasks to the custom worker thread pool.
+/// Worker pool execution provider: submits tasks to the worker thread pool it
+/// is given.
 ///
-/// This is the default execution provider used in production.
+/// A standalone adapter: [`RuntimeHandle`](crate::RuntimeHandle) does not run
+/// its dataflows through it.
 pub struct WorkerPoolExecution {
     /// Reference to the worker pool (tasks are submitted here).
     pool: Arc<crate::worker_pool::WorkerPool>,

@@ -647,6 +647,11 @@ dataflow. The runtime manages the producer's lifecycle:
    that drops its sender and keeps running keeps the source unfinished
    until it returns or the dataflow is cancelled. The pump publishes the
    producer's outcome to the source before it wakes the worker.
+   The pump runtime shuts down once the producer returns, dropping any
+   task the producer spawned on it, even one holding a sender clone: what
+   such a task had not sent is never sent. A producer that spawns tasks
+   must await them, and check their results, before returning `Ok`;
+   tasks are not supervised past the producer's return.
 5. **Cancellation**: The pump thread runs in a `tokio::select!` with the
    dataflow's `CancellationToken`. On cancellation, the producer is dropped
    (with its sender), and any in-flight `send()` in the producer returns an

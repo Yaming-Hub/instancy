@@ -102,6 +102,35 @@ builder
 
 An error returned with `?` (here from `fetch_batch`) fails the dataflow with that error, naming the source. To end the input on a condition you expect, return `Ok(())`: dropping the sender alone does not end it.
 
+### Await the tasks a producer spawns
+The producer runs on a private Tokio runtime that shuts down as soon as the producer returns, dropping any task it spawned, even one holding a sender clone. Whatever such a task had not sent is never sent. Await every task, and check both its `JoinHandle` (a panic or cancellation) and its own result, before returning `Ok(())`.
+
+```rust
+use instancy::{DataflowBuilder, Error};
+
+async fn fetch_page(page: u64) -> instancy::Result<Vec<String>> { todo!() }
+
+let builder = DataflowBuilder::<u64>::new("fan-out-source");
+builder
+    .source_async::<String, _, _>("pages", |sender| async move {
+        let mut tasks = Vec::new();
+        for page in 0..4u64 {
+            let sender = sender.clone();
+            tasks.push(tokio::spawn(async move {
+                let rows = fetch_page(page).await?;
+                sender.send(0, rows).await
+            }));
+        }
+        for task in tasks {
+            // The outer `?` is the task's end (panic, cancellation); the
+            // inner one is its own result.
+            task.await.map_err(|e| Error::operator("pages", e))??;
+        }
+        Ok(())
+    })
+    .output("pages_out");
+```
+
 ### Poll a database or HTTP endpoint on a timer
 Wrap the external client in the async source; instancy handles the backpressure boundary.
 

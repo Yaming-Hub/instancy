@@ -6,8 +6,11 @@
 //!
 //! Built-in implementations:
 //! - [`LocalTransport`]: single-process in-memory delivery
-//! - [`WorkerPoolExecution`]: uses the custom worker thread pool
+//! - [`WorkerPoolExecution`]: submits tasks to a worker thread pool
 //! - [`InlineExecution`]: testing — runs everything on the calling thread
+//!
+//! [`RuntimeHandle`](crate::RuntimeHandle) does not use these providers: it
+//! schedules and connects its dataflows itself.
 
 pub mod execution;
 pub mod transport;
