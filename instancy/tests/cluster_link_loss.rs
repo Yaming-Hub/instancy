@@ -983,6 +983,143 @@ async fn report_node_leave_during_silent_partition_cancels_with_peer_down() {
     }
 }
 
+/// A peer the membership source reports gone is down for this runtime even
+/// while its connection stays up: a cluster dataflow spawned with it fails
+/// with `PeerDown`. Once the peer rejoins, a new one runs to completion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn membership_node_left_cancels_runs_with_that_peer_until_it_rejoins() {
+    let membership = instancy::ChannelMembership::new();
+    let events = membership.sender();
+    let topo = topology(&["node-a", "node-b"], 1);
+    let rt_a = RuntimeHandle::new(RuntimeConfig {
+        worker_threads: 1,
+        topology: Some(topo.clone().with_membership(membership)),
+        ..Default::default()
+    })
+    .unwrap();
+    let rt_b = RuntimeHandle::new(RuntimeConfig {
+        worker_threads: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    let node_b_listed = |rt: &RuntimeHandle| {
+        rt.current_topology()
+            .is_some_and(|topo| topo.contains_node("node-b"))
+    };
+
+    events
+        .send(instancy::MembershipEvent::NodeLeft {
+            node_id: "node-b".into(),
+            reason: instancy::NodeDepartureReason::Graceful,
+        })
+        .unwrap();
+    wait_until("node-a never processed node-b leaving", || {
+        !node_b_listed(&rt_a)
+    })
+    .await;
+    let (ra, _) = run_dedicated_pair(&rt_a, &rt_b, &topo).await;
+    assert!(
+        matches!(
+            &ra,
+            Err(Error::Cancelled {
+                reason: Some(CancellationReason::PeerDown { node_id }),
+            }) if node_id == "node-b"
+        ),
+        "node-a must fail with node-b down, got {ra:?}"
+    );
+
+    events
+        .send(instancy::MembershipEvent::NodeJoined {
+            node_id: "node-b".into(),
+            logical_workers: 1,
+        })
+        .unwrap();
+    wait_until("node-a never processed node-b rejoining", || {
+        node_b_listed(&rt_a)
+    })
+    .await;
+    let (ra, rb) = run_dedicated_pair(&rt_a, &rt_b, &topo).await;
+    assert!(
+        ra.is_ok() && rb.is_ok(),
+        "after node-b rejoined: a={ra:?} b={rb:?}"
+    );
+    drop(events);
+    drop_runtimes(vec![rt_a, rt_b]).await;
+}
+
+/// Poll `done` until it holds, failing with `what` after 5 s.
+async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !done() {
+        assert!(tokio::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Run [`exchange`] on node-a (on `rt_a`) and node-b (on `rt_b`), joined by a
+/// fresh in-memory Dedicated connection: each node sends ten records and
+/// closes its input. Returns each node's result, a failed spawn included.
+async fn run_dedicated_pair(
+    rt_a: &RuntimeHandle,
+    rt_b: &RuntimeHandle,
+    topo: &ClusterTopology,
+) -> (Result<()>, Result<()>) {
+    let (a_end, b_end) = tokio::io::duplex(1 << 20);
+    let (ar, aw) = tokio::io::split(a_end);
+    let (br, bw) = tokio::io::split(b_end);
+    let id = DataflowId::new();
+    let handle = tokio::runtime::Handle::current();
+    let (ca, cb) = tokio::join!(
+        rt_a.spawn_cluster_async(
+            "membership",
+            topo.clone(),
+            "node-a",
+            id,
+            ClusterSpawnTransport::dedicated(
+                vec![PeerConnection {
+                    node_id: "node-b".into(),
+                    reader: ar,
+                    writer: aw,
+                }],
+                1024,
+            ),
+            Duration::from_secs(5),
+            exchange,
+            &handle,
+            SpawnOptions::new(),
+        ),
+        rt_b.spawn_cluster_async(
+            "membership",
+            topo.clone(),
+            "node-b",
+            id,
+            ClusterSpawnTransport::dedicated(
+                vec![PeerConnection {
+                    node_id: "node-a".into(),
+                    reader: br,
+                    writer: bw,
+                }],
+                1024,
+            ),
+            Duration::from_secs(5),
+            exchange,
+            &handle,
+            SpawnOptions::new(),
+        ),
+    );
+    async fn finish(spawned: Result<ClusterSpawnedDataflow<u64>>) -> Result<()> {
+        let mut df = spawned?;
+        let input = df.take_input::<u64>(0, "data").unwrap();
+        let _output = df.take_output::<u64>(0, "out").unwrap();
+        let _ = input.send(0, (0..10).collect());
+        drop(input);
+        tokio::time::timeout(DETECT, df.join()?)
+            .await
+            .expect("the dataflow hung")
+    }
+    tokio::join!(finish(ca), finish(cb))
+}
+
 // ---------------------------------------------------------------------------
 // M3: peer cancellation with a foreign caller runtime
 // ---------------------------------------------------------------------------

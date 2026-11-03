@@ -8598,6 +8598,56 @@ mod tests {
         assert!(!bridge.is_cancelled());
     }
 
+    /// A cluster run's completion reports records lost on the way to this
+    /// node as `DataLoss` even when every local worker succeeded, whether it
+    /// is waited for or polled. A cancellation the loss caused is reported as
+    /// the loss too, and a run without loss keeps its result.
+    #[cfg(feature = "transport")]
+    #[test]
+    fn cluster_completion_turns_local_success_with_lost_records_into_data_loss() {
+        use cluster_lifecycle::{DataLoss, teardown_signal};
+        let transport = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        // The local workers' result, then the teardown, which recorded `loss`.
+        let completion = |result: Result<()>, loss: Option<DataLoss>| {
+            let (notifier, waiter) = teardown_signal(transport.handle().clone());
+            if let Some(loss) = loss {
+                notifier.set_data_loss(loss);
+            }
+            drop(notifier);
+            ClusterCompletion::<u64> {
+                completion: None,
+                result: Some(result),
+                teardown: waiter,
+                _phantom: PhantomData,
+            }
+        };
+        let loss = || {
+            Some(DataLoss {
+                peer: "node-b".into(),
+                detail: "records arrived after their operator finished".into(),
+            })
+        };
+        let is_loss = |result: &Result<()>| {
+            matches!(
+                result,
+                Err(Error::Communication(crate::error::CommunicationError::DataLoss { peer_id, .. }))
+                    if peer_id == "node-b"
+            )
+        };
+
+        let waited = completion(Ok(()), loss()).wait();
+        assert!(is_loss(&waited), "waited: {waited:?}");
+        let polled = transport.block_on(completion(Ok(()), loss()));
+        assert!(is_loss(&polled), "polled: {polled:?}");
+        let cancelled = completion(Err(Error::Cancelled { reason: None }), loss()).wait();
+        assert!(is_loss(&cancelled), "cancelled: {cancelled:?}");
+        assert!(completion(Ok(()), None).wait().is_ok());
+    }
+
     #[test]
     fn validate_stage_parallelism_matching_passes() {
         // Build a dataflow with exchange_by_hash_to(par=2) and spawn with 2 workers.

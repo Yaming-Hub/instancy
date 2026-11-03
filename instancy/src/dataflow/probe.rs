@@ -717,9 +717,17 @@ mod async_tests {
 
         let p = probe.clone();
         let waiter = tokio::spawn(async move { p.wait_until_done().await });
+        // The frontier is {5}: a time it equals is not done with, even once
+        // every writer has gone.
+        let p = probe.clone();
+        let at_frontier = tokio::spawn(async move { p.wait_until_done_with(&5).await });
         tokio::task::yield_now().await;
         drop(a);
         drop(b);
         assert!(waiter.await.unwrap().is_err());
+        assert!(matches!(
+            at_frontier.await.unwrap(),
+            Err(crate::error::Error::ChannelClosed)
+        ));
     }
 }

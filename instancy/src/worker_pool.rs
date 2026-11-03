@@ -1322,4 +1322,301 @@ mod tests {
         assert!(comp2.wait().is_ok());
         pool.shutdown();
     }
+
+    /// Bounds waits for expected progress; separate from the one-second
+    /// early-return observation. Each test shares one deadline across all its
+    /// waits, so the bound is per test, not per wait.
+    const LIVENESS: Duration = Duration::from_secs(30);
+
+    /// Time left before deadline (zero once it passed).
+    fn left(deadline: Instant) -> Duration {
+        deadline.saturating_duration_since(Instant::now())
+    }
+
+    fn one_thread() -> WorkerPoolConfig {
+        WorkerPoolConfig {
+            min_threads: 1,
+            max_threads: 1,
+            idle_shutdown: Duration::from_secs(30),
+            spin_limit: 5,
+            yield_limit: 10,
+        }
+    }
+
+    /// Whether `condition` held within `limit`.
+    fn within(limit: Duration, condition: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        while !condition() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+
+    /// Poll every completion until it resolves or `limit` passes; `None` for
+    /// one still unresolved.
+    fn resolve(
+        completions: Vec<crate::runtime::DataflowCompletion>,
+        limit: Duration,
+    ) -> Vec<Option<crate::error::Result<()>>> {
+        use std::future::Future;
+        let mut pending: Vec<_> = completions.into_iter().map(|c| Some(Box::pin(c))).collect();
+        let mut outcomes: Vec<_> = pending.iter().map(|_| None).collect();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let deadline = Instant::now() + limit;
+        while outcomes.iter().any(Option::is_none) && Instant::now() < deadline {
+            for (slot, outcome) in pending.iter_mut().zip(outcomes.iter_mut()) {
+                if let Some(completion) = slot {
+                    if let std::task::Poll::Ready(result) = completion.as_mut().poll(&mut cx) {
+                        *outcome = Some(result);
+                        *slot = None;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        outcomes
+    }
+
+    fn is_runtime_shutdown(outcome: &Option<crate::error::Result<()>>) -> bool {
+        matches!(
+            outcome,
+            Some(Err(crate::error::Error::Cancelled {
+                reason: Some(crate::cancellation::CancellationReason::RuntimeShutdown)
+            }))
+        )
+    }
+
+    /// Reports its first poll and stays Pending, never waking itself.
+    struct PendingAfterFirstPoll(Option<std::sync::mpsc::Sender<()>>);
+
+    impl std::future::Future for PendingAfterFirstPoll {
+        type Output = crate::error::Result<bool>;
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            if let Some(polled) = self.0.take() {
+                let _ = polled.send(());
+            }
+            std::task::Poll::Pending
+        }
+    }
+
+    /// The only worker survives a panicking activation: the activation
+    /// queued behind it runs once, and none is counted as running after
+    /// shutdown. Nothing is submitted after the panic that could start a
+    /// replacement worker.
+    #[test]
+    fn a_panicking_activation_does_not_stop_its_worker() {
+        let deadline = Instant::now() + LIVENESS;
+        let pool = WorkerPool::new(one_thread()).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        pool.submit(OperatorActivation::new(
+            crate::worker::WorkerId::new(0),
+            "panics",
+            0,
+            move || {
+                let _ = entered_tx.send(());
+                // Until the driver releases it (or drops the sender).
+                let _ = release_rx.recv();
+                panic!("a deliberately panicking activation");
+            },
+        ));
+        let entered = entered_rx.recv_timeout(left(deadline));
+        let (ran_tx, ran_rx) = std::sync::mpsc::channel();
+        pool.submit(OperatorActivation::new(
+            crate::worker::WorkerId::new(0),
+            "after-the-panic",
+            1,
+            move || {
+                let _ = ran_tx.send(());
+            },
+        ));
+        let _ = release_tx.send(());
+        let ran = ran_rx.recv_timeout(left(deadline));
+        pool.shutdown();
+        let ran_again = ran_rx.try_recv();
+        assert!(entered.is_ok(), "the panicking activation started");
+        assert!(ran.is_ok(), "the worker kept serving after the panic");
+        assert!(ran_again.is_err(), "the queued activation ran once");
+        assert_eq!(
+            pool.active_threads(),
+            0,
+            "no activation counts as running after shutdown"
+        );
+    }
+
+    /// A pool takes one registry: a second is refused, and the first stays
+    /// installed and keeps driving its tasks.
+    #[test]
+    fn a_second_registry_is_refused() {
+        let deadline = Instant::now() + LIVENESS;
+        let pool = WorkerPool::new(one_thread()).unwrap();
+        let first = pool.create_registry(None).unwrap();
+        let second = pool.create_registry(None);
+        let installed = pool.registry();
+        let (completion, notifier) = crate::runtime::DataflowCompletion::new();
+        first.register(
+            Box::pin(async { Ok(true) }),
+            notifier,
+            crate::dataflow::DataflowId::new(),
+            0,
+        );
+        let outcome = resolve(vec![completion], left(deadline)).pop().unwrap();
+        pool.shutdown();
+        assert!(
+            matches!(
+                second,
+                Err(crate::Error::Runtime(RuntimeError::AlreadyConsumed { .. }))
+            ),
+            "a second registry is refused"
+        );
+        assert!(
+            installed.is_some_and(|installed| Arc::ptr_eq(&installed, &first)),
+            "the first registry stays installed"
+        );
+        assert!(
+            matches!(outcome, Some(Ok(()))),
+            "the first registry's task runs: {outcome:?}"
+        );
+    }
+
+    /// Shutdown completes every executor left Pending, including those
+    /// registered before the live-task list was first pruned (it prunes at
+    /// 32 entries). The tasks are held until the outcomes are captured, so
+    /// none completes by being dropped.
+    #[test]
+    fn shutdown_completes_every_pending_executor() {
+        let deadline = Instant::now() + LIVENESS;
+        const TASKS: usize = 40;
+        let pool = WorkerPool::new(one_thread()).unwrap();
+        let registry = pool.create_registry(None).unwrap();
+        let (polled_tx, polled_rx) = std::sync::mpsc::channel();
+        let mut tasks = Vec::new();
+        let mut completions = Vec::new();
+        for _ in 0..TASKS {
+            let (completion, notifier) = crate::runtime::DataflowCompletion::new();
+            tasks.push(registry.register(
+                Box::pin(PendingAfterFirstPoll(Some(polled_tx.clone()))),
+                notifier,
+                crate::dataflow::DataflowId::new(),
+                0,
+            ));
+            completions.push(completion);
+        }
+        let mut polled = 0;
+        while polled < TASKS && polled_rx.recv_timeout(left(deadline)).is_ok() {
+            polled += 1;
+        }
+        pool.shutdown();
+        let outcomes = resolve(completions, left(deadline));
+        drop(tasks);
+        assert_eq!(polled, TASKS, "every executor was polled once");
+        let unresolved = outcomes.iter().filter(|o| o.is_none()).count();
+        let shut_down = outcomes.iter().filter(|o| is_runtime_shutdown(o)).count();
+        assert_eq!(
+            (shut_down, unresolved),
+            (TASKS, 0),
+            "every pending executor completes with RuntimeShutdown"
+        );
+    }
+
+    /// Enters its first poll, reports it, and stays inside it until released;
+    /// then Pending.
+    struct GatedPoll {
+        entered: Option<std::sync::mpsc::SyncSender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl std::future::Future for GatedPoll {
+        type Output = crate::error::Result<bool>;
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+                // Until the driver releases it (or drops the sender).
+                let _ = self.release.recv();
+            }
+            std::task::Poll::Pending
+        }
+    }
+
+    /// Shutdown waits for a worker inside a poll, then completes that
+    /// executor: an executor being polled cannot be aborted, so shutdown
+    /// must join the worker first. The poll is released only after shutdown
+    /// started and either returned or kept waiting for a second; a shutdown
+    /// that does not wait is caught only if it returns within that second.
+    #[test]
+    fn shutdown_waits_for_a_worker_inside_a_poll() {
+        let deadline = Instant::now() + LIVENESS;
+        let pool = Arc::new(WorkerPool::new(one_thread()).unwrap());
+        let registry = pool.create_registry(None).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let (completion, notifier) = crate::runtime::DataflowCompletion::new();
+        let task = registry.register(
+            Box::pin(GatedPoll {
+                entered: Some(entered_tx),
+                release: release_rx,
+            }),
+            notifier,
+            crate::dataflow::DataflowId::new(),
+            0,
+        );
+        let entered = entered_rx.recv_timeout(left(deadline));
+        let shutting_down = Arc::clone(&pool);
+        let shutdown = thread::spawn(move || shutting_down.shutdown());
+        let started = within(left(deadline), || pool.is_shutdown());
+        let returned_early = within(Duration::from_secs(1), || shutdown.is_finished());
+        let _ = release_tx.send(());
+        let joined = shutdown.join();
+        let outcome = resolve(vec![completion], left(deadline)).pop().unwrap();
+        drop(task);
+        assert!(entered.is_ok(), "a worker entered the poll");
+        assert!(started, "shutdown started");
+        assert!(joined.is_ok(), "shutdown did not panic");
+        assert!(
+            !returned_early,
+            "shutdown returned while a worker was inside a poll"
+        );
+        assert!(
+            is_runtime_shutdown(&outcome),
+            "the executor completes with RuntimeShutdown: {outcome:?}"
+        );
+    }
+
+    /// `new` refuses an invalid configuration, with the reason `validate`
+    /// gives.
+    #[test]
+    fn new_refuses_an_invalid_config() {
+        let cases = [
+            (0, 1, 5, 10, "min_threads must be at least 1"),
+            (2, 1, 5, 10, "max_threads must be >= min_threads"),
+            (1, 4, 0, 10, "spin_limit must be at least 1"),
+            (1, 4, 5, 5, "yield_limit must be > spin_limit"),
+        ];
+        for (min_threads, max_threads, spin_limit, yield_limit, reason) in cases {
+            let result = WorkerPool::new(WorkerPoolConfig {
+                min_threads,
+                max_threads,
+                idle_shutdown: Duration::from_secs(30),
+                spin_limit,
+                yield_limit,
+            });
+            let refused = match &result {
+                Err(RuntimeError::InvalidConfig(message)) => message == reason,
+                _ => false,
+            };
+            if let Ok(pool) = &result {
+                pool.shutdown();
+            }
+            assert!(refused, "{reason}: got {:?}", result.as_ref().err());
+        }
+    }
 }

@@ -5594,6 +5594,168 @@ mod tests {
         escalate.join().unwrap();
     }
 
+    /// A failure escalated during the very sweep in which a drain gives up
+    /// on a peer that stopped without sealing ends the drain with that
+    /// failure, not with the stopped-peer error: the failure is what
+    /// stopped the peer.
+    #[test]
+    fn failure_escalated_while_giving_up_on_a_stopped_peer_is_reported() {
+        use crate::cancellation::CancellationReason;
+
+        /// Never done and never shut down; idle, so it changes nothing the
+        /// drain watches. Escalates on its second activation.
+        struct EscalatesOnSecondActivation {
+            parent: CancellationToken,
+            failure: CancellationReason,
+            activations: usize,
+        }
+        impl SchedulableOperator for EscalatesOnSecondActivation {
+            fn activate(&mut self) -> Result<ActivationOutcome> {
+                self.activations += 1;
+                if self.activations == 2 {
+                    self.parent.escalate(self.failure.clone());
+                }
+                Ok(ActivationOutcome::Idle)
+            }
+            fn name(&self) -> &str {
+                "escalates"
+            }
+            fn index(&self) -> usize {
+                0
+            }
+            fn stage_id(&self) -> crate::dataflow::stage::StageId {
+                crate::dataflow::stage::StageId(0)
+            }
+            fn is_done(&self) -> bool {
+                false
+            }
+            fn can_shut_down(&self) -> bool {
+                false
+            }
+        }
+
+        // Worker 1 stops without sealing or releasing its capability, so
+        // worker 0's view keeps work only worker 1 could release.
+        let (mut trackers, releases) = crate::progress::subgraph::tests::sealing_pair();
+        drop(trackers.pop());
+        releases[0].update(0, -1);
+        let mut tracker = trackers.pop().unwrap();
+        tracker.propagate().unwrap();
+
+        let parent = CancellationToken::new();
+        let failure = CancellationReason::PeerCancelled {
+            peer_id: "b".into(),
+            detail: "worker failed: boom".into(),
+        };
+        let op = EscalatesOnSecondActivation {
+            parent: parent.clone(),
+            failure: failure.clone(),
+            activations: 0,
+        };
+        let config = ExecutorConfig {
+            max_sweeps_per_poll: 0,
+            max_idle_sweeps: 1,
+            drain_timeout: Some(std::time::Duration::from_secs(60)),
+            stopped_peer_grace: std::time::Duration::ZERO,
+            ..Default::default()
+        };
+        let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
+        executor.cancel = parent.child_token();
+        executor.set_progress_tracker(tracker);
+        parent.cancel_with_reason(CancellationReason::UserRequested);
+
+        // The drain starts and finds worker 1 stopped while the view holds
+        // work; the first sight of that starts the (zero) grace.
+        assert_eq!(executor.run_one_sweep().unwrap(), SweepOutcome::Idle);
+        assert!(executor.draining);
+        let tracker = executor.progress_tracker.as_ref().unwrap();
+        assert_eq!(tracker.stopped_peers(), [1]);
+        assert!(!tracker.is_completed());
+        assert!(!executor.async_waiting.iter().any(|&waiting| waiting));
+        assert!(executor.cancel.escalation().is_none());
+
+        // The failure arrives during this sweep's activation, after its
+        // first check for one, and the drain gives up on worker 1.
+        match executor.run_one_sweep() {
+            Err(Error::Cancelled {
+                reason: Some(reason),
+            }) => assert_eq!(reason, failure),
+            other => panic!("the drain must end with the escalated failure, got {other:?}"),
+        }
+    }
+
+    /// A worker seals only once every change it has made is committed, even
+    /// a release made after the sweep's commit, just before its last
+    /// operator can shut down. Sealing first would send the seal ahead of
+    /// that release: the worker, whose peer has already sealed, would then
+    /// find its own capability left over and fail with a residual.
+    #[test]
+    fn a_release_made_at_shutdown_is_committed_before_the_seal() {
+        /// Worker 0's instance of `a` in `sealing_pair`. Its capability is
+        /// released after the sweep's commit, as the executor asks whether
+        /// it can shut down (as a capability dropped on another thread
+        /// would be), and only then, holding nothing, it can.
+        struct ReleasedLate(
+            std::sync::Mutex<Option<crate::progress::operate::ProgressReporter<u64>>>,
+        );
+        impl SchedulableOperator for ReleasedLate {
+            fn activate(&mut self) -> Result<ActivationOutcome> {
+                Ok(ActivationOutcome::Idle)
+            }
+            fn name(&self) -> &str {
+                "a"
+            }
+            fn index(&self) -> usize {
+                1
+            }
+            fn stage_id(&self) -> crate::dataflow::stage::StageId {
+                crate::dataflow::stage::StageId(0)
+            }
+            fn is_done(&self) -> bool {
+                false
+            }
+            fn can_shut_down(&self) -> bool {
+                let mut held = self.0.lock().unwrap();
+                if let Some(capability) = held.take() {
+                    capability.update(0, -1);
+                }
+                held.is_none()
+            }
+            fn exhausted(&self) -> bool {
+                self.0.lock().unwrap().is_none()
+            }
+        }
+
+        // Worker 1 releases its instance's capability and seals.
+        let (mut trackers, mut releases) = crate::progress::subgraph::tests::sealing_pair();
+        let mut peer = trackers.pop().unwrap();
+        releases[1].update(0, -1);
+        peer.propagate().unwrap();
+        peer.seal();
+
+        let op = ReleasedLate(std::sync::Mutex::new(Some(releases.swap_remove(0))));
+        let mut executor =
+            DataflowExecutor::new_test(vec![Box::new(op)], ExecutorConfig::default(), 0);
+        executor.set_progress_tracker(trackers.pop().unwrap());
+        let mut outcome = executor.run_one_sweep();
+        for _ in 0..10 {
+            if !matches!(outcome, Ok(SweepOutcome::Idle | SweepOutcome::MadeProgress)) {
+                break;
+            }
+            outcome = executor.run_one_sweep();
+        }
+        assert!(
+            matches!(outcome, Ok(SweepOutcome::Completed)),
+            "worker 0 must complete, got {outcome:?}"
+        );
+        assert!(executor.progress_tracker.as_ref().unwrap().is_sealed());
+
+        // Worker 1 receives the release before the seal: its view is final
+        // and empty.
+        peer.propagate().unwrap();
+        assert!(peer.all_sealed() && peer.is_completed());
+    }
+
     #[test]
     fn sibling_worker_error_aborts_an_active_drain() {
         let wakes = vec![WakeHandle::new(), WakeHandle::new()];

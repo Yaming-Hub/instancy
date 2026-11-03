@@ -751,6 +751,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "was dropped without being connected")]
     fn unconnected_feedback_handle_panics_in_debug() {
         let mut root = RootScope::<u64>::new("root", 4);
