@@ -108,7 +108,9 @@ stream.map("process", |_t, x| x * 2).output("results");
 Key differences from `input()`:
 - **Self-contained**: The producer closure runs automatically — no external sender to manage.
 - **Backpressure**: `sender.send()` yields when the internal channel is full.
-- **Cancellation**: When the dataflow is cancelled, `send()` returns an error.
+- **Completion**: The input ends when the producer returns `Ok(())`. Dropping the sender alone does not end it; return `Ok(())` to end the input on a condition you expect.
+- **Errors**: If the producer returns `Err` (for example through `?`), the dataflow fails with that error in the source's operator context; a producer that panics fails it too.
+- **Cancellation**: When the dataflow is cancelled, `send()` returns an error; an error the producer returns once the cancellation is observed counts as the cancellation, not as a failure.
 - **Frontier support**: Call `sender.advance_to(t)` to advance the input frontier, enabling downstream `unary_notify` operators to fire notifications.
 
 The async source works with `RuntimeHandle`; `SimpleRuntime` remains available only for tests behind the `test-utils` feature.
@@ -272,6 +274,33 @@ The closure receives the timestamp and the full `Vec<D>`, returning a new `Vec<D
 Use `try_map_batch` when the batch transformation can fail. If the closure
 returns an error, the dataflow stops and the error is reported via the operator
 error path.
+
+#### Async Map (`unary_async`)
+
+Run async I/O (a database lookup, an HTTP call) for each batch as a Tokio task,
+with at most `max_concurrency` tasks at once. Results are emitted in completion
+order, each at its batch's time:
+
+```rust
+use std::sync::Arc;
+
+let enriched = stream.unary_async("lookup", 8, Arc::new(|_time, batch: Vec<u64>| async move {
+    let mut rows = Vec::new();
+    for id in batch {
+        rows.push(fetch_row(id).await?);
+    }
+    Ok(rows)
+}));
+```
+
+The tasks run on the Tokio runtime that is current when `unary_async` is
+called, not necessarily the `RuntimeHandle`'s. Keep that runtime alive and
+running while the dataflow runs (do not block a current-thread runtime's only
+thread in `join_blocking()`). If it shuts down under a running dataflow, the
+dataflow fails with `Error::Operator` naming the operator. A task's `Err` fails
+the dataflow with that error, and a task panic fails it with
+`Error::OperatorPanic`. Cancellation does not abort tasks that are already
+running: they finish on their runtime and their results are discarded.
 
 #### Inspect — Observing Data
 

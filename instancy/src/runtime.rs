@@ -420,9 +420,16 @@ impl SpawnOptions {
     /// Once the drain begins, `send()` / `advance_to()` on the dataflow's
     /// input senders fail with [`Error::ChannelClosed`]; every call that
     /// already returned `Ok` is delivered. `source_async` producers are
-    /// stopped. The drain therefore does not wait for callers to drop their
-    /// senders. Failure-driven cancellation (an operator error, a failed
-    /// sibling worker, a lost peer) never drains.
+    /// stopped, and their sources end once what they sent is delivered: an
+    /// error a producer returns once the cancellation is observed counts as
+    /// the cancellation, not as a failure of the drain, though a producer
+    /// panic fails the drain. The drain therefore does not wait for callers
+    /// to drop their senders. Failure-driven cancellation (an operator
+    /// error, a failed sibling worker, a lost peer) never drains.
+    ///
+    /// `timeout` bounds the dataflow's completion, not user code: a stopped
+    /// producer whose destruction blocks may keep its pump thread running,
+    /// after the dataflow has ended, until that code returns.
     ///
     /// # Example
     ///
@@ -3465,7 +3472,7 @@ impl RuntimeHandle {
                 unfinished_announced: false,
                 worker_failure: None,
                 #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
-                trace_pending: None,
+                loss_dumped: false,
                 _teardown: teardown_notifier,
             };
             runtime_handle.spawn(lifecycle.run());

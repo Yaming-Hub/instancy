@@ -8,6 +8,9 @@
 #![cfg(any(debug_assertions, feature = "progress-check"))]
 
 #[cfg(feature = "transport")]
+#[path = "support/faults.rs"]
+mod faults;
+#[cfg(feature = "transport")]
 #[path = "support/teardown.rs"]
 mod support;
 #[path = "support/trace_verdict.rs"]
@@ -425,6 +428,135 @@ async fn an_injected_residual_is_dumped_on_both_nodes_of_a_cluster() {
         );
     }
     assert!(from_residual > 0, "a worker proved the residual");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `data -> exchange -> map -> out`.
+#[cfg(feature = "transport")]
+fn exchange(builder: &mut DataflowBuilder<u64>) -> Result<()> {
+    builder
+        .input::<u64>("data")?
+        .exchange("by_val", |x: &u64| *x)
+        .map("id", |_t, x| x)
+        .output("out")?;
+    Ok(())
+}
+
+/// Whether `ring` has its coordinator's teardown.
+#[cfg(feature = "transport")]
+fn torn_down(ring: &DumpRing) -> bool {
+    ring.events
+        .iter()
+        .any(|e| e["ev"] == "coordinator" && e["action"] == "teardown")
+}
+
+/// Corrupt traffic is a data loss the lifecycle accepts: node-a dumps it
+/// as soon as the actions it led to were taken, before tearing down, as
+/// `inbound-data-lost` with the accepted cause, and its completion still
+/// reports the loss (node-b is cancelled by it).
+#[cfg(feature = "transport")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[allow(clippy::await_holding_lock)]
+async fn an_accepted_data_loss_is_dumped_before_teardown() {
+    use faults::{FaultMesh, FrameKind};
+    use instancy::{ClusterTopology, CommunicationError, Error, NodeConfig};
+    use support::{collect, drop_runtimes, fmt_join, join_with_timeout, spawn_node};
+
+    let _serial = serial();
+    let dir = fresh_dir("accepted-loss");
+    trace::set_dir(Some(dir.clone()));
+    let topology = ClusterTopology::multi_node(vec![
+        NodeConfig::new("node-a", 1),
+        NodeConfig::new("node-b", 1),
+    ])
+    .unwrap();
+    let id = DataflowId::new();
+    let mut mesh = FaultMesh::new(&["node-a", "node-b"], 2, false);
+    let ha = spawn_node(
+        topology.clone(),
+        "node-a",
+        id,
+        mesh.dedicated("node-a", 1024),
+        2,
+        exchange,
+    );
+    let hb = spawn_node(
+        topology,
+        "node-b",
+        id,
+        mesh.dedicated("node-b", 1024),
+        2,
+        exchange,
+    );
+    let ((rt_a, ca), (rt_b, cb)) = (ha.await.unwrap(), hb.await.unwrap());
+    let (mut ca, mut cb) = (ca.unwrap(), cb.unwrap());
+    let oa = collect(ca.take_output::<u64>(0, "out").unwrap());
+    let ob = collect(cb.take_output::<u64>(0, "out").unwrap());
+    let sa = ca.take_input::<u64>(0, "data").unwrap();
+    let sb = cb.take_input::<u64>(0, "data").unwrap();
+    let b_to_a = mesh.ctl("node-b", "node-a");
+    b_to_a.corrupt_next(FrameKind::Data);
+    sb.send(0, (0..20).collect()).unwrap();
+    sa.send(0, (100..110).collect()).unwrap();
+    drop(sa);
+    let ra = join_with_timeout(ca, Duration::from_secs(15))
+        .await
+        .unwrap();
+    let rb = join_with_timeout(cb, Duration::from_secs(15))
+        .await
+        .unwrap();
+    drop(sb);
+    let _ = (oa.join(), ob.join());
+    drop_runtimes(vec![rt_a, rt_b]).await;
+    let root = dir.join(id.as_uuid().to_string());
+    let final_dump = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let found = std::fs::read_dir(&root)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| p.to_string_lossy().ends_with("-final") && p.join("reason.txt").exists());
+            if let Some(found) = found {
+                break found;
+            }
+            assert!(std::time::Instant::now() < deadline, "a final dump");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    trace::set_dir(None);
+
+    assert!(
+        b_to_a.corrupted(),
+        "precondition: a data frame was corrupted"
+    );
+    assert!(
+        matches!(
+            &ra,
+            Some(Err(Error::Communication(CommunicationError::DataLoss { peer_id, .. })))
+                if peer_id == "node-b"
+        ),
+        "node-a reports the loss: {}",
+        fmt_join(&ra)
+    );
+    assert!(matches!(rb, Some(Err(_))), "node-b: {}", fmt_join(&rb));
+    let reason = std::fs::read_to_string(root.join("reason.txt")).unwrap();
+    assert!(
+        reason.starts_with(
+            "inbound-data-lost: data lost on the link to peer node-b: corrupt traffic from the peer:"
+        ),
+        "{reason}"
+    );
+    let link = "node-a-bridge-node-b.jsonl";
+    assert!(
+        !torn_down(&read_dump(&root)[link]),
+        "dumped before node-a tore down"
+    );
+    assert!(
+        torn_down(&read_dump(&final_dump)[link]),
+        "its teardown, after"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

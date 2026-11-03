@@ -182,6 +182,100 @@ impl<T> OutputSend<T> {
 }
 
 // ---------------------------------------------------------------------------
+// ProducerOutcome — how an async source's producer ended
+// ---------------------------------------------------------------------------
+
+/// How an async source's producer ended, as its pump publishes it. A closed
+/// channel alone does not end the source's input: a producer can drop its
+/// sender before it returns an error. The first outcome published stays.
+#[derive(Debug, Default)]
+pub(crate) struct ProducerOutcome(std::sync::Mutex<Outcome>);
+
+#[derive(Debug, Default)]
+enum Outcome {
+    /// Not decided: the producer runs, or has not started.
+    #[default]
+    Pending,
+    /// The producer returned `Ok`, or was stopped for a drain: the input
+    /// ends with its channel.
+    Completed,
+    /// The producer returned this error (`None` once the source raised it).
+    Failed(Option<crate::Error>),
+    /// Cut off by a cancellation without a drain, or never started: the
+    /// closed channel is not an end of input.
+    Abandoned,
+}
+
+/// What a source does once its channel holds nothing more.
+enum InputEnd {
+    Ends,
+    Waits,
+    Fails(crate::Error),
+}
+
+impl ProducerOutcome {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Outcome> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Publish `outcome` unless one was published already; returns whether
+    /// it was published.
+    fn publish(&self, outcome: Outcome) -> bool {
+        let mut current = self.lock();
+        let pending = matches!(*current, Outcome::Pending);
+        if pending {
+            *current = outcome;
+        }
+        pending
+    }
+
+    /// The producer returned `Ok`.
+    pub(crate) fn complete(&self) -> bool {
+        self.publish(Outcome::Completed)
+    }
+
+    /// The producer returned `error`.
+    pub(crate) fn fail(&self, error: crate::Error) -> bool {
+        self.publish(Outcome::Failed(Some(error)))
+    }
+
+    /// The producer was stopped by a cancellation: with a drain its input
+    /// ends there; without one it was cut off.
+    pub(crate) fn cancelled(&self, drains: bool) -> bool {
+        self.publish(if drains {
+            Outcome::Completed
+        } else {
+            Outcome::Abandoned
+        })
+    }
+
+    /// The producer never started.
+    pub(crate) fn abandon(&self) -> bool {
+        self.publish(Outcome::Abandoned)
+    }
+
+    /// The producer's error, if it failed and nobody raised it yet.
+    fn take_failure(&self) -> Option<crate::Error> {
+        match &mut *self.lock() {
+            Outcome::Failed(error) => error.take(),
+            _ => None,
+        }
+    }
+
+    /// What the source does at the end of its channel: after a drain
+    /// closed the input (`drained`), only a pending or failed producer
+    /// keeps it from finishing.
+    fn input_end(&self, drained: bool) -> InputEnd {
+        match &mut *self.lock() {
+            Outcome::Completed => InputEnd::Ends,
+            Outcome::Abandoned if drained => InputEnd::Ends,
+            Outcome::Failed(error) => error.take().map_or(InputEnd::Waits, InputEnd::Fails),
+            Outcome::Pending | Outcome::Abandoned => InputEnd::Waits,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ChannelSourceLogic
 // ---------------------------------------------------------------------------
 
@@ -197,7 +291,9 @@ impl<T> OutputSend<T> {
 /// While this operator's channel is open, it prevents the executor from
 /// declaring quiescence by holding a count in `external_inputs_open`.
 /// When the channel is closed (sender dropped or explicit close), the
-/// count is decremented and the source releases its capability.
+/// count is decremented and the source releases its capability; an async
+/// source's input ends only once its producer has also completed (see
+/// [`ProducerOutcome`]).
 ///
 /// # Graceful drain
 ///
@@ -224,11 +320,11 @@ pub(crate) struct ChannelSourceLogic<T: Timestamp, D: Send + 'static> {
     external_closed: bool,
     /// Input ended: the capability is released.
     finished: bool,
-    /// Set (async sources without a drain) when the producer was cut off by a
-    /// cancellation: the closed channel is then not an end of input.
-    abandoned: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// A protocol violation found after events that were already emitted:
-    /// raised once those are committed.
+    /// How the producer of an async source ended (absent for an `input()`
+    /// port, whose input ends with its channel).
+    producer: Option<Arc<ProducerOutcome>>,
+    /// A failure found after events that were already emitted: raised once
+    /// those are committed.
     failure: Option<crate::Error>,
 }
 
@@ -249,7 +345,7 @@ impl<T: Timestamp, D: Send + 'static> ChannelSourceLogic<T, D> {
             input_gate: None,
             external_closed: false,
             finished: false,
-            abandoned: None,
+            producer: None,
             failure: None,
         }
     }
@@ -260,20 +356,35 @@ impl<T: Timestamp, D: Send + 'static> ChannelSourceLogic<T, D> {
         self
     }
 
-    /// A channel that closes after `flag` was set did not end the input (its
-    /// producer was cancelled): the source then neither finishes nor
-    /// releases its capability, and the executor stops on the cancellation.
-    pub(crate) fn with_abandon_flag(
-        mut self,
-        flag: Option<Arc<std::sync::atomic::AtomicBool>>,
-    ) -> Self {
-        self.abandoned = flag;
+    /// The input of an async source, which ends only once its producer did
+    /// (see [`ProducerOutcome`]): until then a closed channel leaves the
+    /// source unfinished, and a producer error fails the source at once.
+    pub(crate) fn with_producer(mut self, producer: Option<Arc<ProducerOutcome>>) -> Self {
+        self.producer = producer;
         self
     }
 
     /// Whether no sender is between admission and enqueue.
     fn senders_idle(&self) -> bool {
         self.input_gate.as_ref().is_none_or(|gate| gate.is_idle())
+    }
+
+    /// What to do once the channel holds nothing more (see
+    /// [`ProducerOutcome::input_end`]); an `input()` port's input ends.
+    fn input_end(&self, drained: bool) -> InputEnd {
+        self.producer
+            .as_ref()
+            .map_or(InputEnd::Ends, |producer| producer.input_end(drained))
+    }
+
+    /// Raise `error` now, or after the events already emitted in this call
+    /// are committed.
+    fn fail(&mut self, made_progress: bool, error: crate::Error) -> Result<bool> {
+        if !made_progress {
+            return Err(error);
+        }
+        self.failure = Some(error);
+        Ok(true)
     }
 
     /// The input ended: stop accepting events and release the capability.
@@ -304,6 +415,11 @@ impl<T: Timestamp, D: Send + 'static> OperatorLogic for ChannelSourceLogic<T, D>
 
     fn call(&mut self, _: &mut (), output: &mut Self::Outputs) -> Result<bool> {
         if let Some(failure) = self.failure.take() {
+            return Err(failure);
+        }
+        // A producer error fails the source even while a clone of its
+        // sender keeps the channel open.
+        if let Some(failure) = self.producer.as_ref().and_then(|p| p.take_failure()) {
             return Err(failure);
         }
         // Cap per-call work so other operators get a turn. The cap applies
@@ -357,8 +473,16 @@ impl<T: Timestamp, D: Send + 'static> OperatorLogic for ChannelSourceLogic<T, D>
                 Err(RecvError::Empty) => {
                     if self.external_closed {
                         if drained_inputs_final {
-                            self.finish();
-                            return Ok(true);
+                            match self.input_end(true) {
+                                InputEnd::Ends => {
+                                    self.finish();
+                                    return Ok(true);
+                                }
+                                // The producer has not stopped yet; its pump
+                                // wakes the worker once it has.
+                                InputEnd::Waits => break,
+                                InputEnd::Fails(error) => return self.fail(made_progress, error),
+                            }
                         }
                         if self.senders_idle() {
                             // The gate is closed and empty: every accepted event
@@ -370,20 +494,17 @@ impl<T: Timestamp, D: Send + 'static> OperatorLogic for ChannelSourceLogic<T, D>
                     }
                     break;
                 }
-                Err(RecvError::Disconnected) => {
-                    if self
-                        .abandoned
-                        .as_ref()
-                        .is_some_and(|flag| flag.load(Ordering::SeqCst))
-                    {
-                        // Cut off by a cancellation, not closed: ending the
-                        // input would present a truncated stream as complete
-                        // before the executor notices the cancellation.
-                        break;
+                Err(RecvError::Disconnected) => match self.input_end(false) {
+                    InputEnd::Ends => {
+                        self.finish();
+                        return Ok(true);
                     }
-                    self.finish();
-                    return Ok(true);
-                }
+                    // Cut off by a cancellation, or the producer has not
+                    // returned yet: ending the input now could present a
+                    // truncated stream as complete.
+                    InputEnd::Waits => break,
+                    InputEnd::Fails(error) => return self.fail(made_progress, error),
+                },
             }
         }
         Ok(made_progress)
@@ -1470,36 +1591,77 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 0);
     }
 
+    /// An async source on `rx` whose producer's outcome is `producer` (and
+    /// whose input shares `gate`), with its output and its count of open
+    /// external inputs (one).
+    fn producer_source(
+        rx: InputRecv<InputEvent<u64, i32>>,
+        producer: &Arc<ProducerOutcome>,
+        gate: Option<Arc<InputGate>>,
+    ) -> (
+        OperatorShell<ChannelSourceLogic<u64, i32>>,
+        crate::dataflow::channels::bounded::BoundedPull<u64, i32, ()>,
+        Arc<AtomicUsize>,
+    ) {
+        let (push, pull) = bounded_channel::<u64, i32, ()>(1024);
+        let counter = Arc::new(AtomicUsize::new(1));
+        let mut output = CountedOutput::new(
+            "test:output".into(),
+            Box::new(push) as Box<dyn Push<u64, i32>>,
+            PortLedger::new(),
+            ProgressReporter::new(),
+            None,
+        );
+        output.set_reporter(ProgressReporter::new());
+        let mut logic = ChannelSourceLogic::new(rx, &output, counter.clone())
+            .with_producer(Some(Arc::clone(producer)));
+        if let Some(gate) = gate {
+            logic = logic.with_input_gate(gate);
+        }
+        let op = channel_source("async_input", 0, StageId::new(0), logic, output);
+        (op, pull, counter)
+    }
+
+    /// The source has not ended its input: unfinished, its output open, and
+    /// still counted as an open input.
+    fn assert_input_open(
+        op: &OperatorShell<ChannelSourceLogic<u64, i32>>,
+        pull: &crate::dataflow::channels::bounded::BoundedPull<u64, i32, ()>,
+        counter: &AtomicUsize,
+        what: &str,
+    ) {
+        assert!(!op.exhausted(), "{what}: the source finished");
+        assert!(!pull.is_exhausted(), "{what}: the output closed");
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "{what}: the input count");
+    }
+
+    fn producer_error(text: &str) -> crate::Error {
+        crate::Error::Io(std::io::Error::other(text.to_string()))
+    }
+
+    fn is_producer_error(error: &crate::Error, text: &str) -> bool {
+        matches!(error, crate::Error::Io(e) if e.to_string() == text)
+    }
+
+    /// A producer cut off by a cancellation (or never started) did not end
+    /// the input; one that completed did.
     #[test]
     fn abandoned_source_neither_finishes_nor_closes_its_output() {
         for abandoned in [false, true] {
             let (tx, rx) = mpsc::sync_channel::<InputEvent<u64, i32>>(16);
-            let (push, pull) = bounded_channel::<u64, i32, ()>(1024);
-            let counter = Arc::new(AtomicUsize::new(1));
-            let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let mut output = CountedOutput::new(
-                "test:output".into(),
-                Box::new(push) as Box<dyn Push<u64, i32>>,
-                PortLedger::new(),
-                ProgressReporter::new(),
-                None,
-            );
-            output.set_reporter(ProgressReporter::new());
-            let logic = ChannelSourceLogic::new(InputRecv::Std(rx), &output, counter.clone())
-                .with_abandon_flag(Some(Arc::clone(&flag)));
-            let mut op = channel_source("async_input", 0, StageId::new(0), logic, output);
-            // The pump flags a cancellation before it drops the sender.
-            flag.store(abandoned, Ordering::SeqCst);
+            let producer = Arc::new(ProducerOutcome::default());
+            let (mut op, pull, counter) = producer_source(InputRecv::Std(rx), &producer, None);
+            // The pump publishes the outcome before it drops the sender.
+            if abandoned {
+                producer.cancelled(false);
+            } else {
+                producer.complete();
+            }
             drop(tx);
             let outcome = op.activate().unwrap();
             if abandoned {
                 assert!(matches!(outcome, ActivationOutcome::Idle));
-                assert!(!op.exhausted());
-                assert!(
-                    !pull.is_exhausted(),
-                    "a cut-off input must not look complete"
-                );
-                assert_eq!(counter.load(Ordering::SeqCst), 1);
+                assert_input_open(&op, &pull, &counter, "cut off");
             } else {
                 assert!(op.exhausted());
                 op.shut_down();
@@ -1507,6 +1669,107 @@ mod tests {
                 assert_eq!(counter.load(Ordering::SeqCst), 0);
             }
         }
+    }
+
+    /// A producer can drop its sender before it returns: the closed channel
+    /// leaves the source waiting for the producer's outcome, which then
+    /// fails it or ends its input.
+    #[test]
+    fn a_closed_channel_waits_for_its_producers_outcome() {
+        for fails in [true, false] {
+            let (tx, rx) = mpsc::sync_channel::<InputEvent<u64, i32>>(16);
+            let producer = Arc::new(ProducerOutcome::default());
+            let (mut op, mut pull, counter) = producer_source(InputRecv::Std(rx), &producer, None);
+            tx.send(InputEvent::data(0, vec![1])).unwrap();
+            drop(tx);
+            assert!(matches!(
+                op.activate().unwrap(),
+                ActivationOutcome::MadeProgress
+            ));
+            assert_eq!(pull.pull().unwrap().as_data(), Some((&0, &vec![1])));
+            assert_input_open(&op, &pull, &counter, "closed, producer pending");
+            assert!(matches!(op.activate().unwrap(), ActivationOutcome::Idle));
+            assert_input_open(&op, &pull, &counter, "still pending");
+            if fails {
+                assert!(producer.fail(producer_error("the producer failed")));
+                let error = op.activate().unwrap_err();
+                assert!(is_producer_error(&error, "the producer failed"), "{error}");
+                assert_input_open(&op, &pull, &counter, "failed");
+            } else {
+                assert!(producer.complete());
+                op.activate().unwrap();
+                assert!(op.exhausted());
+                op.shut_down();
+                assert!(pull.is_exhausted());
+                assert_eq!(counter.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    /// A producer error fails the source while a clone of its sender keeps
+    /// the channel open, before the source reads what is queued.
+    #[test]
+    fn a_producer_failure_is_raised_while_its_channel_is_still_open() {
+        let (tx, rx) = mpsc::sync_channel::<InputEvent<u64, i32>>(16);
+        let producer = Arc::new(ProducerOutcome::default());
+        let (mut op, mut pull, counter) = producer_source(InputRecv::Std(rx), &producer, None);
+        tx.send(InputEvent::data(0, vec![1])).unwrap();
+        producer.fail(producer_error("failed with a sender still open"));
+        let error = op.activate().unwrap_err();
+        assert!(
+            is_producer_error(&error, "failed with a sender still open"),
+            "{error}"
+        );
+        assert!(pull.pull().is_none(), "nothing read after the failure");
+        assert_input_open(&op, &pull, &counter, "failed");
+        drop(tx);
+    }
+
+    /// The first outcome published stays: a cancellation (with or without a
+    /// drain) or a completion after a failure changes nothing, and the
+    /// source raises the failure once, then never ends its input.
+    #[test]
+    fn a_published_failure_is_not_replaced_by_a_later_outcome() {
+        let producer = Arc::new(ProducerOutcome::default());
+        assert!(producer.fail(producer_error("first")));
+        assert!(!producer.cancelled(true));
+        assert!(!producer.cancelled(false));
+        assert!(!producer.complete());
+        assert!(!producer.abandon());
+        let (tx, rx) = mpsc::sync_channel::<InputEvent<u64, i32>>(16);
+        let gate = Arc::new(InputGate::default());
+        let (mut op, pull, counter) = producer_source(InputRecv::Std(rx), &producer, Some(gate));
+        drop(tx);
+        op.close_external_input();
+        let error = op.activate().unwrap_err();
+        assert!(is_producer_error(&error, "first"), "{error}");
+        op.activate().unwrap();
+        assert_input_open(&op, &pull, &counter, "after the failure was raised");
+    }
+
+    /// A drain ends the input only once the producer stopped, and after
+    /// every event accepted before the drain closed it.
+    #[test]
+    fn a_drain_ends_the_input_once_its_producer_stopped() {
+        let (tx, rx) = mpsc::sync_channel::<InputEvent<u64, i32>>(16);
+        let producer = Arc::new(ProducerOutcome::default());
+        let gate = Arc::new(InputGate::default());
+        let (mut op, mut pull, counter) =
+            producer_source(InputRecv::Std(rx), &producer, Some(gate));
+        tx.send(InputEvent::data(0, vec![1])).unwrap();
+        tx.send(InputEvent::data(0, vec![2])).unwrap();
+        op.close_external_input();
+        op.activate().unwrap();
+        assert_eq!(pull.pull().unwrap().as_data(), Some((&0, &vec![1])));
+        assert_eq!(pull.pull().unwrap().as_data(), Some((&0, &vec![2])));
+        assert_input_open(&op, &pull, &counter, "drained, producer pending");
+        assert!(producer.cancelled(true));
+        op.activate().unwrap();
+        assert!(op.exhausted());
+        op.shut_down();
+        assert!(pull.is_exhausted());
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        drop(tx);
     }
 
     #[test]

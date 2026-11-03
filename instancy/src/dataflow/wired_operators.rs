@@ -19,6 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 
 use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::operators::handles::{InputHandle, NotifyContext, OutputHandle};
@@ -630,21 +631,25 @@ pub type AsyncLogicFn<T, D1, D2> =
 /// the call that takes it until the call that hands its result to the
 /// output: while it waits for a task slot, while its task runs, and while
 /// the result waits to be collected. A failed task keeps its capability;
-/// the operator fails.
+/// the operator fails. So does a task that ended without its result (its
+/// runtime shut down before or while it ran).
+///
+/// Dropping the operator detaches its tasks rather than aborting them: on a
+/// live runtime they run on, and their results are discarded.
 pub(crate) struct AsyncLogic<T: Timestamp, D1: Send + 'static, D2: Send + 'static> {
     name: String,
     logic: AsyncLogicFn<T, D1, D2>,
     max_concurrency: usize,
     /// The capability of each spawned task not yet collected, by task id.
-    in_flight: HashMap<u64, Capability<T>>,
-    next_task: u64,
-    result_tx: tokio::sync::mpsc::UnboundedSender<(u64, Result<Vec<D2>>)>,
-    result_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, Result<Vec<D2>>)>,
+    in_flight: HashMap<tokio::task::Id, Capability<T>>,
+    /// The spawned tasks not yet collected.
+    tasks: tokio::task::JoinSet<Result<Vec<D2>>>,
     /// Consumed input waiting for a task slot, with its capability.
     pending_input: VecDeque<(Capability<T>, Vec<D1>)>,
     tokio_handle: tokio::runtime::Handle,
-    /// Woken when a task completes, so the operator collects its result.
-    wake_handle: Option<WakeHandle>,
+    /// Polls `tasks`: wakes the executor when a task ends, so the operator
+    /// collects it.
+    waker: Waker,
     /// The progress checker's counts of `pending_input` and of running or
     /// uncollected tasks (one unit per task), both at the output: each is
     /// covered by a capability there.
@@ -652,6 +657,45 @@ pub(crate) struct AsyncLogic<T: Timestamp, D1: Send + 'static, D2: Send + 'stati
     check_input: Option<crate::progress::check::StoreCheck<T>>,
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     check_tasks: Option<crate::progress::check::StoreCheck<T>>,
+}
+
+/// Wakes an async operator's executor when one of its tasks ends.
+struct NotifyExecutor(WakeHandle);
+
+impl std::task::Wake for NotifyExecutor {
+    fn wake(self: Arc<Self>) {
+        self.0.notify();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.notify();
+    }
+}
+
+/// A `unary_async` task that ended without returning its result: it was
+/// cancelled, for example because its runtime shut down.
+#[derive(Debug, thiserror::Error)]
+#[error("unary_async task ended before returning a result")]
+struct TaskEndedWithoutResult(#[source] tokio::task::JoinError);
+
+/// A result from a task the operator has no record of. Every task is
+/// recorded as it is spawned, so this is a broken invariant.
+#[derive(Debug, thiserror::Error)]
+#[error("unary_async collected the result of a task it did not record")]
+struct UnrecordedTask;
+
+/// The operator's error for a task that did not return its result: a panic
+/// is the operator's panic; any other end fails the operator.
+fn task_failure(operator: &str, error: tokio::task::JoinError) -> Error {
+    if error.is_panic() {
+        Error::OperatorPanic {
+            operator: operator.to_string(),
+            worker_index: None,
+            message: format!("unary_async task panicked: {error}"),
+        }
+    } else {
+        Error::operator(operator, TaskEndedWithoutResult(error))
+    }
 }
 
 impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> AsyncLogic<T, D1, D2> {
@@ -671,59 +715,44 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> AsyncLogic<T, D1, D2>
                     check.remove(&time, data.len());
                 }
             }
-            let id = self.next_task;
-            self.next_task += 1;
             let logic = Arc::clone(&self.logic);
-            let tx = self.result_tx.clone();
-            let wake = self.wake_handle.clone();
-            let operator_name = self.name.clone();
-            // A nested spawn turns a panic into a JoinError.
-            let handle = self.tokio_handle.clone();
-            self.tokio_handle.spawn(async move {
-                let inner = handle.spawn(async move { logic(time, data).await });
-                let result = match inner.await {
-                    Ok(Ok(output)) => Ok(output),
-                    Ok(Err(e)) => Err(e),
-                    Err(join_err) => Err(Error::OperatorPanic {
-                        operator: operator_name,
-                        worker_index: None,
-                        message: format!("unary_async task panicked: {join_err}"),
-                    }),
-                };
-                let _ = tx.send((id, result));
-                if let Some(w) = wake {
-                    w.notify();
-                }
-            });
-            self.in_flight.insert(id, capability);
+            // The logic is called inside the task, so a panic building its
+            // future is the task's.
+            let task = self
+                .tasks
+                .spawn_on(async move { logic(time, data).await }, &self.tokio_handle);
+            // Recorded before the set is polled: the task may have ended.
+            self.in_flight.insert(task.id(), capability);
         }
     }
 
-    /// Collect completed results into the output session.
+    /// Collect ended tasks into the output session until none is ready.
+    /// Polling a set that has tasks registers `waker` for the next one.
     fn collect_results(&mut self, output: &mut OutputHandle<T, D2>) -> Result<bool> {
         let mut collected = false;
+        let mut cx = Context::from_waker(&self.waker);
         loop {
-            match self.result_rx.try_recv() {
-                Ok((id, Ok(data))) => {
+            match self.tasks.poll_join_next_with_id(&mut cx) {
+                Poll::Ready(Some(Ok((id, Ok(data))))) => {
                     let Some(capability) = self.in_flight.remove(&id) else {
-                        continue;
+                        return Err(Error::operator(self.name.clone(), UnrecordedTask));
                     };
                     let time = capability.time().clone();
                     #[cfg(any(debug_assertions, feature = "progress-check"))]
                     if let Some(check) = &self.check_tasks {
                         check.remove(&time, 1);
                     }
-                    // The capability was held when this call began, so it
-                    // justifies the output; dropping it now releases it in
-                    // the same commit as the output.
+                    // The capability was held when this call began, or the
+                    // call consumed its batch: either justifies the output.
+                    // Dropping it now releases it in the same commit.
                     output.push_vec(time, data);
                     drop(capability);
                     collected = true;
                 }
                 // The task's capability stays held: the operator fails.
-                Ok((_, Err(e))) => return Err(e),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-                | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                Poll::Ready(Some(Ok((_, Err(e))))) => return Err(e),
+                Poll::Ready(Some(Err(error))) => return Err(task_failure(&self.name, error)),
+                Poll::Ready(None) | Poll::Pending => break,
             }
         }
         Ok(collected)
@@ -755,7 +784,11 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> OperatorLogic for Asy
             took = true;
         }
         self.spawn_pending();
-        Ok(collected || took)
+        // Poll again now that the set holds the new tasks: polling an empty
+        // set registers no waker, so this registers it before the executor
+        // can park (even after this sweep), and collects a task that ended.
+        let collected_late = self.collect_results(output.handle())?;
+        Ok(collected || took || collected_late)
     }
 
     fn holds_work(&self) -> bool {
@@ -764,6 +797,13 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> OperatorLogic for Asy
 
     fn waiting_for_async(&self) -> bool {
         !self.in_flight.is_empty()
+    }
+}
+
+impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> Drop for AsyncLogic<T, D1, D2> {
+    fn drop(&mut self) {
+        // Dropping the set would abort the tasks: leave them running.
+        self.tasks.detach_all();
     }
 }
 
@@ -780,7 +820,6 @@ pub(crate) fn unary_async<T: Timestamp, D1: Send + 'static, D2: Send + 'static>(
     tokio_handle: tokio::runtime::Handle,
 ) -> OperatorShell<AsyncLogic<T, D1, D2>> {
     let name = name.into();
-    let (result_tx, result_rx) = tokio::sync::mpsc::unbounded_channel();
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     let check_input = output.check_port().map(|port| {
         crate::progress::check::StoreCheck::new(port, crate::progress::check::Store::AsyncInput)
@@ -789,7 +828,11 @@ pub(crate) fn unary_async<T: Timestamp, D1: Send + 'static, D2: Send + 'static>(
     let check_tasks = output.check_port().map(|port| {
         crate::progress::check::StoreCheck::new(port, crate::progress::check::Store::AsyncTask)
     });
-    let wake_handle = output.wake_handle().cloned();
+    // Without a wake handle (direct fixtures), nothing is woken.
+    let waker = match output.wake_handle() {
+        Some(wake) => Waker::from(Arc::new(NotifyExecutor(wake.clone()))),
+        None => Waker::noop().clone(),
+    };
     OperatorShell::new(
         name.clone(),
         index,
@@ -799,12 +842,10 @@ pub(crate) fn unary_async<T: Timestamp, D1: Send + 'static, D2: Send + 'static>(
             logic,
             max_concurrency: max_concurrency.max(1),
             in_flight: HashMap::new(),
-            next_task: 0,
-            result_tx,
-            result_rx,
+            tasks: tokio::task::JoinSet::new(),
             pending_input: VecDeque::new(),
             tokio_handle,
-            wake_handle,
+            waker,
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             check_input,
             #[cfg(any(debug_assertions, feature = "progress-check"))]
@@ -1561,5 +1602,140 @@ pub(crate) mod tests {
         assert!(op.exhausted());
         assert_eq!(drain(&mut pull_left), vec![(0, vec![1, 2])]);
         assert_eq!(drain(&mut pull_right), vec![(0, vec![1, 2])]);
+    }
+
+    /// Gives a signal when woken.
+    struct Observer(std::sync::Mutex<std::sync::mpsc::Sender<()>>);
+
+    impl std::task::Wake for Observer {
+        fn wake(self: Arc<Self>) {
+            let _ = self.0.lock().unwrap().send(());
+        }
+    }
+
+    /// The call that spawns a task already registers for its end: the
+    /// executor is woken when the task ends (here released, or destroyed
+    /// by its runtime's shutdown) without another activation of the
+    /// operator, which then collects the task's outcome.
+    #[test]
+    fn the_call_that_spawns_a_task_registers_for_its_end() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        for shutdown in [false, true] {
+            let host = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .build()
+                .unwrap();
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (entered_tx, entered) = mpsc::channel::<()>();
+            let entered_tx = Arc::new(std::sync::Mutex::new(entered_tx));
+            let task_gate = Arc::clone(&gate);
+            let logic: AsyncLogicFn<u64, i32, i32> = Arc::new(move |_t, batch| {
+                let (gate, entered) = (Arc::clone(&task_gate), Arc::clone(&entered_tx));
+                Box::pin(async move {
+                    let _ = entered.lock().unwrap().send(());
+                    gate.notified().await;
+                    Ok(batch)
+                })
+            });
+            let wake = WakeHandle::new();
+            let ch_in = make_channel::<u64, i32>();
+            let ch_out = make_channel::<u64, i32>();
+            let (mut push_in, mut pull_out) = (ch_in.pusher, ch_out.puller);
+            let mut op = unary_async(
+                "lookup",
+                1,
+                StageId::new(0),
+                logic,
+                4,
+                input(ch_in.puller),
+                CountedOutput::new(
+                    "out".into(),
+                    ch_out.pusher,
+                    PortLedger::new(),
+                    ProgressReporter::new(),
+                    Some(wake.clone()),
+                ),
+                host.handle().clone(),
+            );
+            push_in.push(Envelope::data(0, vec![1, 2])).unwrap();
+            assert_eq!(op.activate().unwrap(), ActivationOutcome::MadeProgress);
+            let (woken_tx, woken) = mpsc::channel();
+            wake.register_waker(&Waker::from(Arc::new(Observer(woken_tx.into()))));
+            wake.take_notification();
+            entered
+                .recv_timeout(Duration::from_secs(20))
+                .expect("the task started");
+            if shutdown {
+                drop(host);
+            } else {
+                gate.notify_one();
+            }
+            let woken = woken.recv_timeout(Duration::from_secs(20));
+            assert!(
+                woken.is_ok(),
+                "shutdown {shutdown}: the task's end woke the executor"
+            );
+            let outcome = op.activate();
+            if shutdown {
+                assert!(
+                    matches!(&outcome, Err(Error::Operator { operator, .. }) if operator == "lookup"),
+                    "the destroyed task fails the operator: {outcome:?}"
+                );
+            } else {
+                assert_eq!(outcome.unwrap(), ActivationOutcome::MadeProgress);
+                assert_eq!(drain(&mut pull_out), vec![(0, vec![1, 2])]);
+            }
+        }
+    }
+
+    /// A task that panicked is the operator's panic; a cancelled one (its
+    /// runtime shut down, or it was aborted) fails the operator, with the
+    /// task's end as cause.
+    #[test]
+    fn a_cancelled_task_fails_the_operator_and_a_panicking_one_is_its_panic() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (cancelled, panicked) = rt.block_on(async {
+            let mut tasks = tokio::task::JoinSet::<()>::new();
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let task_gate = Arc::clone(&gate);
+            tasks
+                .spawn(async move { task_gate.notified().await })
+                .abort();
+            let cancelled = tasks.join_next().await.unwrap().unwrap_err();
+            tasks.spawn(async { panic!("the task panicked") });
+            let panicked = tasks.join_next().await.unwrap().unwrap_err();
+            (cancelled, panicked)
+        });
+        match task_failure("lookup", cancelled) {
+            Error::Operator {
+                operator, source, ..
+            } => {
+                assert_eq!(operator, "lookup");
+                assert_eq!(
+                    source.to_string(),
+                    "unary_async task ended before returning a result"
+                );
+                let cause = source
+                    .source()
+                    .and_then(|cause| cause.downcast_ref::<tokio::task::JoinError>());
+                assert!(
+                    cause.is_some_and(|cause| cause.is_cancelled()),
+                    "{source:?}"
+                );
+            }
+            other => panic!("expected an operator error, got {other:?}"),
+        }
+        match task_failure("lookup", panicked) {
+            Error::OperatorPanic {
+                operator, message, ..
+            } => {
+                assert_eq!(operator, "lookup");
+                assert!(message.contains("the task panicked"), "{message}");
+            }
+            other => panic!("expected the operator's panic, got {other:?}"),
+        }
     }
 }

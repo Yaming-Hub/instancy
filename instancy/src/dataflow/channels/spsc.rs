@@ -288,15 +288,10 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Pull<T, D, M> for SpscP
         let slot = self.ring.wrap(head);
         // Safety: we are the sole consumer and the slot is initialized.
         let value = unsafe { (*self.ring.slots[slot].value.get()).assume_init_read() };
-        let was_full = self.ring.len_from(head, self.cached_tail) >= self.ring.capacity;
         self.ring
             .head
             .store(head.wrapping_add(1), Ordering::Release);
-        if was_full {
-            if let Some(ref wake) = self.wake {
-                wake.notify();
-            }
-        }
+        self.freed();
         Some(value)
     }
 
@@ -308,7 +303,6 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Pull<T, D, M> for SpscP
         if count == 0 {
             return 0;
         }
-        let was_full = count >= self.ring.capacity;
         buffer.reserve(count);
         for i in 0..count {
             let slot = self.ring.wrap(head.wrapping_add(i));
@@ -318,11 +312,7 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Pull<T, D, M> for SpscP
         self.ring
             .head
             .store(head.wrapping_add(count), Ordering::Release);
-        if was_full {
-            if let Some(ref wake) = self.wake {
-                wake.notify();
-            }
-        }
+        self.freed();
         count
     }
 
@@ -361,6 +351,19 @@ impl<T: Timestamp, D, M> SpscPush<T, D, M> {
 }
 
 impl<T: Timestamp, D, M> SpscPull<T, D, M> {
+    /// Notify the wake handle, if any, after `head` was advanced: a
+    /// producer refused for a full ring may push again.
+    ///
+    /// Every pull and every nonempty drain notifies, not only one that found
+    /// the ring full: the producer may fill the ring after this consumer last
+    /// read the tail, so whether it was refused cannot be told here. Such a
+    /// wake may be spurious. Without a wake handle nothing is notified.
+    fn freed(&self) {
+        if let Some(ref wake) = self.wake {
+            wake.notify();
+        }
+    }
+
     /// Returns the current number of envelopes available.
     pub fn len(&self) -> usize {
         let head = self.ring.head.load(Ordering::Relaxed);
@@ -508,6 +511,75 @@ mod tests {
         let (push, pull) = spsc_channel::<u64, i32, ()>(4);
         drop(push);
         assert!(pull.is_exhausted());
+    }
+
+    /// A waker that counts its wakes.
+    #[derive(Default)]
+    struct Wakes(AtomicUsize);
+
+    impl std::task::Wake for Wakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A pull that frees a full ring wakes the producer, even when the
+    /// consumer last read the tail before the push that filled the ring.
+    #[test]
+    fn pull_from_a_full_ring_wakes_the_producer() {
+        let (mut push, mut pull) = spsc_channel::<u64, i32, ()>(2);
+        let wake = WakeHandle::new();
+        pull.set_wake(wake.clone());
+        let wakes = Arc::new(Wakes::default());
+        wake.register_waker(&std::task::Waker::from(Arc::clone(&wakes)));
+        push.push(Envelope::data(0, vec![1])).unwrap();
+        push.push(Envelope::data(0, vec![2])).unwrap();
+        pull.pull().unwrap();
+        push.push(Envelope::data(0, vec![3])).unwrap();
+        assert!(
+            matches!(
+                push.push(Envelope::data(0, vec![4])),
+                Err(Error::Backpressure)
+            ),
+            "the ring is full"
+        );
+        wake.take_notification();
+        let woken = wakes.0.load(Ordering::SeqCst);
+        pull.pull().unwrap();
+        assert!(wake.take_notification(), "freeing a full ring notifies");
+        assert!(
+            wakes.0.load(Ordering::SeqCst) > woken,
+            "freeing a full ring wakes the producer"
+        );
+        push.push(Envelope::data(0, vec![4])).unwrap();
+    }
+
+    /// A drain that frees a full ring wakes the producer.
+    #[test]
+    fn drain_from_a_full_ring_wakes_the_producer() {
+        let (mut push, mut pull) = spsc_channel::<u64, i32, ()>(2);
+        let wake = WakeHandle::new();
+        pull.set_wake(wake.clone());
+        let wakes = Arc::new(Wakes::default());
+        wake.register_waker(&std::task::Waker::from(Arc::clone(&wakes)));
+        push.push(Envelope::data(0, vec![1])).unwrap();
+        push.push(Envelope::data(0, vec![2])).unwrap();
+        assert!(
+            matches!(
+                push.push(Envelope::data(0, vec![3])),
+                Err(Error::Backpressure)
+            ),
+            "the ring is full"
+        );
+        wake.take_notification();
+        let woken = wakes.0.load(Ordering::SeqCst);
+        assert_eq!(pull.drain_into(&mut Vec::new()), 2);
+        assert!(wake.take_notification(), "freeing a full ring notifies");
+        assert!(
+            wakes.0.load(Ordering::SeqCst) > woken,
+            "freeing a full ring wakes the producer"
+        );
+        push.push(Envelope::data(0, vec![3])).unwrap();
     }
 
     #[test]

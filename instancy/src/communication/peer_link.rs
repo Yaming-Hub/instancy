@@ -320,15 +320,12 @@ impl PeerMonitor {
     }
 
     /// Records from this peer were lost (`detail`): note it in the link's
-    /// ring and dump at once (the coordinator reports it too).
+    /// ring. Only an observation: the coordinator dumps a loss once its
+    /// lifecycle accepts it (a failure or a cancellation may explain it).
     #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
-    pub(crate) fn trace_lost(&self, detail: &str) {
+    pub(crate) fn note_lost(&self, detail: &str) {
         if let Some(recorder) = self.recorder() {
             recorder.note(crate::progress::trace::Note::Loss, detail);
-            recorder.trigger(
-                crate::progress::trace::Trigger::InboundDataLost,
-                &format!("records from peer {} were lost: {detail}", self.peer),
-            );
         }
     }
 

@@ -35,8 +35,13 @@
 //! A dump is written, at most once per dataflow and trigger kind, when:
 //!
 //! - a push finds records lost on a retired link (`data-lost`);
-//! - a receive bridge or the coordinator reports records that arrived for a
-//!   finished operator (`inbound-data-lost`);
+//! - a cluster node's lifecycle accepts a data loss on a link
+//!   (`inbound-data-lost`, a historical name: records lost on the way in,
+//!   but also corrupt traffic, a data channel that ended without its close
+//!   marker, or frames to the peer that could not be sent). Records a
+//!   receive bridge could not deliver are only noted in its ring when it
+//!   reports them: the lifecycle may yet explain them (a failure, a
+//!   cancellation) or leave them to a worker's result;
 //! - a worker proves a residual (`residual`);
 //! - the progress checker records a finding (`checker`);
 //! - a test calls [`dump_traces`] (`explicit`).
@@ -1035,6 +1040,7 @@ impl Recorder {
     }
 
     /// Dump every ring of this recorder's dataflow (see [`trigger`]).
+    #[cfg(test)]
     pub(crate) fn trigger(&self, trigger: Trigger, reason: &str) -> Option<PathBuf> {
         dump_entry(&self.entry, trigger, reason)
     }

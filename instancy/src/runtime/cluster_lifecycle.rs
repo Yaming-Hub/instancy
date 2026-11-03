@@ -1433,6 +1433,36 @@ fn cancel_broadcast_reason(dataflow_cancel: &CancellationToken) -> String {
     }
 }
 
+/// The flight recorder: the reason to dump the data loss `machine` has
+/// accepted, unless it was `dumped` already. A loss only observed (records
+/// a bridge could not deliver) is not dumped: the machine may yet explain it
+/// by a failure or a cancellation, or leave it to a worker's result. Every
+/// accepted loss counts, whatever its cause (records lost on the way in,
+/// corrupt traffic, a missing close marker, frames we could not send), even
+/// when a worker's own error is what the completion returns.
+#[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+fn accepted_loss_dump(machine: &LifecycleMachine, dumped: bool) -> Option<String> {
+    if dumped {
+        return None;
+    }
+    machine.data_loss().map(ToString::to_string)
+}
+
+/// The flight recorder: dump the data loss the machine of dataflow `id`
+/// accepted, once (`dumped`), as `inbound-data-lost` (the trigger's
+/// historical name).
+#[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+fn dump_accepted_loss(id: DataflowId, machine: &LifecycleMachine, dumped: &mut bool) {
+    if let Some(reason) = accepted_loss_dump(machine, *dumped) {
+        *dumped = true;
+        crate::progress::trace::trigger(
+            id,
+            crate::progress::trace::Trigger::InboundDataLost,
+            &reason,
+        );
+    }
+}
+
 /// Everything a cluster dataflow needs until teardown, plus the coordinator
 /// state. Field order matters: `_teardown` is dropped last so waiters resolve
 /// only after every resource has been released.
@@ -1463,10 +1493,10 @@ pub(crate) struct ClusterLifecycle {
     pub(crate) unfinished_announced: bool,
     /// The first local worker error other than a cancellation.
     pub(crate) worker_failure: Option<String>,
-    /// The flight recorder: a dump of records lost on the way in, written
-    /// once the actions the loss led to were taken.
+    /// The flight recorder: the data loss the machine accepted was dumped
+    /// (see [`dump_accepted_loss`]).
     #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
-    pub(crate) trace_pending: Option<String>,
+    pub(crate) loss_dumped: bool,
     /// Completes waiters when dropped, after every field above.
     pub(crate) _teardown: TeardownNotifier,
 }
@@ -1523,14 +1553,16 @@ impl ClusterLifecycle {
                     continue;
                 }
                 if self.perform(action).await {
+                    // After teardown, which may still record a loss reported
+                    // behind the event that finished the machine.
                     traced! {
-                        self.fire_trace_pending();
+                        self.trace_accepted_loss();
                     }
                     return;
                 }
             }
             traced! {
-                self.fire_trace_pending();
+                self.trace_accepted_loss();
             }
             // A peer that stopped without finishing its part sends no more
             // progress: its lanes close (after the actions above, so a
@@ -1557,31 +1589,21 @@ impl ClusterLifecycle {
                 peer,
                 event: LinkEvent::InboundDataLost(detail),
             } => {
-                #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
-                let traced = {
-                    let recorder = self
-                        .outboxes
-                        .get(&peer)
-                        .and_then(|outbox| outbox.link().recorder());
-                    (recorder.is_some() || crate::progress::trace::enabled())
-                        .then(|| (recorder, peer.clone(), detail.clone()))
-                };
-                let cancelled = self.dataflow_cancel.is_cancelled();
-                let actions = self.machine.on_inbound_data_lost(peer, detail, cancelled);
-                // Dumped once the actions the loss led to are taken: a dump
-                // must never delay the failure.
+                // Noted in the link's ring; dumped only if the machine
+                // accepts the loss (see `trace_accepted_loss`).
                 traced! {
                     use crate::progress::trace::{Ev, Kind, Note};
-                    if let Some((recorder, peer, detail)) = traced {
-                        if let Some(recorder) = recorder {
-                            recorder.record(Ev::new(Kind::Link).a(9));
-                            recorder.note(Note::Loss, &detail);
-                        }
-                        self.trace_pending
-                            .get_or_insert(format!("records from peer {peer} were lost: {detail}"));
+                    if let Some(recorder) = self
+                        .outboxes
+                        .get(&peer)
+                        .and_then(|outbox| outbox.link().recorder())
+                    {
+                        recorder.record(Ev::new(Kind::Link).a(9));
+                        recorder.note(Note::Loss, &detail);
                     }
                 }
-                actions
+                let cancelled = self.dataflow_cancel.is_cancelled();
+                self.machine.on_inbound_data_lost(peer, detail, cancelled)
             }
             LifecycleEvent::WorkerFinished { success, failure } => {
                 traced! {
@@ -1603,17 +1625,11 @@ impl ClusterLifecycle {
         }
     }
 
-    /// The flight recorder: write the dump of records lost on the way in,
-    /// once the actions the loss led to were taken.
+    /// The flight recorder: dump the data loss the machine accepted, once
+    /// the actions it led to were taken (a dump must never delay a failure).
     #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
-    fn fire_trace_pending(&mut self) {
-        if let Some(reason) = self.trace_pending.take() {
-            crate::progress::trace::trigger(
-                self.dataflow_id,
-                crate::progress::trace::Trigger::InboundDataLost,
-                &reason,
-            );
-        }
+    fn trace_accepted_loss(&mut self) {
+        dump_accepted_loss(self.dataflow_id, &self.machine, &mut self.loss_dumped);
     }
 
     /// The flight recorder: the coordinator's `action` (see
@@ -3203,6 +3219,345 @@ mod tests {
             "token cancelled: stashed"
         );
         assert!(m.data_loss().is_none());
+    }
+
+    /// The flight recorder dumps a data loss once the machine accepts it:
+    /// not while it waits for a worker's result or a drain, nor when a
+    /// failure explains it, but also when teardown replays it after the
+    /// machine finished. Deciding reads the machine only, so teardown still
+    /// announces a late loss.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[test]
+    fn only_an_accepted_data_loss_is_dumped() {
+        let lost_from_b = Some("data lost on the link to peer b: channel 7: late".to_string());
+        // Accepted at once: a worker already succeeded.
+        let (mut m, _) = machine(2, &[("b", 1)]);
+        m.on_event(done(true));
+        m.on_event(lost("b"));
+        assert_eq!(accepted_loss_dump(&m, false), lost_from_b);
+        assert_eq!(accepted_loss_dump(&m, true), None, "dumped once");
+        // Left to the finishing worker's result, or to a requested drain.
+        for success in [true, false] {
+            let (mut m, _) = machine(1, &[("b", 1)]);
+            m.on_event(lost("b"));
+            assert_eq!(accepted_loss_dump(&m, false), None, "deferred");
+            m.on_event(done(success));
+            let expected = if success { lost_from_b.clone() } else { None };
+            assert_eq!(
+                accepted_loss_dump(&m, false),
+                expected,
+                "worker ok: {success}"
+            );
+
+            let (mut m, _) = machine(1, &[("b", 1)]);
+            m.on_dataflow_cancelled(false);
+            m.on_event(lost("b"));
+            assert_eq!(accepted_loss_dump(&m, false), None, "pending");
+            m.on_event(done(success));
+            let expected = if success { lost_from_b.clone() } else { None };
+            assert_eq!(
+                accepted_loss_dump(&m, false),
+                expected,
+                "drained: {success}"
+            );
+        }
+        // Explained by a local failure.
+        let (mut m, _) = machine(2, &[("b", 1)]);
+        m.on_event(done(false));
+        m.on_event(lost("b"));
+        assert_eq!(accepted_loss_dump(&m, false), None, "explained");
+        // Replayed by teardown into the finished machine.
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        m.on_event(done(true));
+        m.on_event(link_event("b", LinkEvent::AckReceived));
+        assert_eq!(m.phase(), Phase::Finished);
+        assert_eq!(accepted_loss_dump(&m, false), None);
+        m.on_event(lost("b"));
+        assert_eq!(accepted_loss_dump(&m, false), lost_from_b);
+        assert_eq!(
+            m.take_unannounced_loss().map(|loss| loss.peer),
+            Some("b".to_string()),
+            "still announced to the peers"
+        );
+    }
+
+    /// Every cause of an accepted loss is dumped with that cause: corrupt
+    /// traffic (even when a worker's failure is what the completion
+    /// returns), a missing close marker, frames we could not send.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[test]
+    fn every_accepted_data_loss_is_dumped_with_its_cause() {
+        let decode = || LinkFailure::Decode("tag".into());
+        let (mut m, _) = machine(2, &[("b", 1)]);
+        m.on_event(done(false));
+        m.on_event(link_event("b", LinkEvent::DataChannelEnded(decode())));
+        assert_eq!(
+            accepted_loss_dump(&m, false),
+            Some(format!(
+                "data lost on the link to peer b: corrupt traffic from the peer: {}",
+                decode()
+            ))
+        );
+
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        m.on_event(link_event("b", LinkEvent::ProgressEndOfStream));
+        m.on_event(link_event(
+            "b",
+            LinkEvent::DataChannelEnded(LinkFailure::ChannelClosed),
+        ));
+        assert_eq!(
+            accepted_loss_dump(&m, false).as_deref(),
+            Some(
+                "data lost on the link to peer b: a data channel ended without its close \
+                 marker although the peer finished"
+            )
+        );
+
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        m.on_event(link_event(
+            "b",
+            LinkEvent::OutboundFailed(LinkFailure::SendFailed),
+        ));
+        m.on_event(done(true));
+        assert_eq!(accepted_loss_dump(&m, false), None, "not settled yet");
+        m.on_soft_failure_expired("b".into());
+        assert_eq!(
+            accepted_loss_dump(&m, false),
+            Some(format!(
+                "data lost on the link to peer b: frames to the peer could not be sent ({}) \
+                 while the dataflow ran",
+                LinkFailure::SendFailed
+            ))
+        );
+    }
+
+    /// Two nodes of one dataflow in one process share its dumps (one per
+    /// kind): a loss one node only observed reserves nothing, so the loss
+    /// the other accepts is dumped, with its own cause, once.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[test]
+    fn a_loss_one_node_ignored_leaves_the_dump_to_the_loss_another_accepted() {
+        use crate::progress::trace;
+        let dir = std::env::temp_dir().join(format!(
+            "instancy-trace-accepted-loss-{}",
+            DataflowId::new().as_uuid()
+        ));
+        let id = DataflowId::new();
+        let rings = [
+            trace::recorder_for_test(id, "node-a", None, "node-b", 2, &dir),
+            trace::recorder_for_test(id, "node-b", None, "node-a", 2, &dir),
+        ];
+        let root = dir.join(id.as_uuid().to_string());
+        // node-a's worker failed: the records it dropped are explained.
+        let (mut a, _) = machine(2, &[("node-b", 1)]);
+        a.on_event(done(false));
+        a.on_event(lost("node-b"));
+        let mut a_dumped = false;
+        dump_accepted_loss(id, &a, &mut a_dumped);
+        assert!(!a_dumped && !root.exists(), "nothing dumped for node-a");
+        // node-b accepts a loss from node-a.
+        let (mut b, _) = machine(2, &[("node-a", 1)]);
+        b.on_event(done(true));
+        b.on_event(link_event(
+            "node-a",
+            LinkEvent::InboundDataLost("channel 9: arrived late".into()),
+        ));
+        let mut b_dumped = false;
+        dump_accepted_loss(id, &b, &mut b_dumped);
+        dump_accepted_loss(id, &b, &mut b_dumped);
+        assert!(b_dumped);
+        let reason = std::fs::read_to_string(root.join("reason.txt")).unwrap();
+        assert_eq!(
+            reason.lines().next(),
+            Some(
+                "inbound-data-lost: data lost on the link to peer node-a: channel 9: arrived late"
+            )
+        );
+        let later: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .collect();
+        assert!(later.is_empty(), "one dump: {later:?}");
+        drop(rings);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A real coordinator on a node whose only peer is `peer`, for `machine`
+    /// and the `events` queued for it, over a connection whose far end is
+    /// returned (to read what the peer receives), with its teardown waiter.
+    /// The link to the peer records into `ring`.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn coordinator(
+        id: DataflowId,
+        machine: LifecycleMachine,
+        peer: &str,
+        events: Vec<LifecycleEvent>,
+        ring: &Arc<crate::progress::trace::Recorder>,
+    ) -> (
+        ClusterLifecycle,
+        crate::communication::transport::FramedReader<tokio::io::DuplexStream>,
+        TeardownWaiter,
+    ) {
+        let runtime = tokio::runtime::Handle::current();
+        let (local, remote) = tokio::io::duplex(64 * 1024);
+        let (reader, writer) = tokio::io::split(local);
+        let connection = crate::communication::transport_session::PeerConnection {
+            node_id: peer.to_string(),
+            reader,
+            writer,
+        };
+        let (session, _) = crate::communication::transport_session::TransportSession::new(
+            id,
+            vec![connection],
+            &[],
+            &[],
+            16,
+            &runtime,
+        )
+        .unwrap();
+        let (tx, rx) = tokio_mpsc::unbounded_channel();
+        for event in events {
+            tx.send(event).unwrap();
+        }
+        let (sink, _) = tokio_mpsc::channel(16);
+        let (outbox, forwarder) = crate::communication::peer_link::spawn_peer_outbox(
+            peer,
+            crate::communication::cluster_transport::FrameSender::Direct(sink),
+            tokio_mpsc::unbounded_channel().0,
+            &runtime,
+        );
+        outbox.link().attach_trace(Some(Arc::clone(ring)));
+        let (notifier, waiter) = teardown_signal(runtime);
+        let lifecycle = ClusterLifecycle {
+            machine,
+            events: rx,
+            dataflow_id: id,
+            dataflow_cancel: CancellationToken::new(),
+            bridge_cancel: tokio_util::sync::CancellationToken::new(),
+            local_workers: (0, 1),
+            peer_workers: HashMap::from([(peer.to_string(), (1, 2))]),
+            total_workers: 2,
+            cancel_broadcast_timeout: Duration::from_secs(5),
+            outboxes: HashMap::from([(peer.to_string(), outbox)]),
+            forwarders: HashMap::from([(peer.to_string(), forwarder)]),
+            inbound: InboundBridges::default(),
+            progress_handles: None,
+            dispatcher: None,
+            peer_registry: Arc::new(super::super::PeerRegistry::new()),
+            peer_registration: None,
+            shared_managers: None,
+            shared_registration: None,
+            transport: Arc::new(ClusterTransport::Dedicated(Arc::new(session))),
+            failure_announced: false,
+            unfinished_announced: false,
+            worker_failure: None,
+            loss_dumped: false,
+            _teardown: notifier,
+        };
+        let remote = crate::communication::transport::FramedReader::new(remote);
+        (lifecycle, remote, waiter)
+    }
+
+    /// Through the coordinator itself: a node whose worker failed ignores
+    /// the records it dropped and dumps nothing, so the loss another node of
+    /// the same dataflow accepts is the one dumped (at the checkpoint after
+    /// the actions it led to).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[tokio::test]
+    async fn a_coordinator_dumps_only_the_loss_its_machine_accepts() {
+        use crate::progress::trace;
+        let dir = std::env::temp_dir().join(format!(
+            "instancy-trace-coordinator-loss-{}",
+            DataflowId::new().as_uuid()
+        ));
+        let id = DataflowId::new();
+        let rings = [
+            trace::recorder_for_test(id, "node-a", None, "node-b", 2, &dir),
+            trace::recorder_for_test(id, "node-b", None, "node-a", 2, &dir),
+        ];
+        let root = dir.join(id.as_uuid().to_string());
+        let deadline = Duration::from_secs(10);
+
+        let (m, _) = machine(2, &[("node-b", 1)]);
+        let events = vec![done(false), lost("node-b"), done(false)];
+        let (a, _node_b, waiter) = coordinator(id, m, "node-b", events, &rings[0]);
+        tokio::time::timeout(deadline, a.run()).await.unwrap();
+        assert!(waiter.data_loss().is_none());
+        assert!(!root.exists(), "an ignored loss is not dumped");
+
+        let (m, _) = machine(2, &[("node-a", 1)]);
+        let late = link_event(
+            "node-a",
+            LinkEvent::InboundDataLost("channel 9: arrived late".into()),
+        );
+        let events = vec![done(true), late, done(true)];
+        let (b, _node_a, waiter) = coordinator(id, m, "node-a", events, &rings[1]);
+        tokio::time::timeout(deadline, b.run()).await.unwrap();
+        assert_eq!(
+            waiter.data_loss().map(|loss| loss.peer),
+            Some("node-a".to_string())
+        );
+        let reason = std::fs::read_to_string(root.join("reason.txt")).unwrap();
+        assert_eq!(
+            reason.lines().next(),
+            Some(
+                "inbound-data-lost: data lost on the link to peer node-a: channel 9: arrived late"
+            )
+        );
+        drop(rings);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The checkpoint after teardown: records reported behind the
+    /// acknowledgement that finished the machine are a loss only teardown
+    /// records. It is dumped, published to the completion, and announced to
+    /// the peer, which may still run on our output, as a failure.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[tokio::test]
+    async fn a_loss_recorded_by_teardown_is_dumped_published_and_announced() {
+        use crate::communication::control_protocol::{ControlMessage, decode_control_message};
+        use crate::progress::trace;
+        let dir = std::env::temp_dir().join(format!(
+            "instancy-trace-teardown-loss-{}",
+            DataflowId::new().as_uuid()
+        ));
+        let id = DataflowId::new();
+        let ring = trace::recorder_for_test(id, "node-a", None, "node-b", 2, &dir);
+        let (mut m, _) = machine(1, &[("node-b", 1)]);
+        m.on_event(done(true));
+        assert_eq!(m.phase(), Phase::Draining);
+        let events = vec![link_event("node-b", LinkEvent::AckReceived), lost("node-b")];
+        let (a, mut node_b, waiter) = coordinator(id, m, "node-b", events, &ring);
+        tokio::time::timeout(Duration::from_secs(10), a.run())
+            .await
+            .unwrap();
+
+        let loss = waiter.data_loss().expect("the completion reports the loss");
+        assert_eq!(
+            (loss.peer.as_str(), loss.detail.as_str()),
+            ("node-b", "channel 7: late")
+        );
+        let root = dir.join(id.as_uuid().to_string());
+        let reason = std::fs::read_to_string(root.join("reason.txt")).unwrap();
+        assert_eq!(
+            reason.lines().next(),
+            Some("inbound-data-lost: data lost on the link to peer node-b: channel 7: late")
+        );
+        let frame = tokio::time::timeout(Duration::from_secs(10), node_b.read_frame())
+            .await
+            .expect("the peer is told")
+            .unwrap();
+        match decode_control_message(&frame.payload) {
+            Ok(ControlMessage::Cancel { reason }) => assert!(
+                CancellationReason::describes_failure(&reason)
+                    && reason.contains("data lost on the link to peer node-b"),
+                "{reason}"
+            ),
+            other => panic!("expected a Cancel: {other:?}"),
+        }
+        drop(ring);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

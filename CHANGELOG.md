@@ -7,8 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### SPSC wake
+
+- **Fixed: an SPSC consumer with a wake handle wakes a producer it unblocks.**
+  `SpscPull::pull` decided whether the ring had been full from a stale view
+  of the tail, so a pull that freed a full ring could skip the wake; a pull
+  or `drain_into` racing the push that filled the ring could skip it too.
+  With a wake handle set (`set_wake`, `spsc_channel_with_wake`), every pull
+  and nonempty drain now notifies; some of these wakes are spurious.
+  Channels without a wake handle are unchanged.
+
 ### Test suite, docs and small fixes
 
+- **Fixed: a `unary_async` operator whose Tokio runtime shuts down fails its
+  dataflow.** The operator runs its tasks on the Tokio runtime that is
+  current when `unary_async` is called. If that runtime shut down before or
+  while a task ran, the dataflow used to wait for the task's result until it
+  was cancelled; it now fails with `Error::Operator` naming the operator. A
+  task that ended without a result is no longer reported as a panic:
+  `Error::OperatorPanic` is for tasks that panicked. Tasks that are still
+  running are not aborted when the dataflow is cancelled or fails, as
+  before. The docs now say which runtime runs the tasks and that it must
+  stay alive and running.
+- **Fixed: a `source_async` producer error fails the dataflow.** A
+  producer that returns `Err` now fails its dataflow with the error in the
+  source's operator context (`Error::Operator`, naming the source, with the
+  original cause), unless the dataflow's cancellation had already been
+  observed when the result was classified: then it counts as the
+  cancellation and does not by itself fail a graceful drain. A producer
+  that panics fails the dataflow too, and fails a drain even when it
+  panics while being stopped. Completion waits for the producer's result,
+  not just for its sender to close. It used to log the error and end the
+  input as if the producer had finished, so the dataflow could succeed with
+  only part of its input. **Migration:** a producer that returned `Err` as
+  a normal end of input must return `Ok(())` instead.
 - **Fixed: a refused Shared spawn no longer cancels another run.** A
   Shared `spawn_cluster` now claims its `DataflowId` with every peer
   manager before anything else can fail, and a spawn refused because

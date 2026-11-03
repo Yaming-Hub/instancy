@@ -100,6 +100,8 @@ builder
     .output("results");
 ```
 
+An error returned with `?` (here from `fetch_batch`) fails the dataflow with that error, naming the source. To end the input on a condition you expect, return `Ok(())`: dropping the sender alone does not end it.
+
 ### Poll a database or HTTP endpoint on a timer
 Wrap the external client in the async source; instancy handles the backpressure boundary.
 
@@ -125,7 +127,7 @@ builder
 ```
 
 ### Make async sources cancellation-aware
-Share a `CancellationToken` with the task that owns the runtime, or stop when `send()` starts failing.
+Share a `CancellationToken` with the task that owns the runtime, or stop when `send()` starts failing. Returning that failure with `?` is fine too: an error classified after the dataflow's cancellation was observed counts as the cancellation, so it does not fail a graceful drain by itself.
 
 ```rust
 use instancy::{CancellationToken, DataflowBuilder};

@@ -264,16 +264,38 @@ pub(crate) type AsyncSourceWiring = Box<
 /// source does not finish as if its input had ended.
 struct UnstartedPumpInput<T: Timestamp, D: Send + 'static> {
     sender: Option<crate::dataflow::channel_operators::AsyncInputSender<T, D>>,
-    abandoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    outcome: std::sync::Arc<crate::dataflow::channel_operators::ProducerOutcome>,
 }
 
 impl<T: Timestamp, D: Send + 'static> Drop for UnstartedPumpInput<T, D> {
     fn drop(&mut self) {
         if self.sender.is_some() {
-            self.abandoned
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.outcome.abandon();
         }
         // `sender` (if still here) is dropped after this, closing the channel.
+    }
+}
+
+/// A producer that ended without returning a result (it panicked).
+#[derive(Debug, thiserror::Error)]
+#[error("the async source's producer ended without returning a result")]
+struct ProducerEndedWithoutResult;
+
+/// Held by a running pump: if the producer ends without a result (its pump
+/// unwinds), publishes a failure naming the source and wakes the worker, so
+/// a panic neither passes as the end of input nor leaves the source waiting.
+struct UnresolvedProducer {
+    outcome: std::sync::Arc<crate::dataflow::channel_operators::ProducerOutcome>,
+    wake: WakeHandle,
+    source: String,
+}
+
+impl Drop for UnresolvedProducer {
+    fn drop(&mut self) {
+        let error = Error::operator(self.source.clone(), ProducerEndedWithoutResult);
+        if self.outcome.fail(error) {
+            self.wake.notify();
+        }
     }
 }
 
@@ -819,14 +841,35 @@ impl<T: Timestamp> DataflowBuilder<T> {
     ///
     /// # Cancellation
     ///
-    /// When the dataflow is cancelled, the producer's `sender.send()` will
-    /// return an error (channel closed). The producer should handle this by
-    /// returning from the async block.
+    /// When the dataflow is cancelled, the producer is stopped (its future is
+    /// dropped), and a pending or later `sender.send()` fails with
+    /// [`crate::Error::ChannelClosed`]. A producer that observes that error
+    /// may return it with `?`: an error the producer returns counts as the
+    /// cancellation, not as a failure, when the cancellation has already
+    /// been observed as the error is classified (when its pump receives the
+    /// result, not when the producer created it), even an error of its own.
+    /// With [`drain_on_cancel`](crate::SpawnOptions::drain_on_cancel) the
+    /// source then ends once every record it accepted is processed; without
+    /// a drain the dataflow stops as cancelled. A producer that panics fails
+    /// a drain, even when it panics while being stopped (for example, a
+    /// value it holds panics when dropped).
     ///
     /// # Errors
     ///
-    /// If the producer returns `Err`, the pump task logs the error and
-    /// closes the channel, causing the source operator to finish gracefully.
+    /// If the producer returns `Err` and no cancellation has been observed
+    /// when its result is classified, the dataflow fails with that error in
+    /// the source's operator context ([`crate::Error::Operator`]), even
+    /// while a clone of the sender keeps the channel open; a producer that
+    /// panics fails it too. Records it sent before failing may already have
+    /// reached the outputs: check the dataflow's result before accepting
+    /// them.
+    ///
+    /// The input ends only once the producer returns `Ok(())` and the
+    /// channel is closed: dropping or closing the sender alone does not end
+    /// it, and a producer that does so and keeps running keeps the source
+    /// open until it returns or the dataflow is cancelled. To end the input
+    /// on a condition you expect (the end of a file, an exhausted cursor),
+    /// return `Ok(())`.
     ///
     /// The producer closure must be `Clone` so repeated materializations can
     /// spawn one independent pump per worker.
@@ -881,14 +924,14 @@ impl<T: Timestamp> DataflowBuilder<T> {
             let wiring: AsyncSourceWiring = Box::new(
                 move |external_inputs_open, wake_handle, cancel, drains_on_cancel| {
                     use crate::dataflow::channel_operators::{
-                        AsyncInputSender, InputGate, InputRecv,
+                        AsyncInputSender, InputGate, InputRecv, ProducerOutcome,
                     };
 
-                    // Set when the channel closes without the producer having
-                    // ended the input: the pump never ran it, or (without a
-                    // drain) a cancellation cut it off. The source then does
-                    // not finish (and close its output) as if the input ended.
-                    let abandoned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    // How the producer ended: the source finishes only once
+                    // the producer returned Ok (or stopped for a drain), fails
+                    // with its error, and stays unfinished if the pump never
+                    // ran it or (without a drain) a cancellation cut it off.
+                    let outcome = std::sync::Arc::new(ProducerOutcome::default());
                     let producer = producer.clone();
                     let (tx, rx) = tokio::sync::mpsc::channel::<InputEvent<T, D>>(channel_cap);
                     let gate = std::sync::Arc::new(InputGate::default());
@@ -897,7 +940,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                             AsyncInputSender::with_wake_handle(tx, wake_handle.clone())
                                 .with_input_gate(std::sync::Arc::clone(&gate)),
                         ),
-                        abandoned: std::sync::Arc::clone(&abandoned),
+                        outcome: std::sync::Arc::clone(&outcome),
                     };
 
                     let factory = channel_source_factory::<T, D>(
@@ -905,7 +948,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                         op_idx,
                         InputRecv::Tokio(rx),
                         Some(std::sync::Arc::clone(&gate)),
-                        Some(abandoned.clone()),
+                        Some(outcome),
                         std::sync::Arc::clone(&external_inputs_open),
                         source_reporter.clone(),
                         "async source channel",
@@ -948,39 +991,49 @@ impl<T: Timestamp> DataflowBuilder<T> {
                         let Some(sender) = pump_input.sender.take() else {
                             return;
                         };
-                        let pump_abandoned = std::sync::Arc::clone(&pump_input.abandoned);
+                        let outcome = std::sync::Arc::clone(&pump_input.outcome);
                         rt.block_on(async move {
-                            // Run producer with cancellation support.
+                            // Dropped unresolved only if the producer, or its
+                            // destruction, unwinds.
+                            let unresolved = UnresolvedProducer {
+                                outcome,
+                                wake: pump_wake.clone(),
+                                source: pump_name.clone(),
+                            };
+                            // Run producer with cancellation support. Each
+                            // outcome is published by a handler, which runs
+                            // once both branch futures are dropped: if the
+                            // producer unwinds while being dropped, the
+                            // unresolved guard still publishes its failure.
+                            // Until then the closed channel does not end the
+                            // input (the outcome is pending).
                             tokio::select! {
                                 biased;
-                                _ = async {
-                                    cancel.cancelled_async().await;
-                                    // Without a drain, flag the cut before the
-                                    // sender is dropped. With a drain the source
-                                    // finishes so the drain can complete.
-                                    if !drains_on_cancel {
-                                        pump_abandoned
-                                            .store(true, std::sync::atomic::Ordering::SeqCst);
-                                    }
-                                } => {
-                                    // Dataflow cancelled — drop sender to close channel.
+                                _ = cancel.cancelled_async() => {
+                                    // With a drain the input ends here;
+                                    // without one it was cut off.
+                                    unresolved.outcome.cancelled(drains_on_cancel);
                                 }
-                                result = producer(sender) => {
-                                    if let Err(e) = result {
-                                        // Producer returned an error. Log it and close the
-                                        // channel by dropping sender, causing the
-                                        // ChannelSourceOperator to finish gracefully.
+                                result = producer(sender) => match result {
+                                    Ok(()) => {
+                                        unresolved.outcome.complete();
+                                    }
+                                    // A cancellation observed by now decides,
+                                    // whatever the error: a drain closing the
+                                    // input fails a pending send.
+                                    Err(_) if cancel.is_cancelled() => {
+                                        unresolved.outcome.cancelled(drains_on_cancel);
+                                    }
+                                    Err(error) => {
                                         #[cfg(feature = "tracing")]
                                         tracing::warn!(
                                             source = %pump_name,
-                                            error = %e,
+                                            error = %error,
                                             "async source producer failed"
                                         );
-                                        let _ = e; // suppress unused warning when tracing is off
+                                        unresolved.outcome.fail(error);
                                     }
-                                    // On success, sender is dropped here too, which
-                                    // closes the channel and signals completion.
-                                }
+                                },
                             }
                             // Notify executor that the source has finished/changed.
                             pump_wake.notify();
@@ -2089,6 +2142,30 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// Output order matches **completion order**, not input order. If strict
     /// ordering is required, include sequence information in the data and sort
     /// downstream.
+    ///
+    /// # Tokio runtime
+    ///
+    /// The tasks run on the Tokio runtime that is current when `unary_async`
+    /// is called (it is captured then), which need not be the runtime of the
+    /// [`RuntimeHandle`](crate::RuntimeHandle) that runs the dataflow. Keep
+    /// that runtime alive, and running its tasks, while the dataflow runs:
+    /// for example, do not block the only thread of a current-thread runtime
+    /// in `join_blocking()`. If the runtime shuts down before or while a task
+    /// runs, the dataflow fails with [`Error::Operator`] naming this
+    /// operator. A task that never ends (its runtime is not driven, or the
+    /// task blocks) keeps the dataflow waiting until it is cancelled or a
+    /// drain's deadline passes.
+    ///
+    /// # Errors
+    ///
+    /// A task that returns `Err` fails the dataflow with that error; a task
+    /// that panics fails it with [`Error::OperatorPanic`].
+    ///
+    /// # Cancellation
+    ///
+    /// Cancelling the dataflow, or its failure, does not abort tasks that
+    /// are already running: they run to their end on their runtime, and
+    /// their results are discarded. A graceful drain waits for them.
     ///
     /// # Example
     ///
@@ -5349,7 +5426,7 @@ fn channel_source_factory<T: Timestamp, D: Clone + Send + 'static>(
     op_idx: usize,
     receiver: crate::dataflow::channel_operators::InputRecv<InputEvent<T, D>>,
     gate: Option<Arc<crate::dataflow::channel_operators::InputGate>>,
-    abandoned: Option<Arc<std::sync::atomic::AtomicBool>>,
+    producer: Option<Arc<crate::dataflow::channel_operators::ProducerOutcome>>,
     external_inputs_open: Arc<std::sync::atomic::AtomicUsize>,
     fallback_reporter: ProgressReporter<T>,
     resource: &'static str,
@@ -5368,7 +5445,7 @@ fn channel_source_factory<T: Timestamp, D: Clone + Send + 'static>(
         }
         let mut logic =
             ChannelSourceLogic::new(receiver, &output, Arc::clone(&external_inputs_open))
-                .with_abandon_flag(abandoned.clone());
+                .with_producer(producer.clone());
         if let Some(gate) = &gate {
             logic = logic.with_input_gate(Arc::clone(gate));
         }
@@ -5391,12 +5468,13 @@ mod tests {
 
     /// A pump dropped before it starts its producer marks the source
     /// abandoned before the receiver can observe the closed channel; a
-    /// started pump does not.
+    /// started pump does not (its producer's outcome is still to come).
     #[test]
     fn unstarted_pump_input_marks_the_source_abandoned_before_closing() {
         for started in [false, true] {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<InputEvent<u64, u64>>(1);
-            let abandoned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let outcome =
+                std::sync::Arc::new(crate::dataflow::channel_operators::ProducerOutcome::default());
             let mut input = UnstartedPumpInput {
                 sender: Some(
                     crate::dataflow::channel_operators::AsyncInputSender::with_wake_handle(
@@ -5404,7 +5482,7 @@ mod tests {
                         WakeHandle::new(),
                     ),
                 ),
-                abandoned: std::sync::Arc::clone(&abandoned),
+                outcome: std::sync::Arc::clone(&outcome),
             };
             let producer_sender = if started { input.sender.take() } else { None };
             drop(input);
@@ -5413,11 +5491,8 @@ mod tests {
                 rx.try_recv(),
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
             ));
-            assert_eq!(
-                abandoned.load(std::sync::atomic::Ordering::SeqCst),
-                !started,
-                "started={started}"
-            );
+            // Only a still pending outcome can be published now.
+            assert_eq!(outcome.complete(), started, "started={started}");
         }
     }
 
