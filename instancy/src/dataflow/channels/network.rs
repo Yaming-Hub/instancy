@@ -2048,10 +2048,18 @@ mod tests {
             outbox: &PeerOutbox,
             sender: tokio_mpsc::Sender<Frame>,
         ) -> NetworkPush<u64, u64> {
+            push_to_with_id(outbox, sender, DataflowId::new())
+        }
+
+        fn push_to_with_id(
+            outbox: &PeerOutbox,
+            sender: tokio_mpsc::Sender<Frame>,
+            dataflow_id: DataflowId,
+        ) -> NetworkPush<u64, u64> {
             NetworkPush {
                 time_codec: u64::codec(),
                 data_codec: u64::codec(),
-                dataflow_id: DataflowId::new(),
+                dataflow_id,
                 channel_id: 5,
                 sender: crate::communication::cluster_transport::FrameSender::Direct(sender),
                 outbox: Some(outbox.clone()),
@@ -2062,6 +2070,277 @@ mod tests {
                 worker_completed: None,
                 closed: false,
                 trace_frames: Default::default(),
+            }
+        }
+
+        /// Schedule tests of record admission against link retirement, under
+        /// Shuttle (Linux, `RUSTFLAGS="--cfg instancy_shuttle"`; see
+        /// `docs/testing/nextest.md`). Pushes of one record each race
+        /// `retire()` followed by the acknowledgement on the same transport
+        /// queue. Shuttle's depth-first scheduler runs every interleaving of
+        /// the link's flag and admission lock. The Tokio queue is opaque to
+        /// it (each call is one step), and the outbox's runtime is never
+        /// driven.
+        ///
+        /// A push that re-checked retirement after enqueueing could report a
+        /// record lost that was already queued ahead of the acknowledgement:
+        /// these tests fail on such a push.
+        #[cfg(all(test, target_os = "linux", instancy_shuttle))]
+        mod send_retire_shuttle {
+            use super::*;
+            use crate::communication::cluster_transport::FrameSender;
+            use crate::error::CommunicationError;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use tokio_mpsc::error::TryRecvError;
+
+            const ACK_CHANNEL: u64 = 1;
+
+            /// How the records of every execution ended, counted after the
+            /// execution's assertions passed. Never read during an execution.
+            struct Outcomes {
+                admitted: AtomicUsize,
+                lost: AtomicUsize,
+                /// Executions in which one record was admitted and another
+                /// lost.
+                mixed: AtomicUsize,
+            }
+
+            impl Outcomes {
+                const fn new() -> Self {
+                    Self {
+                        admitted: AtomicUsize::new(0),
+                        lost: AtomicUsize::new(0),
+                        mixed: AtomicUsize::new(0),
+                    }
+                }
+            }
+
+            fn dataflow_id() -> DataflowId {
+                DataflowId::from_bytes([0x35; 16])
+            }
+
+            fn record() -> Envelope<u64, u64, ()> {
+                Envelope::data(1u64, vec![10u64, 11])
+            }
+
+            /// The record's frame on `channel`, as `(channel, payload)`.
+            fn record_frame(channel: u64) -> (u64, Vec<u8>) {
+                let mut payload = Vec::new();
+                encode_envelope(&u64::codec(), &u64::codec(), &record(), &mut payload).unwrap();
+                (channel, payload)
+            }
+
+            fn ack_frame() -> (u64, Vec<u8>) {
+                (
+                    ACK_CHANNEL,
+                    crate::progress::network_progress::encode_progress_ack(),
+                )
+            }
+
+            /// The peer reading while the push and retirement race: twice,
+            /// yield and then try one receive. Two reads suffice: the queue
+            /// holds at most the record and the acknowledgement, and the search
+            /// places each read at every point.
+            fn receive(
+                mut rx: tokio_mpsc::Receiver<Frame>,
+            ) -> (tokio_mpsc::Receiver<Frame>, Vec<Frame>) {
+                let mut taken = Vec::new();
+                for _ in 0..2 {
+                    shuttle::thread::yield_now();
+                    match rx.try_recv() {
+                        Ok(frame) => taken.push(frame),
+                        Err(TryRecvError::Empty) => {}
+                        Err(TryRecvError::Disconnected) => panic!("the transport queue closed"),
+                    }
+                }
+                (rx, taken)
+            }
+
+            /// One execution: a push per channel in `channels`, one record
+            /// each, while the link retires and the acknowledgement is
+            /// queued; with `drain`, the peer reads concurrently. Then check
+            /// what the queue carried against what each push returned.
+            fn race(channels: &[u64], drain: bool, outcomes: &Outcomes) {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                // Room for the records and the acknowledgement: none waits.
+                let (tx, rx) = tokio_mpsc::channel::<Frame>(4);
+                let (events, events_rx) = tokio_mpsc::unbounded_channel();
+                let (outbox, forwarder) = spawn_peer_outbox(
+                    "node-b",
+                    FrameSender::Direct(tx.clone()),
+                    events,
+                    runtime.handle(),
+                );
+                let pushers: Vec<_> = channels
+                    .iter()
+                    .map(|&channel| {
+                        let mut push = push_to_with_id(&outbox, tx.clone(), dataflow_id());
+                        push.channel_id = channel;
+                        shuttle::thread::spawn(move || push.push(record()))
+                    })
+                    .collect();
+                let link = Arc::clone(outbox.link());
+                let retirer = shuttle::thread::spawn(move || {
+                    link.retire();
+                    // Queued directly: the outbox's forwarder never runs.
+                    let (channel_id, payload) = ack_frame();
+                    tx.try_send(Frame {
+                        dataflow_id: dataflow_id(),
+                        channel_id,
+                        payload,
+                    })
+                    .expect("room for the acknowledgement");
+                });
+                let mut rx = Some(rx);
+                let receiver = drain.then(|| {
+                    let rx = rx.take().unwrap();
+                    shuttle::thread::spawn(move || receive(rx))
+                });
+
+                let sent: Vec<_> = pushers
+                    .into_iter()
+                    .map(|pusher| pusher.join().unwrap())
+                    .collect();
+                retirer.join().unwrap();
+                let (mut rx, mut frames) = match receiver {
+                    Some(receiver) => receiver.join().unwrap(),
+                    None => (rx.take().unwrap(), Vec::new()),
+                };
+                // Then what is still queued: at most the records and the ack.
+                for _ in 0..=channels.len() {
+                    match rx.try_recv() {
+                        Ok(frame) => frames.push(frame),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => panic!("the transport queue closed"),
+                    }
+                }
+                assert!(
+                    matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+                    "nothing but the records and the acknowledgement is queued"
+                );
+                let frames: Vec<(u64, Vec<u8>)> = frames
+                    .into_iter()
+                    .map(|frame| {
+                        assert_eq!(frame.dataflow_id, dataflow_id());
+                        (frame.channel_id, frame.payload)
+                    })
+                    .collect();
+                let acks = frames.iter().filter(|(c, _)| *c == ACK_CHANNEL).count();
+                assert_eq!(acks, 1, "one acknowledgement: {frames:?}");
+                let at = frames.iter().position(|(c, _)| *c == ACK_CHANNEL).unwrap();
+                assert_eq!(frames[at], ack_frame());
+                let ahead = &frames[..at];
+
+                let mut admitted = 0;
+                for (&channel, sent) in channels.iter().zip(&sent) {
+                    let record = record_frame(channel);
+                    match sent {
+                        Ok(()) => {
+                            assert_eq!(
+                                ahead.iter().filter(|frame| **frame == record).count(),
+                                1,
+                                "an admitted record precedes the acknowledgement: {frames:?}"
+                            );
+                            admitted += 1;
+                        }
+                        Err(Error::Communication(CommunicationError::DataLoss { .. })) => {
+                            assert!(
+                                !ahead.contains(&record),
+                                "false data loss: the record reported lost was queued \
+                                 ahead of the acknowledgement: {frames:?}"
+                            );
+                            assert!(
+                                !frames.contains(&record),
+                                "a record reported lost is not queued: {frames:?}"
+                            );
+                        }
+                        Err(error) => panic!("unexpected push error: {error:?}"),
+                    }
+                }
+                assert_eq!(
+                    frames.len(),
+                    admitted + 1,
+                    "only the admitted records and the acknowledgement are queued: {frames:?}"
+                );
+                let lost = channels.len() - admitted;
+                outcomes.admitted.fetch_add(admitted, Ordering::Relaxed);
+                outcomes.lost.fetch_add(lost, Ordering::Relaxed);
+                if admitted > 0 && lost > 0 {
+                    outcomes.mixed.fetch_add(1, Ordering::Relaxed);
+                }
+
+                forwarder.abort();
+                drop(forwarder);
+                drop(runtime);
+                drop((outbox, rx, events_rx));
+            }
+
+            /// Run `race` in every interleaving, depth first: no seed, no
+            /// sampling.
+            fn explore(channels: &'static [u64], drain: bool, outcomes: &'static Outcomes) {
+                crate::progress::trace::set_dir(None);
+                assert!(
+                    !crate::progress::trace::active(),
+                    "no flight recorder is current"
+                );
+                outcomes.admitted.store(0, Ordering::Relaxed);
+                outcomes.lost.store(0, Ordering::Relaxed);
+                outcomes.mixed.store(0, Ordering::Relaxed);
+
+                let mut config = shuttle::Config::new();
+                config.stack_size = 0x10_0000;
+                config.max_steps = shuttle::MaxSteps::FailAfter(10_000);
+                config.max_time = None;
+                let scheduler = shuttle::scheduler::DfsScheduler::new(None, false);
+                let executions = shuttle::Runner::new(scheduler, config)
+                    .run(move || race(channels, drain, outcomes));
+
+                let admitted = outcomes.admitted.load(Ordering::Relaxed);
+                let lost = outcomes.lost.load(Ordering::Relaxed);
+                let mixed = outcomes.mixed.load(Ordering::Relaxed);
+                println!(
+                    "{executions} interleavings: {admitted} records admitted, {lost} lost; \
+                     {mixed} interleavings admitted one record and lost another"
+                );
+                assert!(executions > 0, "no interleaving ran");
+                assert_eq!(
+                    admitted + lost,
+                    executions * channels.len(),
+                    "every interleaving was checked"
+                );
+                assert!(
+                    admitted > 0 && lost > 0,
+                    "both outcomes explored: {admitted} admitted, {lost} lost"
+                );
+                assert!(
+                    channels.len() == 1 || mixed > 0,
+                    "an admitted and a lost record in one interleaving"
+                );
+            }
+
+            /// The peer reads only after both sides finished.
+            #[test]
+            fn admitted_record_precedes_ack() {
+                static OUTCOMES: Outcomes = Outcomes::new();
+                explore(&[5], false, &OUTCOMES);
+            }
+
+            /// The peer reads while the push and retirement race, and may
+            /// take the record before the link retires.
+            #[test]
+            fn drained_record_is_not_reported_lost() {
+                static OUTCOMES: Outcomes = Outcomes::new();
+                explore(&[5], true, &OUTCOMES);
+            }
+
+            /// Two pushes, on two channels, may hold the admission lock shared
+            /// at once while the link retires.
+            #[test]
+            fn concurrent_records_precede_ack() {
+                static OUTCOMES: Outcomes = Outcomes::new();
+                explore(&[5, 6], false, &OUTCOMES);
             }
         }
 

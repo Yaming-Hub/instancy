@@ -41,8 +41,19 @@
 //! sibling computations.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+// Schedule tests substitute modeled synchronization for the token's flag and
+// locks (Linux only): Loom's under `--cfg instancy_loom` (see
+// `cancellation_loom`), Shuttle's under `--cfg instancy_shuttle` (see
+// `cancellation_shuttle`).
+#[cfg(all(test, target_os = "linux", instancy_loom))]
+use loom::sync::{Mutex, atomic::AtomicBool};
+#[cfg(all(test, target_os = "linux", instancy_shuttle))]
+use shuttle::sync::{Mutex, atomic::AtomicBool};
+#[cfg(not(all(test, target_os = "linux", any(instancy_loom, instancy_shuttle))))]
+use std::sync::{Mutex, atomic::AtomicBool};
 
 use crate::dataflow::channels::wake::{WakeHandle, WeakWakeHandle};
 
@@ -242,6 +253,23 @@ struct TokenInner {
     escalation: std::sync::OnceLock<CancellationReason>,
 }
 
+// The schedule tests explore interleavings only if the token's flag and
+// reason lock are the tool's models.
+#[cfg(all(test, target_os = "linux", instancy_loom))]
+const _: for<'a> fn(
+    &'a TokenInner,
+) -> (
+    &'a loom::sync::atomic::AtomicBool,
+    &'a loom::sync::Mutex<Option<CancellationReason>>,
+) = |inner| (&inner.cancelled, &inner.reason);
+#[cfg(all(test, target_os = "linux", instancy_shuttle))]
+const _: for<'a> fn(
+    &'a TokenInner,
+) -> (
+    &'a shuttle::sync::atomic::AtomicBool,
+    &'a shuttle::sync::Mutex<Option<CancellationReason>>,
+) = |inner| (&inner.cancelled, &inner.reason);
+
 /// A cooperative cancellation signal for dataflow shutdown.
 ///
 /// `CancellationToken` is cheap to clone (Arc-based) and can be shared
@@ -327,6 +355,14 @@ impl CancellationToken {
         // first writer wins (check r.is_none()).
         {
             let mut guard = self.inner.reason.lock().unwrap_or_else(|e| e.into_inner());
+            // An ancestor cancelled since the check above already gave this
+            // token its reason, which `reason()` may have reported: keep it.
+            // `reason()` reads this token's reason under the same lock, so it
+            // either reads ours or, before we take the lock, the ancestor's
+            // (whose cancellation this recheck then sees).
+            if self.is_cancelled() {
+                return;
+            }
             if guard.is_none() {
                 *guard = Some(reason);
             }
@@ -715,9 +751,399 @@ impl Drop for CancellationGuard {
     }
 }
 
-#[cfg(test)]
+/// Model-checked tests of wake-handle registration racing cancellation, under
+/// Loom (Linux, `RUSTFLAGS="--cfg instancy_loom"`; see
+/// `docs/testing/nextest.md`). Loom explores every interleaving of the
+/// tokens' flags and locks and the wake handles' that it distinguishes,
+/// without a preemption bound. Reason publication and async waits are tested
+/// under Shuttle (`cancellation_shuttle`): Loom's pruning misses the reason
+/// races there.
+#[cfg(all(test, target_os = "linux", instancy_loom))]
+mod cancellation_loom {
+    use super::*;
+    use std::sync::atomic::AtomicUsize as Count;
+
+    /// Run `body` in every interleaving Loom distinguishes; return how many
+    /// executions passed. The bounds are set here only.
+    fn explore(passed: &'static Count, body: impl Fn() + Sync + Send + 'static) -> usize {
+        for var in [
+            "LOOM_MAX_PREEMPTIONS",
+            "LOOM_MAX_BRANCHES",
+            "LOOM_MAX_PERMUTATIONS",
+            "LOOM_MAX_DURATION",
+            "LOOM_CHECKPOINT_FILE",
+        ] {
+            assert!(
+                std::env::var_os(var).is_none(),
+                "{var} would change the model's bounds"
+            );
+        }
+        passed.store(0, Ordering::Relaxed);
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = None;
+        builder.max_branches = 10_000;
+        builder.max_permutations = None;
+        builder.max_duration = None;
+        builder.check(move || {
+            body();
+            passed.fetch_add(1, Ordering::Relaxed);
+        });
+        let executions = passed.load(Ordering::Relaxed);
+        println!("{executions} executions, no preemption bound");
+        assert!(executions > 0, "no execution ran");
+        executions
+    }
+
+    /// A wake handle is registered on a child (owned, or weakly with the
+    /// test keeping it alive) while the root, or the child itself, is
+    /// cancelled: whichever comes first, the handle is notified.
+    fn registration_races_cancellation(weak: bool, cancel_root: bool) {
+        let root = CancellationToken::new();
+        let child = root.child_token();
+        let handle = WakeHandle::new();
+        assert!(handle.take_notification(), "a new handle starts notified");
+        let token = if cancel_root {
+            root.clone()
+        } else {
+            child.clone()
+        };
+        let cancel = loom::thread::spawn(move || token.cancel());
+        if weak {
+            child.register_wake_handle_weak(&handle);
+        } else {
+            child.register_wake_handle(handle.clone());
+        }
+        cancel.join().unwrap();
+        assert!(
+            handle.take_notification(),
+            "the registered handle is notified"
+        );
+    }
+
+    #[test]
+    fn registration_racing_root_cancellation_is_notified() {
+        static PASSED: Count = Count::new(0);
+        explore(&PASSED, || registration_races_cancellation(false, true));
+    }
+
+    #[test]
+    fn weak_registration_racing_root_cancellation_is_notified() {
+        static PASSED: Count = Count::new(0);
+        explore(&PASSED, || registration_races_cancellation(true, true));
+    }
+
+    #[test]
+    fn registration_racing_own_cancellation_is_notified() {
+        static PASSED: Count = Count::new(0);
+        explore(&PASSED, || registration_races_cancellation(false, false));
+    }
+}
+
+/// Schedule tests of reason publication and async cancellation waits, under
+/// Shuttle (Linux, `RUSTFLAGS="--cfg instancy_shuttle"`; see
+/// `docs/testing/nextest.md`). The async-wait and child-only cases run every
+/// interleaving of the tokens' flags and reason locks, depth first. The
+/// reason-stability cases sample 5,000 executions with PCT from seed
+/// `0xca2c`: their exhaustive search does not finish. Async waits are driven
+/// by Shuttle's `block_on`; Tokio's `Notify` is opaque to it (each call is
+/// one step).
+#[cfg(all(test, target_os = "linux", instancy_shuttle))]
+mod cancellation_shuttle {
+    use super::*;
+    use std::sync::atomic::AtomicUsize as Count;
+
+    /// Run `body` in every interleaving, depth first; return how many there
+    /// were. Each must pass.
+    fn explore(passed: &'static Count, body: impl Fn() + Sync + Send + 'static) -> usize {
+        let scheduler = shuttle::scheduler::DfsScheduler::new(None, false);
+        let executions = run(passed, scheduler, body);
+        println!("{executions} interleavings");
+        executions
+    }
+
+    /// The only seed of the sampled cases: `SHUTTLE_RANDOM_SEED` must be
+    /// unset.
+    const SEED: u64 = 0xca2c;
+    /// Sampled executions, not distinct interleavings.
+    const SAMPLES: usize = 5_000;
+
+    /// Run `body` in `SAMPLES` executions sampled by PCT from `SEED`, for a
+    /// case whose exhaustive search does not finish. Some executions must
+    /// compare a later read with each kind of first observed reason.
+    fn sample(
+        passed: &'static Count,
+        compared: &'static Compared,
+        body: impl Fn() + Sync + Send + 'static,
+    ) {
+        assert!(
+            std::env::var_os("SHUTTLE_RANDOM_SEED").is_none(),
+            "SHUTTLE_RANDOM_SEED would replace the test's seed"
+        );
+        compared.own.store(0, Ordering::Relaxed);
+        compared.inherited.store(0, Ordering::Relaxed);
+        let scheduler = shuttle::scheduler::PctScheduler::new_from_seed(SEED, 3, SAMPLES);
+        let executions = run(passed, scheduler, body);
+        let own = compared.own.load(Ordering::Relaxed);
+        let inherited = compared.inherited.load(Ordering::Relaxed);
+        println!(
+            "seed {SEED:#x}: {executions} sampled executions; a later read was compared with \
+             an own first reason {own} times, an inherited one {inherited} times"
+        );
+        assert_eq!(executions, SAMPLES);
+        assert!(
+            own > 0 && inherited > 0,
+            "later reads compared with both kinds of first reason"
+        );
+    }
+
+    /// How often a later read was compared with a reason observed first:
+    /// the token's own, or the root's `RuntimeShutdown` (inherited).
+    struct Compared {
+        own: Count,
+        inherited: Count,
+    }
+
+    impl Compared {
+        const fn new() -> Self {
+            Self {
+                own: Count::new(0),
+                inherited: Count::new(0),
+            }
+        }
+    }
+
+    fn run(
+        passed: &'static Count,
+        scheduler: impl shuttle::scheduler::Scheduler + 'static,
+        body: impl Fn() + Sync + Send + 'static,
+    ) -> usize {
+        passed.store(0, Ordering::Relaxed);
+        let mut config = shuttle::Config::new();
+        config.stack_size = 0x10_0000;
+        config.max_steps = shuttle::MaxSteps::FailAfter(10_000);
+        config.max_time = None;
+        let executions = shuttle::Runner::new(scheduler, config).run(move || {
+            body();
+            passed.fetch_add(1, Ordering::Relaxed);
+        });
+        assert!(executions > 0, "nothing ran");
+        assert_eq!(
+            passed.load(Ordering::Relaxed),
+            executions,
+            "every execution passed"
+        );
+        executions
+    }
+
+    fn own(label: &str) -> CancellationReason {
+        CancellationReason::OperatorError {
+            detail: label.into(),
+        }
+    }
+
+    /// Read `token`'s state as an observer: a cancelled token has a reason,
+    /// and once a reason was read (`first`), every later read returns it.
+    fn observe(
+        token: &CancellationToken,
+        first: &mut Option<CancellationReason>,
+        compared: &Compared,
+    ) {
+        let cancelled = token.is_cancelled();
+        let reason = token.reason();
+        if cancelled {
+            assert!(reason.is_some(), "a cancelled token has a reason");
+        }
+        match first {
+            Some(seen) => {
+                assert_eq!(
+                    reason.as_ref(),
+                    Some(&*seen),
+                    "a reason once observed does not change"
+                );
+                let kind = if *seen == CancellationReason::RuntimeShutdown {
+                    &compared.inherited
+                } else {
+                    &compared.own
+                };
+                kind.fetch_add(1, Ordering::Relaxed);
+            }
+            None => *first = reason,
+        }
+    }
+
+    /// A child and its root are cancelled with different reasons at once.
+    /// Sampled: the exhaustive search does not finish within the time limit.
+    #[test]
+    fn observed_reason_is_stable() {
+        static PASSED: Count = Count::new(0);
+        static COMPARED: Compared = Compared::new();
+        sample(&PASSED, &COMPARED, || {
+            let root = CancellationToken::new();
+            let child = root.child_token();
+            let token = child.clone();
+            let child_cancel =
+                shuttle::thread::spawn(move || token.cancel_with_reason(own("child")));
+            let token = root.clone();
+            let root_cancel = shuttle::thread::spawn(move || {
+                token.cancel_with_reason(CancellationReason::RuntimeShutdown)
+            });
+            let mut first = None;
+            observe(&child, &mut first, &COMPARED);
+            child_cancel.join().unwrap();
+            root_cancel.join().unwrap();
+            observe(&child, &mut first, &COMPARED);
+            assert_eq!(root.reason(), Some(CancellationReason::RuntimeShutdown));
+        });
+    }
+
+    /// A leaf and its root, two levels up, are cancelled at once; the middle
+    /// token is observed too. Sampled, like `observed_reason_is_stable`.
+    #[test]
+    fn observed_reason_is_stable_two_levels_down() {
+        static PASSED: Count = Count::new(0);
+        static COMPARED: Compared = Compared::new();
+        sample(&PASSED, &COMPARED, || {
+            let root = CancellationToken::new();
+            let middle = root.child_token();
+            let leaf = middle.child_token();
+            let token = leaf.clone();
+            let leaf_cancel = shuttle::thread::spawn(move || token.cancel_with_reason(own("leaf")));
+            let token = root.clone();
+            let root_cancel = shuttle::thread::spawn(move || {
+                token.cancel_with_reason(CancellationReason::RuntimeShutdown)
+            });
+            let (mut leaf_first, mut middle_first) = (None, None);
+            observe(&leaf, &mut leaf_first, &COMPARED);
+            observe(&middle, &mut middle_first, &COMPARED);
+            leaf_cancel.join().unwrap();
+            root_cancel.join().unwrap();
+            observe(&leaf, &mut leaf_first, &COMPARED);
+            observe(&middle, &mut middle_first, &COMPARED);
+            assert_eq!(
+                middle.reason(),
+                Some(CancellationReason::RuntimeShutdown),
+                "the middle token only inherits"
+            );
+        });
+    }
+
+    /// Cancelling a child leaves its parent and sibling uncancelled.
+    #[test]
+    fn child_cancellation_stays_below() {
+        static PASSED: Count = Count::new(0);
+        explore(&PASSED, || {
+            let root = CancellationToken::new();
+            let child = root.child_token();
+            let sibling = root.child_token();
+            let token = child.clone();
+            let cancel = shuttle::thread::spawn(move || token.cancel_with_reason(own("child")));
+            assert!(!root.is_cancelled() && root.reason().is_none());
+            assert!(!sibling.is_cancelled() && sibling.reason().is_none());
+            cancel.join().unwrap();
+            assert_eq!(child.reason(), Some(own("child")));
+            assert!(!root.is_cancelled() && !sibling.is_cancelled());
+        });
+    }
+
+    /// Wait on `waiter` (the token itself, or its child) while the token is
+    /// cancelled concurrently.
+    fn async_wait_races_cancellation(on_child: bool) {
+        let root = CancellationToken::new();
+        let waiter = if on_child {
+            root.child_token()
+        } else {
+            root.clone()
+        };
+        let token = root.clone();
+        let cancel = shuttle::thread::spawn(move || token.cancel());
+        shuttle::future::block_on(waiter.cancelled_async());
+        cancel.join().unwrap();
+        assert!(waiter.is_cancelled());
+    }
+
+    #[test]
+    fn async_wait_observes_concurrent_cancellation() {
+        static PASSED: Count = Count::new(0);
+        explore(&PASSED, || async_wait_races_cancellation(false));
+    }
+
+    #[test]
+    fn child_async_wait_observes_concurrent_cancellation() {
+        static PASSED: Count = Count::new(0);
+        explore(&PASSED, || async_wait_races_cancellation(true));
+    }
+}
+
+// Native tests: under `--cfg instancy_loom` or `--cfg instancy_shuttle` the
+// token's primitives are modeled ones, which work only inside a model run.
+#[cfg(all(
+    test,
+    not(all(target_os = "linux", any(instancy_loom, instancy_shuttle)))
+))]
 mod tests {
     use super::*;
+
+    /// A waker that counts its wakes.
+    #[derive(Default)]
+    struct CountingWaker(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// `cancelled_async` on a token, and on a descendant `depth` levels
+    /// down, is Pending until the token is cancelled, then woken and Ready.
+    #[test]
+    fn async_wait_is_woken_by_cancellation() {
+        use std::task::{Context, Poll};
+
+        for depth in [0, 1, 3] {
+            let root = CancellationToken::new();
+            let mut token = root.clone();
+            for _ in 0..depth {
+                token = token.child_token();
+            }
+            let counter = Arc::new(CountingWaker::default());
+            let waker = std::task::Waker::from(Arc::clone(&counter));
+            let mut cx = Context::from_waker(&waker);
+            let mut wait = Box::pin(token.cancelled_async());
+            assert!(wait.as_mut().poll(&mut cx).is_pending(), "depth {depth}");
+            assert!(wait.as_mut().poll(&mut cx).is_pending(), "depth {depth}");
+            assert_eq!(counter.0.load(Ordering::SeqCst), 0, "depth {depth}");
+            root.cancel();
+            assert!(
+                counter.0.load(Ordering::SeqCst) > 0,
+                "cancellation wakes the waiter at depth {depth}"
+            );
+            assert_eq!(
+                wait.as_mut().poll(&mut cx),
+                Poll::Ready(()),
+                "depth {depth}"
+            );
+        }
+    }
+
+    /// Waiting on an already-cancelled token, or on a child of one, is Ready
+    /// at once.
+    #[test]
+    fn async_wait_on_a_cancelled_token_is_ready() {
+        use std::task::{Context, Poll};
+
+        let root = CancellationToken::new();
+        let child = root.child_token();
+        root.cancel();
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert_eq!(
+            Box::pin(root.cancelled_async()).as_mut().poll(&mut cx),
+            Poll::Ready(())
+        );
+        assert_eq!(
+            Box::pin(child.cancelled_async()).as_mut().poll(&mut cx),
+            Poll::Ready(())
+        );
+    }
 
     #[test]
     fn ancestor_cancellation_between_check_and_wait_registration_is_observed() {

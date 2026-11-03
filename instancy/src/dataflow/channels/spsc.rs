@@ -16,10 +16,25 @@
 //! slot and then advances `head`. The atomic ordering on index updates
 //! provides the necessary happens-before relationship.
 
-use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
+
+// Model-checked tests (`--cfg instancy_loom`, Linux) substitute Loom's models
+// for the ring's indices, close flag, slots and shared ownership; see
+// `spsc_loom`.
+#[cfg(all(test, target_os = "linux", instancy_loom))]
+use loom::{
+    cell::UnsafeCell,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize},
+    },
+};
+#[cfg(not(all(test, target_os = "linux", instancy_loom)))]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize},
+};
 
 use crate::error::{Error, Result};
 use crate::progress::timestamp::Timestamp;
@@ -42,6 +57,41 @@ struct Slot<T> {
 unsafe impl<T: Send> Send for Slot<T> {}
 unsafe impl<T: Send> Sync for Slot<T> {}
 
+/// std's `UnsafeCell` with the closure-based access of Loom's checked cell,
+/// which replaces it under `--cfg instancy_loom` and checks each slot access
+/// against the other side's.
+#[cfg(not(all(test, target_os = "linux", instancy_loom)))]
+struct UnsafeCell<T>(std::cell::UnsafeCell<T>);
+
+#[cfg(not(all(test, target_os = "linux", instancy_loom)))]
+impl<T> UnsafeCell<T> {
+    fn new(value: T) -> Self {
+        Self(std::cell::UnsafeCell::new(value))
+    }
+
+    #[inline(always)]
+    fn with<R>(&self, f: impl FnOnce(*const T) -> R) -> R {
+        f(self.0.get())
+    }
+
+    #[inline(always)]
+    fn with_mut<R>(&self, f: impl FnOnce(*mut T) -> R) -> R {
+        f(self.0.get())
+    }
+}
+/// The value of an index the caller has exclusive access to.
+#[inline]
+fn exclusive(index: &mut AtomicUsize) -> usize {
+    #[cfg(not(all(test, target_os = "linux", instancy_loom)))]
+    {
+        *index.get_mut()
+    }
+    #[cfg(all(test, target_os = "linux", instancy_loom))]
+    {
+        index.with_mut(|value| *value)
+    }
+}
+
 struct RingBuffer<T> {
     slots: Box<[Slot<T>]>,
     /// Number of usable slots (one slot is reserved as sentinel).
@@ -52,6 +102,24 @@ struct RingBuffer<T> {
     tail: AtomicUsize,
     closed: AtomicBool,
 }
+
+// The model-checked tests explore the ring only if its indices, flag, slots
+// and ownership are Loom's models.
+#[cfg(all(test, target_os = "linux", instancy_loom))]
+const _: fn(
+    &RingBuffer<()>,
+) -> (
+    &loom::sync::atomic::AtomicUsize,
+    &loom::sync::atomic::AtomicUsize,
+    &loom::sync::atomic::AtomicBool,
+    &loom::cell::UnsafeCell<MaybeUninit<()>>,
+) = |ring| (&ring.head, &ring.tail, &ring.closed, &ring.slots[0].value);
+#[cfg(all(test, target_os = "linux", instancy_loom))]
+const _: fn(&SpscPush<u64, ()>) -> &loom::sync::Arc<RingBuffer<Envelope<u64, ()>>> =
+    |push| &push.ring;
+#[cfg(all(test, target_os = "linux", instancy_loom))]
+const _: fn(&SpscPull<u64, ()>) -> &loom::sync::Arc<RingBuffer<Envelope<u64, ()>>> =
+    |pull| &pull.ring;
 
 impl<T> RingBuffer<T> {
     fn new(capacity: usize) -> Self {
@@ -92,17 +160,17 @@ impl<T> RingBuffer<T> {
 
 impl<T> Drop for RingBuffer<T> {
     fn drop(&mut self) {
-        let head = *self.head.get_mut();
-        let tail = *self.tail.get_mut();
+        let head = exclusive(&mut self.head);
+        let tail = exclusive(&mut self.tail);
         // Drop any remaining items in the buffer.
         let mut idx = head;
         while idx != tail {
             let slot = self.wrap(idx);
-            // Safety: items between head and tail are initialized.
-            unsafe {
-                let ptr = (*self.slots[slot].value.get()).as_mut_ptr();
-                std::ptr::drop_in_place(ptr);
-            }
+            // Safety: items between head and tail are initialized, and
+            // `&mut self` is exclusive.
+            self.slots[slot]
+                .value
+                .with_mut(|ptr| unsafe { std::ptr::drop_in_place((*ptr).as_mut_ptr()) });
             idx = idx.wrapping_add(1);
         }
     }
@@ -179,9 +247,9 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Push<T, D, M> for SpscP
         }
         let slot = self.ring.wrap(tail);
         // Safety: we are the sole producer and have verified capacity.
-        unsafe {
-            (*self.ring.slots[slot].value.get()).write(envelope);
-        }
+        self.ring.slots[slot].value.with_mut(|ptr| unsafe {
+            (*ptr).write(envelope);
+        });
         self.ring
             .tail
             .store(tail.wrapping_add(1), Ordering::Release);
@@ -208,9 +276,10 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Push<T, D, M> for SpscP
             }
         }
         let slot = self.ring.wrap(tail);
-        unsafe {
-            (*self.ring.slots[slot].value.get()).write(envelope);
-        }
+        // Safety: we are the sole producer and have verified capacity.
+        self.ring.slots[slot].value.with_mut(|ptr| unsafe {
+            (*ptr).write(envelope);
+        });
         self.ring
             .tail
             .store(tail.wrapping_add(1), Ordering::Release);
@@ -287,7 +356,9 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Pull<T, D, M> for SpscP
         }
         let slot = self.ring.wrap(head);
         // Safety: we are the sole consumer and the slot is initialized.
-        let value = unsafe { (*self.ring.slots[slot].value.get()).assume_init_read() };
+        let value = self.ring.slots[slot]
+            .value
+            .with(|ptr| unsafe { (*ptr).assume_init_read() });
         self.ring
             .head
             .store(head.wrapping_add(1), Ordering::Release);
@@ -306,7 +377,10 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Pull<T, D, M> for SpscP
         buffer.reserve(count);
         for i in 0..count {
             let slot = self.ring.wrap(head.wrapping_add(i));
-            let value = unsafe { (*self.ring.slots[slot].value.get()).assume_init_read() };
+            // Safety: we are the sole consumer and the slot is initialized.
+            let value = self.ring.slots[slot]
+                .value
+                .with(|ptr| unsafe { (*ptr).assume_init_read() });
             buffer.push(value);
         }
         self.ring
@@ -386,7 +460,400 @@ impl<T: Timestamp, D, M> SpscPull<T, D, M> {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+/// Model-checked tests of the ring under Loom (Linux, `RUSTFLAGS="--cfg
+/// instancy_loom"`; see `docs/testing/nextest.md`). One producer and one
+/// consumer share a real ring; Loom explores the interleavings and the
+/// weak-memory outcomes it distinguishes, without a preemption bound, and
+/// checks each slot access against the other side's. Its search tracks only
+/// the last access to each atomic, so it can miss a race whose earlier
+/// access was followed by the other thread's own access (see
+/// `close_behind_an_unread_item`).
+#[cfg(all(test, target_os = "linux", instancy_loom))]
+mod spsc_loom {
+    use super::*;
+    use std::sync::atomic::AtomicUsize as Count;
+
+    /// A sequence number and its complement: a torn or misrouted record
+    /// does not pass for another.
+    type Record = (u64, u64);
+
+    /// Run `body` in every execution Loom distinguishes; return how many
+    /// passed. The bounds are set here only.
+    fn check(passed: &'static Count, body: impl Fn() + Sync + Send + 'static) -> usize {
+        for var in [
+            "LOOM_MAX_PREEMPTIONS",
+            "LOOM_MAX_BRANCHES",
+            "LOOM_MAX_PERMUTATIONS",
+            "LOOM_MAX_DURATION",
+            "LOOM_CHECKPOINT_FILE",
+        ] {
+            assert!(
+                std::env::var_os(var).is_none(),
+                "{var} would change the model's bounds"
+            );
+        }
+        passed.store(0, Ordering::Relaxed);
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = None;
+        builder.max_branches = 10_000;
+        builder.max_permutations = None;
+        builder.max_duration = None;
+        builder.check(move || {
+            body();
+            passed.fetch_add(1, Ordering::Relaxed);
+        });
+        let executions = passed.load(Ordering::Relaxed);
+        println!("{executions} executions, no preemption bound");
+        assert!(
+            executions > 1,
+            "Loom explored more than one execution (one means no race was reversed)"
+        );
+        executions
+    }
+
+    /// The `seq`th item: timestamp `seq`, one record.
+    fn item(seq: u64) -> Envelope<u64, Record> {
+        Envelope::data(seq, vec![(seq, !seq)])
+    }
+
+    #[derive(Clone, Copy)]
+    enum Producer {
+        Push,
+        TryPush,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Consumer {
+        Pull,
+        Drain,
+    }
+
+    /// Items sent through a ring of one usable slot (two physical slots):
+    /// the third reuses the first one's slot.
+    const ITEMS: u64 = 3;
+
+    /// Executions in which the producer was refused for a full ring, and in
+    /// which the consumer found the ring empty.
+    struct Refusals {
+        full: Count,
+        empty: Count,
+    }
+
+    impl Refusals {
+        const fn new() -> Self {
+            Self {
+                full: Count::new(0),
+                empty: Count::new(0),
+            }
+        }
+    }
+
+    /// Send `ITEMS` items from a producer thread while the consumer takes
+    /// them, retrying on a full or empty ring. No wake handle: its lock
+    /// would order the two sides.
+    fn transfer(producer: Producer, consumer: Consumer, refusals: &'static Refusals) {
+        let (mut push, mut pull) = spsc_channel::<u64, Record, ()>(1);
+        let send = loom::thread::spawn(move || {
+            let mut refused = false;
+            for seq in 0..ITEMS {
+                loop {
+                    let sent = match producer {
+                        Producer::Push => match push.push(item(seq)) {
+                            Ok(()) => true,
+                            Err(Error::Backpressure) => false,
+                            Err(e) => panic!("push failed: {e}"),
+                        },
+                        Producer::TryPush => match push.try_push(item(seq)) {
+                            Ok(()) => true,
+                            Err((Error::Backpressure, returned)) => {
+                                assert_eq!(returned, item(seq), "a refused item comes back");
+                                false
+                            }
+                            Err((e, _)) => panic!("try_push failed: {e}"),
+                        },
+                    };
+                    if sent {
+                        break;
+                    }
+                    refused = true;
+                    loom::thread::yield_now();
+                }
+            }
+            (push, refused)
+        });
+        let mut received = Vec::new();
+        let mut empty = false;
+        while (received.len() as u64) < ITEMS {
+            let took = match consumer {
+                Consumer::Pull => pull.pull().map(|item| received.push(item)).is_some(),
+                Consumer::Drain => pull.drain_into(&mut received) > 0,
+            };
+            if !took {
+                empty = true;
+                loom::thread::yield_now();
+            }
+        }
+        assert_eq!(
+            received,
+            (0..ITEMS).map(item).collect::<Vec<_>>(),
+            "every item arrives once, in order and intact"
+        );
+        let (push, refused) = send.join().unwrap();
+        drop((push, pull));
+        refusals
+            .full
+            .fetch_add(usize::from(refused), Ordering::Relaxed);
+        refusals
+            .empty
+            .fetch_add(usize::from(empty), Ordering::Relaxed);
+    }
+
+    fn explore_transfer(
+        producer: Producer,
+        consumer: Consumer,
+        passed: &'static Count,
+        refusals: &'static Refusals,
+    ) {
+        refusals.full.store(0, Ordering::Relaxed);
+        refusals.empty.store(0, Ordering::Relaxed);
+        check(passed, move || transfer(producer, consumer, refusals));
+        let full = refusals.full.load(Ordering::Relaxed);
+        let empty = refusals.empty.load(Ordering::Relaxed);
+        println!("refused for a full ring in {full} executions, found it empty in {empty}");
+        assert!(full > 0 && empty > 0, "both refusals explored");
+    }
+
+    #[test]
+    fn push_to_pull() {
+        static PASSED: Count = Count::new(0);
+        static REFUSALS: Refusals = Refusals::new();
+        explore_transfer(Producer::Push, Consumer::Pull, &PASSED, &REFUSALS);
+    }
+
+    #[test]
+    fn push_to_drain() {
+        static PASSED: Count = Count::new(0);
+        static REFUSALS: Refusals = Refusals::new();
+        explore_transfer(Producer::Push, Consumer::Drain, &PASSED, &REFUSALS);
+    }
+
+    #[test]
+    fn try_push_to_pull() {
+        static PASSED: Count = Count::new(0);
+        static REFUSALS: Refusals = Refusals::new();
+        explore_transfer(Producer::TryPush, Consumer::Pull, &PASSED, &REFUSALS);
+    }
+
+    #[test]
+    fn try_push_to_drain() {
+        static PASSED: Count = Count::new(0);
+        static REFUSALS: Refusals = Refusals::new();
+        explore_transfer(Producer::TryPush, Consumer::Drain, &PASSED, &REFUSALS);
+    }
+
+    /// The producer sends one item and closes its end (or drops it) while
+    /// the consumer, before reading, asks whether the ring is exhausted: it
+    /// is not, whether or not the close was seen.
+    ///
+    /// The consumer observes on the spawned thread: Loom runs the main
+    /// thread first, so the observation also follows the close. (With the
+    /// roles swapped Loom ran one execution, the observation before the
+    /// push: its search keeps only the last access to the flag, and the
+    /// producer's own load of it hid the observer's from its store.)
+    fn close_behind_an_unread_item(drop_endpoint: bool) {
+        let (mut push, pull) = spsc_channel::<u64, Record, ()>(1);
+        let observe = loom::thread::spawn(move || {
+            let exhausted = pull.is_exhausted();
+            (pull, exhausted)
+        });
+        push.push(item(0)).unwrap();
+        let push = if drop_endpoint {
+            drop(push);
+            None
+        } else {
+            push.close();
+            Some(push)
+        };
+        let (mut pull, exhausted) = observe.join().unwrap();
+        assert!(!exhausted, "an unread item is not exhausted");
+        let mut received = Vec::new();
+        assert_eq!(pull.drain_into(&mut received), 1);
+        assert_eq!(received, vec![item(0)]);
+        assert!(pull.is_exhausted(), "closed and read");
+        drop(push);
+    }
+
+    #[test]
+    fn close_behind_an_unread_item_is_not_exhausted() {
+        static PASSED: Count = Count::new(0);
+        check(&PASSED, || close_behind_an_unread_item(false));
+    }
+
+    #[test]
+    fn drop_behind_an_unread_item_is_not_exhausted() {
+        static PASSED: Count = Count::new(0);
+        check(&PASSED, || close_behind_an_unread_item(true));
+    }
+
+    /// A record that counts its drops in `drops[seq]`.
+    struct Counted {
+        seq: usize,
+        drops: std::sync::Arc<[loom::sync::atomic::AtomicUsize; 2]>,
+    }
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.drops[self.seq].fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The consumer drops its end while the producer sends two items into
+    /// a ring of two and drops its end: whichever end goes last destroys
+    /// the unread items, each exactly once.
+    #[test]
+    fn unread_items_are_dropped_once() {
+        static PASSED: Count = Count::new(0);
+        check(&PASSED, || {
+            let (mut push, pull) = spsc_channel::<u64, Counted, ()>(2);
+            let drops = std::sync::Arc::new([0, 0].map(loom::sync::atomic::AtomicUsize::new));
+            let counters = std::sync::Arc::clone(&drops);
+            let send = loom::thread::spawn(move || {
+                for seq in 0..2 {
+                    let record = Counted {
+                        seq,
+                        drops: std::sync::Arc::clone(&counters),
+                    };
+                    push.push(Envelope::data(seq as u64, vec![record])).unwrap();
+                }
+            });
+            drop(pull);
+            send.join().unwrap();
+            for (seq, count) in drops.iter().enumerate() {
+                assert_eq!(count.load(Ordering::SeqCst), 1, "item {seq} dropped once");
+            }
+        });
+    }
+
+    /// Counts the wakes of a registered waker.
+    struct Wakes(loom::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for Wakes {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// What the producer decided after its push was refused.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Refused {
+        /// It was not refused.
+        No,
+        /// A notification was pending when it checked: it would push again.
+        Notified,
+        /// No notification was pending: it waits for its waker.
+        Waiting,
+    }
+
+    /// Executions per producer decision.
+    struct Decisions {
+        no: Count,
+        notified: Count,
+        waiting: Count,
+    }
+
+    impl Decisions {
+        const fn new() -> Self {
+            Self {
+                no: Count::new(0),
+                notified: Count::new(0),
+                waiting: Count::new(0),
+            }
+        }
+    }
+
+    /// The producer fills a ring of two while the consumer pulls (or
+    /// drains) the item already in it. A producer refused for the full ring
+    /// registers its waker and checks for a notification, as an executor
+    /// does. If none was pending and its waker was never woken, the ring must
+    /// still be full: otherwise it waits for a slot that is free. The wake
+    /// handle is the consumer's only: a push does not notify it.
+    fn freeing_wakes_a_refused_producer(consumer: Consumer, decisions: &'static Decisions) {
+        let (mut push, mut pull) = spsc_channel::<u64, Record, ()>(2);
+        let wake = WakeHandle::new();
+        assert!(wake.take_notification(), "a new handle starts notified");
+        pull.set_wake(wake.clone());
+        push.push(item(0)).unwrap();
+        let wakes = std::sync::Arc::new(Wakes(loom::sync::atomic::AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(std::sync::Arc::clone(&wakes));
+        let send = loom::thread::spawn(move || {
+            push.push(item(1)).unwrap();
+            let refused = match push.push(item(2)) {
+                Ok(()) => Refused::No,
+                Err(Error::Backpressure) => {
+                    wake.register_waker(&waker);
+                    if wake.take_notification() {
+                        Refused::Notified
+                    } else {
+                        Refused::Waiting
+                    }
+                }
+                Err(e) => panic!("push failed: {e}"),
+            };
+            (push, refused)
+        });
+        let took = match consumer {
+            Consumer::Pull => usize::from(pull.pull().is_some()),
+            Consumer::Drain => pull.drain_into(&mut Vec::new()),
+        };
+        assert!(took > 0, "the first item was in the ring");
+        let (mut push, refused) = send.join().unwrap();
+        if refused == Refused::Waiting && wakes.0.load(Ordering::SeqCst) == 0 {
+            assert!(
+                matches!(push.push(item(2)), Err(Error::Backpressure)),
+                "a producer waiting for a slot the consumer freed was not woken"
+            );
+        }
+        drop((push, pull));
+        let decision = match refused {
+            Refused::No => &decisions.no,
+            Refused::Notified => &decisions.notified,
+            Refused::Waiting => &decisions.waiting,
+        };
+        decision.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn explore_wake(consumer: Consumer, passed: &'static Count, decisions: &'static Decisions) {
+        for decision in [&decisions.no, &decisions.notified, &decisions.waiting] {
+            decision.store(0, Ordering::Relaxed);
+        }
+        check(passed, move || {
+            freeing_wakes_a_refused_producer(consumer, decisions)
+        });
+        let no = decisions.no.load(Ordering::Relaxed);
+        let notified = decisions.notified.load(Ordering::Relaxed);
+        let waiting = decisions.waiting.load(Ordering::Relaxed);
+        println!("producer not refused in {no}, notified in {notified}, waiting in {waiting}");
+        assert!(waiting > 0, "a refused producer waited");
+    }
+
+    #[test]
+    fn pull_wakes_a_refused_producer() {
+        static PASSED: Count = Count::new(0);
+        static DECISIONS: Decisions = Decisions::new();
+        explore_wake(Consumer::Pull, &PASSED, &DECISIONS);
+    }
+
+    #[test]
+    fn drain_wakes_a_refused_producer() {
+        static PASSED: Count = Count::new(0);
+        static DECISIONS: Decisions = Decisions::new();
+        explore_wake(Consumer::Drain, &PASSED, &DECISIONS);
+    }
+}
+
+// Native tests: under `--cfg instancy_loom` the ring's primitives are
+// modeled ones, which work only inside a model run.
+#[cfg(all(test, not(all(target_os = "linux", instancy_loom))))]
 mod tests {
     use super::*;
 
@@ -511,6 +978,39 @@ mod tests {
         let (push, pull) = spsc_channel::<u64, i32, ()>(4);
         drop(push);
         assert!(pull.is_exhausted());
+    }
+
+    /// A ring holds exactly its capacity, though it has more slots: the
+    /// next item is refused and returned unchanged; closing it keeps the
+    /// items until they are drained in order.
+    #[test]
+    fn a_ring_holds_exactly_its_capacity() {
+        for capacity in [1usize, 2, 3] {
+            let (mut push, mut pull) = spsc_channel::<u64, i32, ()>(capacity);
+            assert!(pull.pull().is_none(), "capacity {capacity}");
+            assert_eq!(pull.drain_into(&mut Vec::new()), 0, "capacity {capacity}");
+            let items: Vec<_> = (0..capacity as u64)
+                .map(|i| Envelope::data(i, vec![i as i32]))
+                .collect();
+            for item in &items {
+                push.push(item.clone()).unwrap();
+            }
+            let extra = Envelope::data(99, vec![99]);
+            let Err((Error::Backpressure, returned)) = push.try_push(extra.clone()) else {
+                panic!("capacity {capacity}: a full ring refuses");
+            };
+            assert_eq!(returned, extra, "capacity {capacity}");
+            assert!(
+                matches!(push.push(extra), Err(Error::Backpressure)),
+                "capacity {capacity}"
+            );
+            push.close();
+            assert!(!pull.is_exhausted(), "capacity {capacity}: items remain");
+            let mut drained = Vec::new();
+            assert_eq!(pull.drain_into(&mut drained), capacity);
+            assert_eq!(drained, items, "capacity {capacity}");
+            assert!(pull.is_exhausted(), "capacity {capacity}");
+        }
     }
 
     /// A waker that counts its wakes.

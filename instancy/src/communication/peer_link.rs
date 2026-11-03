@@ -27,8 +27,23 @@
 //! receiving operator already finished) as [`LinkEvent::InboundDataLost`],
 //! and teardown lets them finish draining before the dataflow completes.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, PoisonError};
+
+// Schedule tests (`--cfg instancy_shuttle`, Linux) substitute Shuttle's
+// models for the link's flag and admission lock, and for the inbound bridge
+// count; see `send_retire_shuttle` in `dataflow::channels::network` and
+// `inbound_idle_shuttle` below.
+#[cfg(all(test, target_os = "linux", instancy_shuttle))]
+use shuttle::sync::{
+    RwLock,
+    atomic::{AtomicBool, AtomicUsize},
+};
+#[cfg(not(all(test, target_os = "linux", instancy_shuttle)))]
+use std::sync::{
+    RwLock,
+    atomic::{AtomicBool, AtomicUsize},
+};
 
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -142,6 +157,16 @@ pub(crate) struct PeerLinkState {
     #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
     trace: std::sync::OnceLock<Arc<crate::progress::trace::Recorder>>,
 }
+
+// The schedule tests explore interleavings only if the flag and the lock
+// are Shuttle's models.
+#[cfg(all(test, target_os = "linux", instancy_shuttle))]
+const _: for<'a> fn(
+    &'a PeerLinkState,
+) -> (
+    &'a shuttle::sync::atomic::AtomicBool,
+    &'a shuttle::sync::RwLock<()>,
+) = |link| (&link.retired, &link.admission);
 
 impl PeerLinkState {
     /// Whether the link no longer carries anything either side needs. Once
@@ -359,6 +384,11 @@ struct InboundInner {
     idle: tokio::sync::Notify,
 }
 
+// The schedule test explores interleavings only if the count is Shuttle's
+// model.
+#[cfg(all(test, target_os = "linux", instancy_shuttle))]
+const _: fn(&InboundInner) -> &shuttle::sync::atomic::AtomicUsize = |inner| &inner.active;
+
 /// Held by one inbound bridge while it runs.
 pub(crate) struct InboundBridgeGuard {
     inner: Arc<InboundInner>,
@@ -454,6 +484,64 @@ async fn run_forwarder(
             }
             return;
         }
+    }
+}
+
+/// Schedule test of the inbound bridges' idle wait, under Shuttle (Linux,
+/// `RUSTFLAGS="--cfg instancy_shuttle"`; see `docs/testing/nextest.md`). Two
+/// bridges exit on their own threads while teardown waits in Shuttle's
+/// `block_on`; the depth-first scheduler runs every interleaving of the
+/// bridge count. Tokio's `Notify` is opaque to it: the waiter's `notified()`
+/// and `enable()` are one step, and the exits may run between them and its
+/// count check. A count check moved before that setup would have no
+/// scheduling point between the two, so that order is not explored.
+#[cfg(all(test, target_os = "linux", instancy_shuttle))]
+mod inbound_idle_shuttle {
+    use super::*;
+    use std::sync::atomic::AtomicUsize as Count;
+
+    /// The wait returns only after the last bridge started to exit, and it
+    /// is never left waiting after the last one exited.
+    #[test]
+    fn wait_idle_returns_after_the_last_bridge_exits() {
+        static PASSED: Count = Count::new(0);
+        PASSED.store(0, Ordering::Relaxed);
+        let mut config = shuttle::Config::new();
+        config.stack_size = 0x10_0000;
+        config.max_steps = shuttle::MaxSteps::FailAfter(10_000);
+        config.max_time = None;
+        let scheduler = shuttle::scheduler::DfsScheduler::new(None, false);
+        let executions = shuttle::Runner::new(scheduler, config).run(|| {
+            let bridges = InboundBridges::default();
+            let guards = [bridges.register(), bridges.register()];
+            // Bridges that started to exit, counted just before each drops
+            // its guard.
+            let exiting = Arc::new(AtomicUsize::new(0));
+            let exits = guards.map(|guard| {
+                let exiting = Arc::clone(&exiting);
+                shuttle::thread::spawn(move || {
+                    exiting.fetch_add(1, Ordering::SeqCst);
+                    drop(guard);
+                })
+            });
+            shuttle::future::block_on(bridges.wait_idle());
+            assert_eq!(
+                exiting.load(Ordering::SeqCst),
+                2,
+                "the wait returned before the last bridge started to exit"
+            );
+            for exit in exits {
+                exit.join().unwrap();
+            }
+            PASSED.fetch_add(1, Ordering::Relaxed);
+        });
+        println!("{executions} interleavings");
+        assert!(executions > 0, "nothing ran");
+        assert_eq!(
+            PASSED.load(Ordering::Relaxed),
+            executions,
+            "every interleaving passed"
+        );
     }
 }
 
@@ -575,6 +663,7 @@ mod tests {
         assert!(rx.try_recv().is_err(), "nothing enqueued after retirement");
     }
 
+    #[cfg(not(all(test, target_os = "linux", instancy_shuttle)))]
     #[test]
     fn a_poisoned_admission_lock_still_retires_the_link() {
         let link = Arc::new(PeerLinkState::default());
@@ -597,5 +686,110 @@ mod tests {
         ));
         assert_eq!(rx.try_recv().unwrap().channel_id, 1);
         assert!(rx.try_recv().is_err(), "nothing enqueued after retirement");
+    }
+
+    // Under `--cfg instancy_shuttle` the bridge count is Shuttle's model,
+    // which works only inside a model run.
+    #[cfg(not(all(target_os = "linux", instancy_shuttle)))]
+    mod inbound_idle {
+        use super::*;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        /// A waker that counts its wakes.
+        #[derive(Default)]
+        struct Wakes(std::sync::atomic::AtomicUsize);
+
+        impl Wake for Wakes {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        /// A `wait_idle` polled by hand, with the wakes it received.
+        struct Waiter<'a> {
+            wait: Pin<Box<dyn Future<Output = ()> + 'a>>,
+            wakes: Arc<Wakes>,
+        }
+
+        impl<'a> Waiter<'a> {
+            fn new(bridges: &'a InboundBridges) -> Self {
+                Self {
+                    wait: Box::pin(bridges.wait_idle()),
+                    wakes: Arc::default(),
+                }
+            }
+
+            fn poll(&mut self) -> Poll<()> {
+                let waker = Waker::from(Arc::clone(&self.wakes));
+                self.wait.as_mut().poll(&mut Context::from_waker(&waker))
+            }
+
+            fn wakes(&self) -> usize {
+                self.wakes.0.load(Ordering::SeqCst)
+            }
+        }
+
+        #[test]
+        fn idle_without_bridges() {
+            let bridges = InboundBridges::default();
+            assert_eq!(Waiter::new(&bridges).poll(), Poll::Ready(()));
+            drop(bridges.register());
+            assert_eq!(
+                Waiter::new(&bridges).poll(),
+                Poll::Ready(()),
+                "the only bridge exited"
+            );
+        }
+
+        #[test]
+        fn waits_for_the_only_bridge() {
+            let bridges = InboundBridges::default();
+            let guard = bridges.register();
+            let mut waiter = Waiter::new(&bridges);
+            assert_eq!(waiter.poll(), Poll::Pending, "a bridge is running");
+            assert_eq!(waiter.wakes(), 0);
+            drop(guard);
+            assert_eq!(waiter.wakes(), 1, "the last exit wakes the waiter once");
+            assert_eq!(waiter.poll(), Poll::Ready(()));
+        }
+
+        /// Only the last exit wakes waiters; an earlier one leaves them be.
+        #[test]
+        fn waits_for_the_last_of_two_bridges() {
+            let bridges = InboundBridges::default();
+            let (first, last) = (bridges.register(), bridges.register());
+            let mut waiter = Waiter::new(&bridges);
+            assert_eq!(waiter.poll(), Poll::Pending);
+            drop(first);
+            assert_eq!(waiter.wakes(), 0, "only the last exit wakes waiters");
+            assert_eq!(waiter.poll(), Poll::Pending, "a bridge is still running");
+            let mut late = Waiter::new(&bridges);
+            assert_eq!(late.poll(), Poll::Pending, "a bridge is still running");
+            drop(last);
+            assert_eq!(waiter.wakes(), 1, "the last exit wakes the waiter once");
+            assert_eq!(late.wakes(), 1, "the last exit wakes the later waiter once");
+            assert_eq!(waiter.poll(), Poll::Ready(()));
+            assert_eq!(late.poll(), Poll::Ready(()));
+        }
+
+        #[test]
+        fn the_last_exit_wakes_every_waiter() {
+            let bridges = InboundBridges::default();
+            let guard = bridges.register();
+            let mut waiters = [Waiter::new(&bridges), Waiter::new(&bridges)];
+            for waiter in &mut waiters {
+                assert_eq!(waiter.poll(), Poll::Pending);
+                assert_eq!(waiter.wakes(), 0);
+            }
+            drop(guard);
+            for waiter in &waiters {
+                assert_eq!(waiter.wakes(), 1, "every waiter is woken once");
+            }
+            for waiter in &mut waiters {
+                assert_eq!(waiter.poll(), Poll::Ready(()));
+            }
+        }
     }
 }

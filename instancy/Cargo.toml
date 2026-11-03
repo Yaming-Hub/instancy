@@ -79,6 +79,17 @@ name = "stress_test"
 version = "0.5"
 features = ["async_tokio"]
 
+# Schedule tests (`--cfg instancy_shuttle`); see docs/testing/nextest.md.
+[target.'cfg(all(target_os = "linux", instancy_shuttle))'.dev-dependencies]
+shuttle = "0.9.9"
+
+# Model-checked tests (`--cfg instancy_loom`); see docs/testing/nextest.md.
+[target.'cfg(all(target_os = "linux", instancy_loom))'.dev-dependencies]
+loom = "=0.7.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(instancy_shuttle)", "cfg(instancy_loom)"] }
+
 [[bench]]
 name = "transport_throughput"
 harness = false
