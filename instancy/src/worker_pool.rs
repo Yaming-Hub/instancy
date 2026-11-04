@@ -12,10 +12,38 @@
 //! 3. Parking (condvar) — near-zero CPU, woken by new tasks
 //! 4. Shutdown — threads above `min_threads` exit after idle timeout
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::{self, JoinHandle};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+
+// Schedule tests substitute modeled synchronization and threads for the
+// pool's park/wake protocol (Linux only): Loom's under `--cfg instancy_loom`
+// (see `pool_loom`), Shuttle's under `--cfg instancy_shuttle` (see
+// `pool_shuttle`).
+#[cfg(all(test, target_os = "linux", instancy_loom))]
+use loom::{
+    sync::{
+        Condvar, Mutex,
+        atomic::{AtomicBool, AtomicUsize},
+    },
+    thread::{self, JoinHandle},
+};
+#[cfg(all(test, target_os = "linux", instancy_shuttle))]
+use shuttle::{
+    sync::{
+        Condvar, Mutex,
+        atomic::{AtomicBool, AtomicUsize},
+    },
+    thread::{self, JoinHandle},
+};
+#[cfg(not(all(test, target_os = "linux", any(instancy_loom, instancy_shuttle))))]
+use std::{
+    sync::{
+        Condvar, Mutex,
+        atomic::{AtomicBool, AtomicUsize},
+    },
+    thread::{self, JoinHandle},
+};
 
 use crossbeam_deque::{Injector, Steal};
 
@@ -539,7 +567,195 @@ fn worker_thread_loop(state: &PoolState) {
     }
 }
 
-#[cfg(test)]
+/// One worker, never above the minimum: no thread is spawned on demand and
+/// none exits idle. Used by the schedule tests below.
+#[cfg(all(test, target_os = "linux", any(instancy_loom, instancy_shuttle)))]
+fn one_worker() -> WorkerPoolConfig {
+    WorkerPoolConfig {
+        min_threads: 1,
+        max_threads: 1,
+        idle_shutdown: Duration::from_secs(3600),
+        spin_limit: 1,
+        yield_limit: 2,
+    }
+}
+
+/// Model-checked tests of the park/wake protocol, under Loom (Linux,
+/// `RUSTFLAGS="--cfg instancy_loom"`; see `docs/testing/nextest.md`). One
+/// worker runs the real loop while the model thread registers an executor
+/// and then shuts the pool down; Loom explores every interleaving of the
+/// operations it sees, without a preemption bound. Loom's
+/// `Condvar::wait_timeout` never times out, so a missed notification
+/// deadlocks the model instead of waiting for the idle timeout. The Crossbeam
+/// injector is invisible to Loom, and stays empty here; submitted
+/// activations and an idle shutdown are tested under Shuttle (`pool_shuttle`).
+#[cfg(all(test, target_os = "linux", instancy_loom))]
+mod pool_loom {
+    use super::*;
+    use crate::dataflow::DataflowId;
+    use crate::runtime::DataflowCompletion;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicUsize as Count;
+    use std::task::{Context, Poll};
+
+    /// Run `body` in every interleaving Loom distinguishes; return how many
+    /// executions passed. The bounds are set here only.
+    fn explore(passed: &'static Count, body: impl Fn() + Sync + Send + 'static) -> usize {
+        for var in [
+            "LOOM_MAX_PREEMPTIONS",
+            "LOOM_MAX_BRANCHES",
+            "LOOM_MAX_PERMUTATIONS",
+            "LOOM_MAX_DURATION",
+            "LOOM_CHECKPOINT_FILE",
+        ] {
+            assert!(
+                std::env::var_os(var).is_none(),
+                "{var} would change the model's bounds"
+            );
+        }
+        passed.store(0, Ordering::Relaxed);
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = None;
+        builder.max_branches = 10_000;
+        builder.max_permutations = None;
+        builder.max_duration = None;
+        builder.check(move || {
+            body();
+            passed.fetch_add(1, Ordering::Relaxed);
+        });
+        let executions = passed.load(Ordering::Relaxed);
+        println!("{executions} executions, no preemption bound");
+        assert!(executions > 0, "no execution ran");
+        executions
+    }
+
+    /// Signals each poll, and completes.
+    struct SignalsPoll(loom::sync::mpsc::Sender<()>);
+
+    impl Future for SignalsPoll {
+        type Output = crate::Result<bool>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let _ = self.0.send(());
+            Poll::Ready(Ok(true))
+        }
+    }
+
+    /// An executor registered while the worker heads for the park mutex is
+    /// polled, once, to completion without the idle timeout.
+    #[test]
+    fn registered_executor_wakes_the_worker() {
+        static PASSED: Count = Count::new(0);
+        explore(&PASSED, || {
+            let pool = WorkerPool::new(one_worker()).unwrap();
+            let registry = pool.create_registry(None).unwrap();
+            let (polled, polls) = loom::sync::mpsc::channel();
+            let (completion, notifier) = DataflowCompletion::new();
+            registry.register(
+                Box::pin(SignalsPoll(polled)),
+                notifier,
+                DataflowId::from_bytes([0x28; 16]),
+                0,
+            );
+            polls.recv().expect("the executor is polled");
+            pool.shutdown();
+            assert!(polls.try_recv().is_err(), "the executor is polled once");
+            assert!(completion.wait().is_ok(), "the executor completed");
+            assert_eq!(pool.thread_count(), 0);
+        });
+    }
+}
+
+/// Schedule tests of the park/wake protocol, under Shuttle (Linux,
+/// `RUSTFLAGS="--cfg instancy_shuttle"`; see `docs/testing/nextest.md`). One
+/// worker runs the real loop while the test thread submits an activation or
+/// shuts the pool down. The Crossbeam injector is opaque to both tools:
+/// Loom's pruning treats its push and steal as unrelated and misses the lost
+/// wakeup, and Shuttle's exhaustive search of a submission does not finish,
+/// so Shuttle samples a fixed set of its schedules with PCT. An idle
+/// shutdown is searched exhaustively. Shuttle's `Condvar::wait_timeout`
+/// never times out, so a missed notification deadlocks the test instead of
+/// waiting for the idle timeout.
+#[cfg(all(test, target_os = "linux", instancy_shuttle))]
+mod pool_shuttle {
+    use super::*;
+    use crate::worker::{OperatorActivation, WorkerId};
+    use std::sync::atomic::AtomicUsize as Count;
+
+    /// The only seed: `SHUTTLE_RANDOM_SEED` must be unset.
+    const SEED: u64 = 0x285;
+    /// Sampled executions, not distinct interleavings.
+    const EXECUTIONS: usize = 5_000;
+
+    /// An activation submitted while the worker heads for the park mutex
+    /// runs, once, without the idle timeout.
+    #[test]
+    fn submitted_activation_wakes_the_worker() {
+        static PASSED: Count = Count::new(0);
+        assert!(
+            std::env::var_os("SHUTTLE_RANDOM_SEED").is_none(),
+            "SHUTTLE_RANDOM_SEED would replace the test's seed"
+        );
+        PASSED.store(0, Ordering::Relaxed);
+        let mut config = shuttle::Config::new();
+        config.stack_size = 0x10_0000;
+        config.max_steps = shuttle::MaxSteps::FailAfter(10_000);
+        config.max_time = None;
+        let scheduler = shuttle::scheduler::PctScheduler::new_from_seed(SEED, 3, EXECUTIONS);
+        let executions = shuttle::Runner::new(scheduler, config).run(|| {
+            let pool = WorkerPool::new(one_worker()).unwrap();
+            let (ran, runs) = shuttle::sync::mpsc::channel();
+            pool.submit(OperatorActivation::new(
+                WorkerId(0),
+                "submitted",
+                0,
+                move || {
+                    let _ = ran.send(());
+                },
+            ));
+            runs.recv().expect("the activation runs");
+            pool.shutdown();
+            assert!(runs.try_recv().is_err(), "the activation runs once");
+            assert_eq!(pool.tasks_completed(), 1);
+            assert_eq!(pool.thread_count(), 0);
+            PASSED.fetch_add(1, Ordering::Relaxed);
+        });
+        println!("seed {SEED:#x}: {executions} sampled executions");
+        assert_eq!(executions, EXECUTIONS);
+        assert_eq!(PASSED.load(Ordering::Relaxed), EXECUTIONS);
+    }
+
+    /// Shutdown stops a worker anywhere on its way to the park mutex. Every
+    /// interleaving, depth first: Loom's handling of the worker's yield never
+    /// lets it reach the wait before the shutdown flag is set.
+    #[test]
+    fn shutdown_stops_an_idle_worker() {
+        static PASSED: Count = Count::new(0);
+        PASSED.store(0, Ordering::Relaxed);
+        let mut config = shuttle::Config::new();
+        config.stack_size = 0x10_0000;
+        config.max_steps = shuttle::MaxSteps::FailAfter(10_000);
+        config.max_time = None;
+        let scheduler = shuttle::scheduler::DfsScheduler::new(None, false);
+        let executions = shuttle::Runner::new(scheduler, config).run(|| {
+            let pool = WorkerPool::new(one_worker()).unwrap();
+            pool.shutdown();
+            assert_eq!(pool.thread_count(), 0);
+            PASSED.fetch_add(1, Ordering::Relaxed);
+        });
+        println!("{executions} interleavings");
+        assert!(executions > 0, "no interleaving ran");
+        assert_eq!(PASSED.load(Ordering::Relaxed), executions);
+    }
+}
+
+// Native tests: under `--cfg instancy_loom` or `--cfg instancy_shuttle` the
+// pool's primitives are modeled ones, which work only inside a model run.
+#[cfg(all(
+    test,
+    not(all(target_os = "linux", any(instancy_loom, instancy_shuttle)))
+))]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;

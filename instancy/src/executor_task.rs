@@ -33,10 +33,30 @@
 use std::cmp::Ordering as CmpOrdering;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, Wake};
 use std::time::Instant;
+
+// Schedule tests substitute modeled synchronization (Linux only), shared with
+// the worker pool's park/wake protocol: Loom's under `--cfg instancy_loom`,
+// Shuttle's under `--cfg instancy_shuttle` (see `worker_pool::pool_loom` and
+// `worker_pool::pool_shuttle`).
+#[cfg(all(test, target_os = "linux", instancy_loom))]
+use loom::sync::{
+    Condvar, Mutex,
+    atomic::{AtomicU8, AtomicUsize},
+};
+#[cfg(all(test, target_os = "linux", instancy_shuttle))]
+use shuttle::sync::{
+    Condvar, Mutex,
+    atomic::{AtomicU8, AtomicUsize},
+};
+#[cfg(not(all(test, target_os = "linux", any(instancy_loom, instancy_shuttle))))]
+use std::sync::{
+    Condvar, Mutex,
+    atomic::{AtomicU8, AtomicUsize},
+};
 
 use crate::dataflow::DataflowId;
 use crate::error::{Result, RuntimeError};
@@ -401,7 +421,7 @@ pub struct ExecutorRegistry {
 
     /// Reference to the pool's condvar for waking parked worker threads.
     /// Set during initialization; None only in tests that don't use a pool.
-    pool_condvar: Option<Arc<std::sync::Condvar>>,
+    pool_condvar: Option<Arc<Condvar>>,
 
     /// Serializes notification with the pool's final queue check and wait.
     pool_park_mutex: Option<Arc<Mutex<()>>>,
@@ -504,7 +524,7 @@ impl ExecutorRegistry {
     /// no comparisons). If `Some`, tasks are ordered by the policy via a binary
     /// heap (O(log n) insert and dequeue).
     pub fn new(
-        pool_condvar: Arc<std::sync::Condvar>,
+        pool_condvar: Arc<Condvar>,
         schedule_policy: Option<Arc<dyn SchedulePolicy>>,
     ) -> Self {
         let ready_queue = match &schedule_policy {
@@ -667,7 +687,267 @@ impl ExecutorRegistry {
     }
 }
 
-#[cfg(test)]
+/// Schedule tests of executor wake ownership, under Shuttle (Linux,
+/// `RUSTFLAGS="--cfg instancy_shuttle"`; see `docs/testing/nextest.md`). A
+/// wake races the real poll of a registered task: if the poll did not see
+/// it, exactly one further poll is scheduled; duplicate wakes schedule
+/// nothing more; no wake revives a finished task. Shuttle's depth-first
+/// scheduler runs every interleaving of the task's state transitions and the
+/// ready queue's lock, except for duplicate wakes, which are sampled.
+#[cfg(all(test, target_os = "linux", instancy_shuttle))]
+mod wake_shuttle {
+    use super::*;
+    use crate::runtime::DataflowCompletion;
+    use std::sync::atomic::{AtomicBool as Flag, AtomicUsize as Count};
+    use std::task::Waker;
+
+    /// Ready once a waker has published `ready`, which it does before
+    /// waking; Pending until then. Counts its polls and records its drop.
+    struct ReadyWhenWoken {
+        ready: Arc<shuttle::sync::atomic::AtomicBool>,
+        polls: Arc<Count>,
+        dropped: Arc<Flag>,
+    }
+
+    impl Future for ReadyWhenWoken {
+        type Output = Result<bool>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            if self.ready.load(Ordering::SeqCst) {
+                Poll::Ready(Ok(true))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    impl Drop for ReadyWhenWoken {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Relaxed);
+        }
+    }
+
+    struct Fixture {
+        registry: Arc<ExecutorRegistry>,
+        task: Arc<ExecutorTask>,
+        waker: Waker,
+        ready: Arc<shuttle::sync::atomic::AtomicBool>,
+        polls: Arc<Count>,
+        dropped: Arc<Flag>,
+        completion: DataflowCompletion,
+    }
+
+    /// A registered (so queued) task and a real `PoolWaker` for it.
+    fn fixture() -> Fixture {
+        let registry = Arc::new(ExecutorRegistry::new_standalone());
+        let ready = Arc::new(shuttle::sync::atomic::AtomicBool::new(false));
+        let polls = Arc::new(Count::new(0));
+        let dropped = Arc::new(Flag::new(false));
+        let (completion, notifier) = DataflowCompletion::new();
+        let task = registry.register(
+            Box::pin(ReadyWhenWoken {
+                ready: Arc::clone(&ready),
+                polls: Arc::clone(&polls),
+                dropped: Arc::clone(&dropped),
+            }),
+            notifier,
+            DataflowId::from_bytes([0x85; 16]),
+            0,
+        );
+        let waker = Arc::new(PoolWaker::new(Arc::clone(&task), Arc::clone(&registry))).into();
+        Fixture {
+            registry,
+            task,
+            waker,
+            ready,
+            polls,
+            dropped,
+            completion,
+        }
+    }
+
+    /// What a pool thread does: dequeue, claim, poll, and requeue on
+    /// `PendingNeedsReenqueue`. `None` if nothing is queued or the claim
+    /// fails.
+    fn poll_once(f: &Fixture) -> Option<PollOutcome> {
+        let task = f.registry.dequeue()?;
+        assert!(Arc::ptr_eq(&task, &f.task), "only this task is queued");
+        if !task.try_start_poll() {
+            return None;
+        }
+        let outcome = task.poll(&mut Context::from_waker(&f.waker));
+        if outcome == PollOutcome::PendingNeedsReenqueue {
+            f.registry.enqueue(task);
+        }
+        Some(outcome)
+    }
+
+    fn completed(f: &mut Fixture) -> Poll<crate::Result<()>> {
+        Pin::new(&mut f.completion).poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    /// Run `body` in every interleaving, depth first; return how many there
+    /// were. Each must pass.
+    fn explore(passed: &'static Count, body: impl Fn() + Sync + Send + 'static) -> usize {
+        let scheduler = shuttle::scheduler::DfsScheduler::new(None, false);
+        let executions = run(passed, scheduler, body);
+        println!("{executions} interleavings");
+        executions
+    }
+
+    /// The only seed of the sampled case: `SHUTTLE_RANDOM_SEED` must be unset.
+    const SEED: u64 = 0x7487;
+    /// Sampled executions, not distinct interleavings.
+    const SAMPLES: usize = 5_000;
+
+    /// Run `body` in `SAMPLES` executions sampled by PCT from `SEED`, for a
+    /// case whose exhaustive search does not finish.
+    fn sample(passed: &'static Count, body: impl Fn() + Sync + Send + 'static) {
+        assert!(
+            std::env::var_os("SHUTTLE_RANDOM_SEED").is_none(),
+            "SHUTTLE_RANDOM_SEED would replace the test's seed"
+        );
+        let scheduler = shuttle::scheduler::PctScheduler::new_from_seed(SEED, 3, SAMPLES);
+        let executions = run(passed, scheduler, body);
+        println!("seed {SEED:#x}: {executions} sampled executions");
+        assert_eq!(executions, SAMPLES);
+    }
+
+    fn run(
+        passed: &'static Count,
+        scheduler: impl shuttle::scheduler::Scheduler + 'static,
+        body: impl Fn() + Sync + Send + 'static,
+    ) -> usize {
+        passed.store(0, Ordering::Relaxed);
+        let mut config = shuttle::Config::new();
+        config.stack_size = 0x10_0000;
+        config.max_steps = shuttle::MaxSteps::FailAfter(10_000);
+        config.max_time = None;
+        let executions = shuttle::Runner::new(scheduler, config).run(move || {
+            body();
+            passed.fetch_add(1, Ordering::Relaxed);
+        });
+        assert!(executions > 0, "nothing ran");
+        assert_eq!(
+            passed.load(Ordering::Relaxed),
+            executions,
+            "every execution passed"
+        );
+        executions
+    }
+
+    /// A thread publishes `ready` and wakes the task while the test thread
+    /// polls it; with `duplicate`, another thread wakes it too, without
+    /// publishing anything.
+    fn wakes_race_the_first_poll(duplicate: bool) {
+        let mut f = fixture();
+        let mut threads = Vec::new();
+        let ready = Arc::clone(&f.ready);
+        let waker = f.waker.clone();
+        threads.push(shuttle::thread::spawn(move || {
+            ready.store(true, Ordering::SeqCst);
+            waker.wake_by_ref();
+        }));
+        if duplicate {
+            let waker = f.waker.clone();
+            threads.push(shuttle::thread::spawn(move || waker.wake_by_ref()));
+        }
+        let first = poll_once(&f).expect("the registered task is polled");
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        if first == PollOutcome::Completed {
+            assert_eq!(
+                f.registry.ready_count(),
+                0,
+                "nothing is queued after completion"
+            );
+            assert_eq!(f.polls.load(Ordering::Relaxed), 1);
+        } else {
+            assert_eq!(
+                f.registry.ready_count(),
+                1,
+                "a wake the poll did not see schedules exactly one more poll"
+            );
+            assert_eq!(poll_once(&f), Some(PollOutcome::Completed));
+            assert_eq!(
+                f.registry.ready_count(),
+                0,
+                "nothing is queued after completion"
+            );
+            assert_eq!(f.polls.load(Ordering::Relaxed), 2);
+        }
+        f.waker.wake_by_ref();
+        assert_eq!(
+            f.registry.ready_count(),
+            0,
+            "a finished task is not queued again"
+        );
+        assert!(f.task.is_done(), "a wake does not revive a finished task");
+        assert!(f.dropped.load(Ordering::Relaxed), "the future is dropped");
+        assert!(matches!(completed(&mut f), Poll::Ready(Ok(()))));
+    }
+
+    /// Every interleaving of one wake against the first poll.
+    #[test]
+    fn unseen_wake_schedules_one_more_poll() {
+        static PASSED: Count = Count::new(0);
+        explore(&PASSED, || wakes_race_the_first_poll(false));
+    }
+
+    /// Two wakes against the first poll: sampled, because the exhaustive
+    /// search does not finish within the test's time limit.
+    #[test]
+    fn duplicate_wakes_schedule_one_more_poll() {
+        static PASSED: Count = Count::new(0);
+        sample(&PASSED, || wakes_race_the_first_poll(true));
+    }
+
+    /// A wake races `abort` of an idle task that no thread polls any more:
+    /// whatever the wake queued, the task is never polled again.
+    #[test]
+    fn wake_never_revives_an_aborted_task() {
+        static PASSED: Count = Count::new(0);
+        explore(&PASSED, || {
+            let mut f = fixture();
+            assert_eq!(poll_once(&f), Some(PollOutcome::Pending));
+            let waker = f.waker.clone();
+            let thread = shuttle::thread::spawn(move || waker.wake_by_ref());
+            let aborted = f.task.abort(|| crate::error::Error::Cancelled {
+                reason: Some(crate::cancellation::CancellationReason::RuntimeShutdown),
+            });
+            thread.join().unwrap();
+            assert!(aborted, "nothing polls the task, so abort completes it");
+            while let Some(task) = f.registry.dequeue() {
+                assert!(
+                    !task.try_start_poll(),
+                    "an aborted task is not polled again"
+                );
+            }
+            f.waker.wake_by_ref();
+            assert_eq!(
+                f.registry.ready_count(),
+                0,
+                "an aborted task is not queued again"
+            );
+            assert!(f.task.is_done());
+            assert!(f.dropped.load(Ordering::Relaxed), "the future is dropped");
+            assert_eq!(f.polls.load(Ordering::Relaxed), 1);
+            assert!(matches!(
+                completed(&mut f),
+                Poll::Ready(Err(crate::error::Error::Cancelled { .. }))
+            ));
+        });
+    }
+}
+
+// Native tests: under `--cfg instancy_loom` or `--cfg instancy_shuttle` the
+// registry's primitives are modeled ones, which work only inside a model run.
+#[cfg(all(
+    test,
+    not(all(target_os = "linux", any(instancy_loom, instancy_shuttle)))
+))]
 mod tests {
     use super::*;
     use std::future::Future;
@@ -931,7 +1211,7 @@ mod tests {
     fn registry_priority_dequeue_order() {
         use crate::scheduler::policy::PriorityPolicy;
 
-        let condvar = Arc::new(std::sync::Condvar::new());
+        let condvar = Arc::new(Condvar::new());
         let registry = Arc::new(ExecutorRegistry::new(
             condvar,
             Some(Arc::new(PriorityPolicy)),
@@ -960,7 +1240,7 @@ mod tests {
     fn registry_aging_policy_dequeue_order() {
         use crate::scheduler::policy::PriorityWithAgingPolicy;
 
-        let condvar = Arc::new(std::sync::Condvar::new());
+        let condvar = Arc::new(Condvar::new());
         let policy = PriorityWithAgingPolicy { aging_rate: 1000.0 };
 
         let registry = Arc::new(ExecutorRegistry::new(condvar, Some(Arc::new(policy))));

@@ -8,6 +8,8 @@ CI runs the unit and integration tests with
 |---|---|
 | Test | `cargo nextest run -p instancy --all-features --lib --tests --profile ci --no-tests fail` |
 | No default features | `cargo nextest run -p instancy --no-default-features --features test-utils --lib --tests --profile ci --no-tests fail` |
+| Schedule tests (Shuttle) | See [Schedule tests](#schedule-tests-shuttle-and-loom) |
+| Model-checked tests (Loom) | See [Schedule tests](#schedule-tests-shuttle-and-loom) |
 
 Doc tests, the full conformance matrix and the release flight-recorder check
 keep their own `cargo test` commands.
@@ -36,6 +38,41 @@ cargo nextest run -p instancy --all-features --lib --tests --profile ci
 ```
 
 Plain `cargo test` still works.
+
+## Schedule tests (Shuttle and Loom)
+
+Some library tests run real synchronization code under a scheduler that
+explores thread interleavings: [Shuttle](https://docs.rs/shuttle/0.9.9/shuttle/)
+in modules named `*_shuttle`, [Loom](https://docs.rs/loom/0.7.2/loom/) in
+modules named `*_loom`. A crate cfg swaps the tool's models in for the
+synchronization under test, so they build only on Linux. CI runs each tool
+in its own job:
+
+```sh
+RUSTFLAGS="-Dwarnings --cfg instancy_shuttle" \
+  cargo nextest run -p instancy --locked --lib \
+  --no-default-features --features tracing,transport,test-utils --profile ci \
+  --test-threads 1 --no-tests fail --failure-output immediate-final \
+  -E 'test(/_shuttle::/)'
+
+RUSTFLAGS="-Dwarnings --cfg instancy_loom" \
+  cargo nextest run -p instancy --locked --lib \
+  --no-default-features --features tracing,transport,test-utils --profile ci \
+  --test-threads 1 --no-tests fail --failure-output immediate-final \
+  -E 'test(/_loom::/)'
+```
+
+- Run only that tool's tests with its cfg: outside a model run, the swapped
+  primitives panic when used.
+- Each test states how it explores: every interleaving (Shuttle's
+  depth-first scheduler, or Loom without a preemption bound), or a fixed
+  number of executions sampled from a fixed seed (Shuttle's PCT scheduler,
+  which fails if `SHUTTLE_RANDOM_SEED` is set). Loom tests set their bounds
+  in code and fail if a `LOOM_*` variable would change them.
+- Neither tool's condition variable times out, so a missed notification
+  fails the test as a deadlock instead of waiting out a timeout.
+- A Shuttle failure prints the schedule that reproduces it (pass it to
+  `shuttle::replay`).
 
 ## Differences from `cargo test`
 

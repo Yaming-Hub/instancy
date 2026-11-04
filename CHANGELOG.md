@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and nonempty drain now notifies; some of these wakes are spurious.
   Channels without a wake handle are unchanged.
 
+### Schedule tests and cancellation
+
+- **Fixed: a cancellation reason no longer changes once read.** When a
+  child token and one of its ancestors were cancelled at the same time,
+  `CancellationToken::reason()` on the child could report the ancestor's
+  reason and later the child's own. The child now keeps the reason first
+  reported for it, as the first-cancel-wins contract says.
+
 ### Test suite, docs and small fixes
 
 - **Fixed: a `unary_async` operator whose Tokio runtime shuts down fails its

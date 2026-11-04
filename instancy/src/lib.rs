@@ -47,6 +47,11 @@
 // Inherent to the trait-object-heavy dataflow design (Push/Pull/Codec generics).
 #![allow(clippy::type_complexity)]
 
+// Each schedule-test cfg swaps in its own tool's models (see
+// docs/testing/nextest.md); build one at a time.
+#[cfg(all(instancy_loom, instancy_shuttle))]
+compile_error!("`--cfg instancy_loom` and `--cfg instancy_shuttle` cannot be combined");
+
 /// Compiles its statements only into builds with the progress trace
 /// recorder (`debug_assertions`, `progress-check` or `test-utils`; see
 /// `progress::trace`).

@@ -22,9 +22,16 @@
 //! 2. Re-check `take_notification()` — if true, continue processing
 //! 3. Only if still not notified, return `Poll::Pending`
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Weak};
 use std::task::Waker;
+
+// Model-checked tests (`--cfg instancy_loom`, Linux) substitute Loom's models
+// for the handle's flag and waker lock; see `cancellation::cancellation_loom`.
+#[cfg(all(test, target_os = "linux", instancy_loom))]
+use loom::sync::{Mutex, atomic::AtomicBool};
+#[cfg(not(all(test, target_os = "linux", instancy_loom)))]
+use std::sync::{Mutex, atomic::AtomicBool};
 
 /// Shared state backing a [`WakeHandle`].
 struct WakeState {

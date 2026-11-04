@@ -80,6 +80,73 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  shuttle:
+    name: Schedule tests (Shuttle)
+    runs-on: ubuntu-latest
+    env:
+      # The cfg substitutes Shuttle's models for the tested synchronization.
+      RUSTFLAGS: "-Dwarnings --cfg instancy_shuttle"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2 pin
+        with:
+          tool: nextest@0.9.150
+      - name: Toolchain
+        run: rustc -Vv
+      # A failure prints the schedule that reproduces it.
+      - name: Shuttle schedule tests
+        run: |
+          set -o pipefail
+          unset SHUTTLE_RANDOM_SEED
+          cargo nextest run -p instancy --locked --lib \
+            --no-default-features --features tracing,transport,test-utils --profile ci \
+            --test-threads 1 --no-tests fail --failure-output immediate-final \
+            -E 'test(/_shuttle::/)' 2>&1 | tee shuttle.log
+      - name: Upload Shuttle log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shuttle-log
+          path: shuttle.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  loom:
+    name: Model-checked tests (Loom)
+    runs-on: ubuntu-latest
+    env:
+      # The cfg substitutes Loom's models for the tested synchronization.
+      RUSTFLAGS: "-Dwarnings --cfg instancy_loom"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2 pin
+        with:
+          tool: nextest@0.9.150
+      - name: Toolchain
+        run: rustc -Vv
+      # The tests set Loom's bounds themselves and fail if LOOM_* overrides them.
+      - name: Loom model tests
+        run: |
+          set -o pipefail
+          cargo nextest run -p instancy --locked --lib \
+            --no-default-features --features tracing,transport,test-utils --profile ci \
+            --test-threads 1 --no-tests fail --failure-output immediate-final \
+            -E 'test(/_loom::/)' 2>&1 | tee loom.log
+      - name: Upload Loom log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: loom-log
+          path: loom.log
+          if-no-files-found: ignore
+          retention-days: 14
+
   conformance:
     name: Full conformance matrix
     runs-on: ubuntu-latest
