@@ -557,10 +557,10 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkPush<T, D> {
                         });
                     }
                     None => {
+                        let _channel_id = self.channel_id;
                         #[cfg(feature = "tracing")]
                         tracing::warn!(
-                            "close sentinel lost for channel {} (queue full)",
-                            self.channel_id
+                            "close sentinel lost for channel {_channel_id} (queue full)"
                         );
                     }
                 },

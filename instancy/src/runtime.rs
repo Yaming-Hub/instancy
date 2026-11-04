@@ -110,14 +110,19 @@ pub enum TokioMode {
     /// Use this when your application already runs on tokio and you want
     /// instancy to share the same runtime (e.g., in an Actix/Axum server).
     External(tokio::runtime::Handle),
-    /// Detect the current tokio runtime automatically.
+    /// Use the tokio runtime of the calling context, like
+    /// `External(tokio::runtime::Handle::current())`.
     ///
-    /// Equivalent to `External(tokio::runtime::Handle::current())` — panics
-    /// if called outside a tokio context. This is the default for backwards
-    /// compatibility.
+    /// `RuntimeHandle::new` returns an `InvalidConfig` error when it is called
+    /// outside a tokio context. Unlike [`TokioMode::Auto`] (the default), it
+    /// never creates a runtime.
     CurrentContext,
     /// Automatically detect: use the current tokio runtime if one is active,
     /// otherwise create a new multi-threaded runtime with 2 worker threads.
+    ///
+    /// An active runtime is borrowed, as with [`TokioMode::External`]; a
+    /// created one belongs to the `RuntimeHandle`, as with
+    /// [`TokioMode::Create`].
     ///
     /// This is the recommended default — it works both inside existing tokio
     /// applications (Actix, Axum, standalone `#[tokio::main]`) and in plain
@@ -1088,7 +1093,8 @@ pub struct RuntimeHandle {
     peer_registry: Arc<PeerRegistry>,
     /// Tokio runtime handle for spawning async bridge tasks, timers, etc.
     tokio_handle: tokio::runtime::Handle,
-    /// Owned tokio runtime (when `TokioMode::Create` was used).
+    /// Owned tokio runtime (`TokioMode::Create`, or `TokioMode::Auto` outside
+    /// a tokio context).
     /// Kept alive for the lifetime of RuntimeHandle; dropped on RuntimeHandle::drop.
     _owned_tokio_runtime: Option<tokio::runtime::Runtime>,
     /// Number of currently active (not yet completed) dataflows.
@@ -1541,6 +1547,7 @@ impl RuntimeHandle {
         let peer_registry = self.peer_registry.clone();
         let live_topology = self.live_topology.clone();
         let runtime_name = self.name.clone();
+        let _ = &runtime_name;
 
         self.tokio_handle.spawn(async move {
             loop {
@@ -1626,6 +1633,7 @@ impl RuntimeHandle {
                                 }
                             }
                             Some(MembershipEvent::NodeLeft { node_id, reason }) => {
+                                let _ = &reason;
                                 #[cfg(feature = "tracing")]
                                 tracing::warn!(
                                     runtime = %runtime_name,

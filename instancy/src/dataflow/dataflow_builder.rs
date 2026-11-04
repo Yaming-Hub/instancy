@@ -871,6 +871,14 @@ impl<T: Timestamp> DataflowBuilder<T> {
     /// on a condition you expect (the end of a file, an exhausted cursor),
     /// return `Ok(())`.
     ///
+    /// # Tokio runtime
+    ///
+    /// The producer runs on a private current-thread Tokio runtime, which
+    /// shuts down once the producer returns: a task the producer spawned is
+    /// dropped then, even one holding a clone of the sender, and whatever it
+    /// had not sent is never sent. Await such a task, and check both its
+    /// `JoinHandle` and its own result, before returning `Ok(())`.
+    ///
     /// The producer closure must be `Clone` so repeated materializations can
     /// spawn one independent pump per worker.
     pub fn source_async<D, F, Fut>(&self, name: impl Into<String>, producer: F) -> Pipe<T, D>
@@ -3974,7 +3982,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
     ) -> Pipe<T, D> {
         let capacity = self.resolve_capacity();
-        let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::by_key(&name.into(), key_fn);
+        let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::by_key(name.into(), key_fn);
         self.add_exchange_internal(exchange_fn, capacity)
     }
 
@@ -4005,7 +4013,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             )));
         }
         let capacity = self.resolve_capacity();
-        let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::by_key(&name.into(), key_fn);
+        let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::by_key(name.into(), key_fn);
         let pipe = self.add_exchange_internal(exchange_fn, capacity);
         let exchange_op_idx = pipe.op_idx;
         pipe.state

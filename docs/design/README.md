@@ -179,6 +179,8 @@ Scopes nest exactly as in timely-dataflow. A `Scope` owns a `SubgraphBuilder` th
 
 A fundamental design choice in instancy is the complete separation between **logical computation** and **physical execution**. The dataflow graph, streams, operators, workers, and partitioning are all purely logical abstractions. Physical resources (OS threads, network connections, processes) are provided by pluggable **adapters** (also called **providers**).
 
+> **Status:** the provider traits below (`TransportProvider`, `ExecutionProvider`) describe the proposed adapter layer. They exist in `instancy::providers`, but `RuntimeHandle` does not route through them: it schedules dataflows through its own worker pool's executor registry and wires their channels itself.
+
 ### The Three Layers
 
 ```
@@ -251,7 +253,7 @@ pub trait TransportProvider: Send + Sync + 'static {
 
 /// Maps logical workers to physical execution resources.
 ///
-/// The default implementation uses the custom Worker Thread Pool.
+/// `WorkerPoolExecution` submits tasks to a worker thread pool.
 /// Alternative implementations can pin workers to specific cores,
 /// use NUMA-aware scheduling, or share with an application thread pool.
 pub trait ExecutionProvider: Send + Sync + 'static {
@@ -270,7 +272,7 @@ pub trait ExecutionProvider: Send + Sync + 'static {
 | `LocalTransport` | Single-process: all logical targets resolve to bounded in-memory buffers |
 | `NetworkTransport` | Multi-process: co-local targets use buffers; remote targets use ConnectionManager + serialization |
 | `InMemoryClusterTransport` | **Testing**: simulates multi-node cluster entirely in-memory within a single OS process |
-| `WorkerPoolExecution` | Default: maps logical workers to the custom Worker Thread Pool |
+| `WorkerPoolExecution` | Standalone adapter: submits tasks to a worker thread pool (`RuntimeHandle` does not use it) |
 | `InlineExecution` | **Testing**: runs all tasks on the calling thread (deterministic, single-threaded) |
 
 ### Key Benefits
@@ -283,7 +285,9 @@ pub trait ExecutionProvider: Send + Sync + 'static {
 
 4. **Separation of concerns**: Operator logic never deals with physical resources. Testing, debugging, and reasoning about correctness only require understanding the logical layer.
 
-### Example: Testing a Multi-Node Dataflow in a Single Process
+### Example (proposed): Testing a Multi-Node Dataflow in a Single Process
+
+> **Proposed API:** this sketches the intended provider configuration. `RuntimeConfig` has no `transport` or `execution` fields today, so this example does not compile against the current runtime.
 
 ```rust
 #[test]

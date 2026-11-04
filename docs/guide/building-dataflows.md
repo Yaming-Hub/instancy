@@ -112,6 +112,7 @@ Key differences from `input()`:
 - **Errors**: If the producer returns `Err` (for example through `?`), the dataflow fails with that error in the source's operator context; a producer that panics fails it too.
 - **Cancellation**: When the dataflow is cancelled, `send()` returns an error; an error the producer returns once the cancellation is observed counts as the cancellation, not as a failure.
 - **Frontier support**: Call `sender.advance_to(t)` to advance the input frontier, enabling downstream `unary_notify` operators to fire notifications.
+- **Runtime**: The producer runs on a private Tokio runtime that shuts down when the producer returns, dropping any task the producer spawned (even one holding a sender clone). Await such tasks and check their results before returning `Ok(())`.
 
 The async source works with `RuntimeHandle`; `SimpleRuntime` remains available only for tests behind the `test-utils` feature.
 
