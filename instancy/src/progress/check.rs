@@ -207,7 +207,8 @@ pub enum Mode {
     Report,
     /// Like [`Mode::Report`], and also print each violation to stderr.
     Verbose,
-    /// Record, then panic on any violation except V5 reports.
+    /// Record, then panic on any violation except V3 records (see
+    /// [`Check::is_report`]).
     Panic,
 }
 
@@ -3027,5 +3028,341 @@ mod tests {
         assert_eq!(held(&oracle), 1, "released, but not committed yet");
         let _ = reporter.drain();
         assert_eq!(held(&oracle), 0);
+    }
+
+    /// A fresh oracle of two registered logical workers, with operators
+    /// `a`, `b` and `c` (indices 1, 2 and 3).
+    fn two_workers() -> (DataflowId, Arc<Oracle<u64>>) {
+        let id = DataflowId::new();
+        let oracle = oracle::<u64>(id, 2).expect("checking is on in tests");
+        oracle.register_worker(0);
+        oracle.register_worker(1);
+        oracle.register_names([(1, "a".into()), (2, "b".into()), (3, "c".into())]);
+        (id, oracle)
+    }
+
+    /// `id`'s violations of one of `kinds`, by location.
+    fn findings(id: DataflowId, kinds: &[&str]) -> Vec<Violation> {
+        let mut found: Vec<Violation> = violations_for(id)
+            .into_iter()
+            .filter(|v| kinds.contains(&v.kind))
+            .collect();
+        found.sort_by(|a, b| a.location.cmp(&b.location));
+        found
+    }
+
+    /// A violation's check, kind, worker and location.
+    fn who(v: &Violation) -> (Check, &'static str, Option<usize>, Option<&str>) {
+        (v.check, v.kind, v.worker, v.location.as_deref())
+    }
+
+    /// Set in the child process that runs `panic_mode_panics_on_sealed_work`.
+    const PANIC_CHILD: &str = "INSTANCY_CHECK_TEST_PANIC_CHILD";
+    const PANIC_TEST: &str = "progress::check::tests::panic_mode_panics_on_sealed_work";
+
+    /// In panic mode a violation panics the thread whose hook finds it, once
+    /// it is recorded: here worker 1 sealing while it holds work (V4).
+    /// Worker 0 sealing first is no finding: that work is not its own.
+    #[test]
+    fn panic_mode_panics_on_sealed_work() {
+        if std::env::var_os(PANIC_CHILD).is_some() {
+            sealing_with_work_held_panics();
+            println!("{PANIC_CHILD}: every assertion passed");
+            return;
+        }
+        // `set_mode` is process-global and plain `cargo test` runs tests on
+        // threads, so this test runs itself alone in a child in panic mode.
+        use std::io::Read;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", PANIC_TEST, "--nocapture", "--test-threads=1"])
+            .env(PANIC_CHILD, "1")
+            .env("INSTANCY_PROGRESS_CHECK", "panic")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("start the child");
+        // From here every failure is collected, and the child is reaped and
+        // its pipes read before the test fails.
+        let mut problems: Vec<String> = Vec::new();
+        let read = |mut pipe: Box<dyn Read + Send>| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                let error = pipe.read_to_string(&mut text).err();
+                (text, error)
+            })
+        };
+        let stdout = child.stdout.take().map(|pipe| read(Box::new(pipe)));
+        let stderr = child.stderr.take().map(|pipe| read(Box::new(pipe)));
+        // A liveness bound only.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                waited => {
+                    problems.push(match waited {
+                        Err(error) => format!("waiting for the child: {error}"),
+                        _ => "the child did not finish within 60 s".into(),
+                    });
+                    if let Err(error) = child.kill() {
+                        problems.push(format!("killing the child: {error}"));
+                    }
+                    break match child.wait() {
+                        Ok(status) => Some(status),
+                        Err(error) => {
+                            problems.push(format!("reaping the child: {error}"));
+                            None
+                        }
+                    };
+                }
+            }
+        };
+        let mut output = |reader: Option<std::thread::JoinHandle<_>>, name: &str| -> String {
+            match reader.map(|reader| reader.join()) {
+                Some(Ok((text, None))) => text,
+                Some(Ok((text, Some(error)))) => {
+                    problems.push(format!("reading the child's {name}: {error}"));
+                    text
+                }
+                Some(Err(_)) => {
+                    problems.push(format!("the child's {name} reader panicked"));
+                    String::new()
+                }
+                None => {
+                    problems.push(format!("no pipe for the child's {name}"));
+                    String::new()
+                }
+            }
+        };
+        let (stdout, stderr) = (output(stdout, "stdout"), output(stderr, "stderr"));
+        assert!(
+            problems.is_empty()
+                && status.is_some_and(|s| s.success())
+                && stdout.contains(&format!("{PANIC_CHILD}: every assertion passed")),
+            "child {status:?}, problems {problems:?}\n--- stdout\n{stdout}\n--- stderr\n{stderr}"
+        );
+    }
+
+    /// The body of `panic_mode_panics_on_sealed_work`, in its child.
+    fn sealing_with_work_held_panics() {
+        assert_eq!(mode(), Mode::Panic, "the child checks in panic mode");
+        let (id, oracle) = two_workers();
+        oracle.count(Store::OutputSession, (1, 0), Some(1), &0, 1, 1);
+        oracle.worker_sealed(0);
+        assert!(violations_for(id).is_empty(), "{:?}", violations_for(id));
+        let sealed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            oracle.worker_sealed(1);
+        }));
+        let payload = sealed.expect_err("sealing with work held panics in panic mode");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            message
+                .starts_with("instancy progress check failed: [V4 sealed-holding-work @ a[out 0]]"),
+            "{message}"
+        );
+        let found = violations_for(id);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].dataflow, Some(id));
+        assert_eq!(
+            who(&found[0]),
+            (Check::V4, "sealed-holding-work", Some(1), Some("a[out 0]"))
+        );
+        assert!(
+            found[0]
+                .detail
+                .contains("1 unit(s) of OutputSession at (1, 0)@0"),
+            "{}",
+            found[0].detail
+        );
+    }
+
+    /// A worker that reports success with work in its own stores: a held
+    /// capability is V4, records left (or a store that ended negative) V7,
+    /// each attributed to that worker at the store's port. Another worker's
+    /// success does not report that work, a failed worker is not reported,
+    /// and work that balanced out is no finding.
+    #[test]
+    fn successful_worker_reports_its_owned_residuals() {
+        // Provokes violations on purpose.
+        let _expect = expect_violations();
+        const FINISH: [&str; 3] = [
+            "finished-holding-capability",
+            "end-state-residual",
+            "end-state-negative",
+        ];
+        let (id, oracle) = two_workers();
+        // Worker 1's own stores: a capability at a's output, two records in
+        // b's input buffer, one more taken out of c's than entered, and a
+        // record that entered and left a's pending output.
+        oracle.count(Store::Capability, (1, 0), Some(1), &0, 1, 1);
+        oracle.count(Store::InputBuffer, (2, 0), Some(1), &0, 2, 1);
+        oracle.count(Store::InputBuffer, (3, 0), Some(1), &0, -1, 1);
+        oracle.count(Store::PendingOutput, (1, 0), Some(1), &0, 1, 1);
+        oracle.count(Store::PendingOutput, (1, 0), Some(1), &0, -1, 1);
+        // Going below zero is a finding when counted, not a finish finding.
+        let counted: Vec<_> = violations_for(id).iter().map(|v| v.kind).collect();
+        assert_eq!(counted, ["negative-occupancy"]);
+        oracle.worker_finished(0, true);
+        assert!(
+            findings(id, &FINISH).is_empty(),
+            "worker 0 reported worker 1's work"
+        );
+        oracle.worker_finished(1, true);
+        let found = findings(id, &FINISH);
+        assert_eq!(
+            found.iter().map(who).collect::<Vec<_>>(),
+            [
+                (
+                    Check::V4,
+                    "finished-holding-capability",
+                    Some(1),
+                    Some("a[out 0]")
+                ),
+                (Check::V7, "end-state-residual", Some(1), Some("b[in 0]")),
+                (Check::V7, "end-state-negative", Some(1), Some("c[in 0]")),
+            ],
+            "{found:?}"
+        );
+        for (v, left) in found.iter().zip([
+            "1 unit(s) left in Capability at (1, 0)@0 (worker 1)",
+            "2 unit(s) left in InputBuffer at (2, 0)@0 (worker 1)",
+            "-1 unit(s) left in InputBuffer at (3, 0)@0 (worker 1)",
+        ]) {
+            assert!(v.detail.contains(left), "{}", v.detail);
+        }
+        assert!(oracle.stats().end_state_checked);
+
+        // Work that balanced out: no finding.
+        let (id, oracle) = two_workers();
+        oracle.count(Store::InputBuffer, (2, 0), Some(1), &0, 1, 1);
+        oracle.count(Store::InputBuffer, (2, 0), Some(1), &0, -1, 1);
+        oracle.worker_finished(1, true);
+        oracle.worker_finished(0, true);
+        assert!(violations_for(id).is_empty(), "{:?}", violations_for(id));
+        assert!(oracle.stats().end_state_checked);
+
+        // A failed worker is not reported: checking stops.
+        let (id, oracle) = two_workers();
+        oracle.count(Store::Capability, (1, 0), Some(1), &0, 1, 1);
+        oracle.worker_finished(1, false);
+        oracle.worker_finished(0, true);
+        assert!(violations_for(id).is_empty(), "{:?}", violations_for(id));
+        assert!(!oracle.stats().end_state_checked);
+
+        // The owner succeeding first: its work is reported at once, while
+        // worker 0 is unfinished (not by the end-state check), and not again
+        // when worker 0 succeeds.
+        let (id, oracle) = two_workers();
+        oracle.count(Store::Capability, (1, 0), Some(1), &0, 1, 1);
+        oracle.count(Store::InputBuffer, (2, 0), Some(1), &0, 2, 1);
+        oracle.count(Store::InputBuffer, (3, 0), Some(1), &0, -1, 1);
+        let counted: Vec<_> = violations_for(id).iter().map(|v| v.kind).collect();
+        assert_eq!(counted, ["negative-occupancy"]);
+        oracle.worker_finished(1, true);
+        let expected = [
+            (
+                Check::V4,
+                "finished-holding-capability",
+                Some(1),
+                Some("a[out 0]"),
+            ),
+            (Check::V7, "end-state-residual", Some(1), Some("b[in 0]")),
+            (Check::V7, "end-state-negative", Some(1), Some("c[in 0]")),
+        ];
+        let found = findings(id, &FINISH);
+        assert_eq!(
+            found.iter().map(who).collect::<Vec<_>>(),
+            expected,
+            "reported when worker 1 succeeds: {found:?}"
+        );
+        assert!(!oracle.stats().end_state_checked);
+        oracle.worker_finished(0, true);
+        let found = findings(id, &FINISH);
+        assert_eq!(
+            found.iter().map(who).collect::<Vec<_>>(),
+            expected,
+            "no finding reported twice: {found:?}"
+        );
+        assert!(oracle.stats().end_state_checked);
+    }
+
+    /// Records left between workers (in a channel that crosses them) are
+    /// checked only once every worker succeeded: V7, attributed to no
+    /// worker, at the channel's input. A channel that balanced out is no
+    /// finding, and neither is one left when a worker failed.
+    #[test]
+    fn all_workers_success_reports_between_worker_residuals() {
+        // Provokes violations on purpose.
+        let _expect = expect_violations();
+        const END: [&str; 2] = ["end-state-residual", "end-state-negative"];
+        for (diff, kind) in [(3, "end-state-residual"), (-2, "end-state-negative")] {
+            let (id, oracle) = two_workers();
+            oracle.count(Store::Channel, (2, 0), None, &0, diff, 0);
+            oracle.worker_finished(1, true);
+            assert!(findings(id, &END).is_empty(), "{kind}: one worker left");
+            assert!(!oracle.stats().end_state_checked, "{kind}");
+            oracle.worker_finished(0, true);
+            let found = findings(id, &END);
+            assert_eq!(
+                found.iter().map(who).collect::<Vec<_>>(),
+                [(Check::V7, kind, None, Some("b[in 0]"))],
+                "{found:?}"
+            );
+            let left = format!("{diff} unit(s) left in Channel at (2, 0)@0 (between workers)");
+            assert!(found[0].detail.contains(&left), "{}", found[0].detail);
+            assert!(oracle.stats().end_state_checked, "{kind}");
+        }
+
+        // A channel that balanced out: no finding.
+        let (id, oracle) = two_workers();
+        oracle.count(Store::Channel, (2, 0), None, &0, 1, 0);
+        oracle.count(Store::Channel, (2, 0), None, &0, -1, 1);
+        oracle.worker_finished(1, true);
+        oracle.worker_finished(0, true);
+        assert!(violations_for(id).is_empty(), "{:?}", violations_for(id));
+        assert!(oracle.stats().end_state_checked);
+
+        // Either worker failing: no end-state check.
+        for failed in [0, 1] {
+            let (id, oracle) = two_workers();
+            oracle.count(Store::Channel, (2, 0), None, &0, 1, 0);
+            oracle.worker_finished(1 - failed, true);
+            oracle.worker_finished(failed, false);
+            assert!(violations_for(id).is_empty(), "{:?}", violations_for(id));
+            assert!(!oracle.stats().end_state_checked, "worker {failed} failed");
+        }
+    }
+
+    /// A count that takes a store below zero is V7 negative-occupancy, when
+    /// it is counted, attributed to the worker that counted it, at the
+    /// store's port. Work that entered and then left is no finding.
+    #[test]
+    fn negative_occupancy_identifies_the_reporting_worker() {
+        // Provokes a violation on purpose.
+        let _expect = expect_violations();
+        let (id, oracle) = two_workers();
+        oracle.count(Store::InputBuffer, (2, 0), Some(1), &0, 1, 1);
+        oracle.count(Store::InputBuffer, (2, 0), Some(1), &0, -1, 1);
+        assert!(violations_for(id).is_empty(), "{:?}", violations_for(id));
+        oracle.count(Store::InputBuffer, (2, 0), Some(1), &0, -1, 1);
+        let found = violations_for(id);
+        assert_eq!(
+            found.iter().map(who).collect::<Vec<_>>(),
+            [(Check::V7, "negative-occupancy", Some(1), Some("b[in 0]"))],
+            "{found:?}"
+        );
+        assert!(
+            found[0]
+                .detail
+                .contains("InputBuffer at (2, 0)@0 (worker 1) went to -1"),
+            "{}",
+            found[0].detail
+        );
     }
 }

@@ -1178,6 +1178,89 @@ fn nested_loop_body_probe_is_conservative() {
     }
 }
 
+/// A loop whose parent frontier is two incomparable times: the dataflow's own
+/// time is `Product<u64, u32>`, and the two inputs feeding the loop are held
+/// at `(0, 1)` and `(1, 0)`. The loop imports both, so its body probe holds
+/// both `((0, 1), 0)` and `((1, 0), 0)` until the inputs move on, and data
+/// then sent at either time leaves the loop.
+#[test]
+fn loop_imports_every_element_of_its_parent_frontier() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+    let slot: ProbeSlot<P2> = Arc::default();
+    let s2 = Arc::clone(&slot);
+    let builder = DataflowBuilder::<P1>::new("antichain-import");
+    let a = builder.input::<u64>("a").unwrap();
+    let b = builder.input::<u64>("b").unwrap();
+    Pipe::concat(vec![a, b])
+        .unwrap()
+        .iterate::<u32>("loop", 1u32, move |var| {
+            let (body, probe) = var.probe();
+            *s2.lock().unwrap() = Some(probe);
+            IterateResult {
+                feedback: body.clone().filter("never", |_t, _x| false),
+                output: body,
+            }
+        })
+        .output("out")
+        .unwrap();
+    let probe = slot.lock().unwrap().take().unwrap();
+    let mut h = rt
+        .spawn(builder.build().unwrap(), SpawnOptions::default())
+        .unwrap();
+    let (ta, tb) = (
+        h.take_input::<u64>("a").unwrap(),
+        h.take_input::<u64>("b").unwrap(),
+    );
+    let rx = h.take_output::<u64>("out").unwrap();
+    ta.advance_to(P1::new(0, 1)).unwrap();
+    tb.advance_to(P1::new(1, 0)).unwrap();
+
+    // Until the probe shows both held times, every frontier it shows must
+    // still hold each of them.
+    let held = [P2::new(P1::new(0, 1), 0), P2::new(P1::new(1, 0), 0)];
+    let mut passed = None;
+    let reached = wait_until(TIMEOUT, || {
+        let frontier = probe.frontier();
+        if let Some(t) = held.iter().find(|t| !frontier.less_equal(t)) {
+            passed.get_or_insert((*t, frontier.elements().to_vec()));
+            return true;
+        }
+        let mut elements = frontier.elements().to_vec();
+        elements.sort();
+        elements == held
+    });
+
+    ta.send(P1::new(0, 1), vec![1]).unwrap();
+    tb.send(P1::new(1, 0), vec![2]).unwrap();
+    drop((ta, tb));
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(h.join_blocking());
+    });
+    let joined = done_rx.recv_timeout(TIMEOUT);
+    let completed = matches!(joined, Ok(Ok(())));
+    let mut out: Vec<(P1, Vec<u64>)> = if completed {
+        rx.collect_data()
+    } else {
+        Vec::new()
+    };
+    out.sort();
+    assert_eq!(
+        passed, None,
+        "the loop body's frontier passed a time an input still holds"
+    );
+    assert!(
+        reached,
+        "the loop body's frontier never showed both held times: {:?}",
+        probe.frontier()
+    );
+    assert!(completed, "the dataflow did not complete: {joined:?}");
+    assert_eq!(
+        out,
+        vec![(P1::new(0, 1), vec![1]), (P1::new(1, 0), vec![2])]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Per-stage parallelism path (stages with different parallelism)
 // ---------------------------------------------------------------------------

@@ -426,6 +426,169 @@ fn owned_tokio_runtime_with_zero_threads_is_an_error_not_a_panic() {
     }
 }
 
+/// A runtime with no worker threads is a configuration error from the
+/// worker pool.
+#[test]
+fn zero_worker_threads_is_an_error() {
+    let result = RuntimeHandle::new(RuntimeConfig {
+        worker_threads: 0,
+        ..RuntimeConfig::default()
+    });
+    let refused = matches!(
+        &result,
+        Err(Error::Runtime(instancy::RuntimeError::InvalidConfig(message)))
+            if message == "min_threads must be at least 1"
+    );
+    let error = result.as_ref().err().map(ToString::to_string);
+    drop(result);
+    assert!(
+        refused,
+        "expected the pool's InvalidConfig error, got {error:?}"
+    );
+}
+
+/// A multi-thread tokio runtime whose one worker thread is named `name`.
+fn named_tokio_runtime(name: &str) -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name(name)
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+/// The name of the thread a task spawned on `handle` runs on.
+fn thread_running_tasks_of(handle: &tokio::runtime::Handle) -> Option<String> {
+    let (tx, rx) = mpsc::channel();
+    handle.spawn(async move {
+        let _ = tx.send(std::thread::current().name().map(str::to_string));
+    });
+    rx.recv_timeout(TIMEOUT).expect("the task never ran")
+}
+
+/// `External` uses the runtime it is given, even when the instancy runtime
+/// is created inside another runtime's context: its bridge tasks run there,
+/// and the given runtime is still the caller's once instancy's is dropped.
+#[test]
+fn an_external_tokio_runtime_is_the_one_used() {
+    let supplied = named_tokio_runtime("supplied-tokio");
+    let ambient = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let rt = {
+        let _entered = ambient.enter();
+        RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 1,
+            tokio_mode: instancy::runtime::TokioMode::External(supplied.handle().clone()),
+            ..RuntimeConfig::default()
+        })
+        .unwrap()
+    };
+    assert_eq!(
+        rt.tokio_handle().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::MultiThread,
+        "the ambient current-thread runtime was used instead"
+    );
+    // Not just a multi-thread runtime: the supplied one.
+    assert_eq!(
+        thread_running_tasks_of(rt.tokio_handle()).as_deref(),
+        Some("supplied-tokio")
+    );
+    // A pre-cancelled external token is bridged by a task on that runtime.
+    let token = tokio_util::sync::CancellationToken::new();
+    token.cancel();
+    let mut handle = rt
+        .spawn(
+            idle_dataflow("external-tokio"),
+            SpawnOptions::new().cancellation_token(token),
+        )
+        .unwrap();
+    let _input = handle.take_input::<u64>("data").unwrap();
+    let result = within(TIMEOUT, move || handle.join_blocking()).expect("never cancelled");
+    assert!(
+        matches!(
+            result,
+            Err(Error::Cancelled {
+                reason: Some(CancellationReason::UserRequested)
+            })
+        ),
+        "unexpected {result:?}"
+    );
+    drop(rt);
+    assert_eq!(
+        thread_running_tasks_of(supplied.handle()).as_deref(),
+        Some("supplied-tokio")
+    );
+}
+
+/// An owned tokio runtime cannot be created inside a tokio context (it
+/// could later be dropped where tokio forbids it): a configuration error.
+#[test]
+fn an_owned_tokio_runtime_inside_a_tokio_context_is_an_error() {
+    let ambient = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = {
+        let _entered = ambient.enter();
+        std::panic::catch_unwind(|| {
+            RuntimeHandle::new(RuntimeConfig {
+                worker_threads: 1,
+                tokio_mode: instancy::runtime::TokioMode::Create { worker_threads: 1 },
+                ..RuntimeConfig::default()
+            })
+        })
+    };
+    // Out of the context again, where a wrongly created runtime drops safely.
+    match result {
+        Ok(Err(Error::Runtime(instancy::RuntimeError::InvalidConfig(message)))) => {
+            assert!(
+                message.contains("inside an existing tokio context"),
+                "{message}"
+            );
+        }
+        Ok(Err(other)) => panic!("expected an InvalidConfig error, got {other:?}"),
+        Ok(Ok(rt)) => {
+            drop(rt);
+            panic!("an owned tokio runtime was created inside a tokio context");
+        }
+        Err(_) => panic!("RuntimeHandle::new panicked"),
+    }
+}
+
+/// `CurrentContext` borrows the runtime of the context it is called in, and
+/// reports a missing one as a configuration error, not a panic.
+#[test]
+fn current_context_borrows_the_entered_tokio_runtime() {
+    let config = || RuntimeConfig {
+        worker_threads: 1,
+        tokio_mode: instancy::runtime::TokioMode::CurrentContext,
+        ..RuntimeConfig::default()
+    };
+    let outside = std::panic::catch_unwind(move || RuntimeHandle::new(config()).map(drop));
+    match outside {
+        Ok(Err(Error::Runtime(instancy::RuntimeError::InvalidConfig(message)))) => {
+            assert!(
+                message.contains("requires an active tokio runtime"),
+                "{message}"
+            );
+        }
+        Ok(other) => panic!("expected an InvalidConfig error, got {other:?}"),
+        Err(_) => panic!("RuntimeHandle::new panicked outside a tokio context"),
+    }
+    let ambient = named_tokio_runtime("ambient-tokio");
+    let rt = {
+        let _entered = ambient.enter();
+        RuntimeHandle::new(config()).expect("inside a tokio context")
+    };
+    assert_eq!(
+        thread_running_tasks_of(rt.tokio_handle()).as_deref(),
+        Some("ambient-tokio")
+    );
+    drop(rt);
+}
+
 // ---------------------------------------------------------------------------
 // External cancellation token bridge
 // ---------------------------------------------------------------------------

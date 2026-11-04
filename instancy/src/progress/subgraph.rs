@@ -2968,7 +2968,7 @@ impl<TP: Timestamp, TI: Timestamp> ChildScope<TP> for LoopScope<TP, TI> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::progress::capability::Capability;
     use crate::progress::reachability::Location;
@@ -3708,7 +3708,18 @@ mod tests {
     /// Two workers, each hosting an instance of a source `a` (capability at
     /// 0) that feeds `sink`, joined by in-process progress channels. Returns
     /// the trackers and, per worker, the reporter through which `a` releases.
-    fn sealing_pair() -> (
+    pub(crate) fn sealing_pair() -> (
+        Vec<ProgressTracker<u64>>,
+        Vec<crate::progress::operate::ProgressReporter<u64>>,
+    ) {
+        sealing_pair_with(|_, _| {})
+    }
+
+    /// [`sealing_pair`], calling `attach(tracker, worker)` on each tracker
+    /// before it is initialized.
+    fn sealing_pair_with(
+        attach: impl Fn(&mut ProgressTracker<u64>, usize),
+    ) -> (
         Vec<ProgressTracker<u64>>,
         Vec<crate::progress::operate::ProgressReporter<u64>>,
     ) {
@@ -3720,7 +3731,7 @@ mod tests {
         .unwrap();
         let mut trackers = Vec::new();
         let mut releases = Vec::new();
-        for channels in channels {
+        for (worker, channels) in channels.into_iter().enumerate() {
             let mut builder = SubgraphBuilder::<u64>::new(0, 0);
             let mut declared = ChangeBatch::new();
             declared.update(0u64, 1);
@@ -3742,6 +3753,7 @@ mod tests {
             builder.add_edge(Location::source(1, 0), Location::target(2, 0));
             let mut tracker = builder.build();
             tracker.set_progress_channels(channels).unwrap();
+            attach(&mut tracker, worker);
             tracker
                 .seed_and_initialize(2, |op| usize::from(op == 1) * 2)
                 .unwrap();
@@ -3822,6 +3834,96 @@ mod tests {
         trackers[0].propagate().unwrap();
         assert!(!trackers[0].stopped_and_quiet(grace));
         assert!(trackers[0].stopped_and_quiet(grace));
+    }
+
+    /// A failed worker reports the non-zero counts left in its view only
+    /// once it has applied every worker's seal: before that, a peer's
+    /// update could still change them. Worker 0 produces a record at an
+    /// otherwise unused time that nothing consumes; both workers release
+    /// their capabilities and apply every batch, so that record is each
+    /// view's only non-zero count. Worker 1 seals, worker 0 applies that
+    /// seal and seals, and both fail. Worker 0 reports the count; worker 1,
+    /// which has not applied worker 0's seal, reports nothing. On a fresh
+    /// pair where worker 1 applies that seal before failing, it reports the
+    /// same count.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    #[test]
+    fn failed_worker_reports_residual_only_after_all_seals() {
+        use crate::progress::check::{self, Check};
+        // The residual reports are provoked on purpose.
+        let _expect = check::expect_violations();
+        let unused = 5u64;
+        let residual = format!("{:?}@{unused:?}: +1", Location::target(2, 0));
+        // Returns, per worker, the residual reports for this pair's dataflow.
+        let fail_both = |apply_seal_first: bool| -> [Vec<String>; 2] {
+            let id = crate::dataflow::id::DataflowId::new();
+            let oracle = check::oracle::<u64>(id, 2).expect("progress checking is on in tests");
+            let (mut trackers, releases) = sealing_pair_with(|tracker, worker| {
+                tracker.attach_check(oracle.clone(), worker, "worker tracker");
+            });
+            trackers[0].operator_progress(1).unwrap().produced[0].update(unused, 1);
+            for release in &releases {
+                release.update(0, -1);
+            }
+            for _ in 0..2 {
+                for tracker in trackers.iter_mut() {
+                    tracker.propagate().unwrap();
+                }
+            }
+            for tracker in &trackers {
+                assert_eq!(
+                    tracker.tracker.nonzero_pointstamps(),
+                    [(Location::target(2, 0), unused, 1)]
+                );
+            }
+            trackers[1].seal();
+            trackers[0].propagate().unwrap();
+            trackers[0].seal();
+            assert!(trackers[0].all_sealed());
+            assert!(trackers[1].is_sealed());
+            assert!(
+                !trackers[1].all_sealed() && !trackers[1].peer_lanes_final(),
+                "worker 0's seal is queued for worker 1, not applied"
+            );
+            if apply_seal_first {
+                trackers[1].propagate().unwrap();
+                assert!(trackers[1].all_sealed());
+            }
+            trackers[1].check_finish(false, true);
+            trackers[0].check_finish(false, true);
+            let mut reports = [Vec::new(), Vec::new()];
+            for violation in check::violations_for(id) {
+                assert_eq!(
+                    (violation.check, violation.kind),
+                    (Check::V5, "residual"),
+                    "{violation}"
+                );
+                let worker = violation.worker.expect("a residual names its worker");
+                reports[worker].push(violation.detail);
+            }
+            reports
+        };
+        let exact = |reports: &[String], worker: usize| {
+            assert!(
+                matches!(
+                    reports,
+                    [detail] if detail.starts_with("finished with 1 non-zero count(s)")
+                        && detail.ends_with(&format!(": {residual}"))
+                ),
+                "worker {worker} must report exactly {residual}: {reports:?}"
+            );
+        };
+
+        let [origin, receiver] = fail_both(false);
+        assert!(
+            receiver.is_empty(),
+            "worker 1 reported before applying every seal: {receiver:?}"
+        );
+        exact(&origin, 0);
+
+        let [origin, receiver] = fail_both(true);
+        exact(&receiver, 1);
+        exact(&origin, 0);
     }
     /// A4: seeding from the plan holds every running instance's initial
     /// capability in every view, from before the first message until that

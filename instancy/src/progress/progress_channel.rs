@@ -544,4 +544,97 @@ mod tests {
         recv.drain_all().unwrap();
         assert!(!recv.has_pending().unwrap());
     }
+
+    /// Each lane transition (a commit, the seal, the sender going away)
+    /// wakes the receiving worker once it is published: a worker that drains
+    /// the lane whenever it is woken sees exactly that transition, before the
+    /// next one could wake it instead.
+    #[test]
+    fn every_lane_transition_wakes_the_worker_once_published() {
+        use std::task::{Wake, Waker};
+
+        type Inner = crate::order::Product<u64, u32>;
+        /// One drained commit: its root changes and its loop sections.
+        type Commit = (
+            Vec<ProgressChange<u64>>,
+            Vec<(usize, Option<Vec<ProgressChange<Inner>>>)>,
+        );
+        type Drained = std::result::Result<(Vec<Commit>, LaneState), String>;
+
+        /// A worker that drains its lane, through a second receiver on the
+        /// same buffer, whenever it is woken. It only records what it saw:
+        /// it also runs inside the sender's `Drop`.
+        struct DrainOnWake {
+            lane: ProgressReceiver<u64>,
+            seen: Mutex<Vec<Drained>>,
+        }
+        impl Wake for DrainOnWake {
+            fn wake(self: Arc<Self>) {
+                let drained = self
+                    .lane
+                    .drain_with_state()
+                    .map(|(batches, state)| {
+                        let commits = batches.into_iter().map(|batch| {
+                            let sections = batch.scopes.iter().map(|(scope, section)| {
+                                let typed = section.downcast_ref::<Vec<ProgressChange<Inner>>>();
+                                (*scope, typed.cloned())
+                            });
+                            (batch.root, sections.collect())
+                        });
+                        (commits.collect(), state)
+                    })
+                    .map_err(|e| e.to_string());
+                if let Ok(mut seen) = self.seen.lock() {
+                    seen.push(drained);
+                }
+            }
+        }
+        fn seen_since_last(worker: &DrainOnWake) -> Vec<Drained> {
+            std::mem::take(&mut *worker.seen.lock().unwrap())
+        }
+
+        for seals in [true, false] {
+            let buffer = Arc::new(Mutex::new(SharedBuffer::new()));
+            let wake = WakeHandle::new();
+            let worker = Arc::new(DrainOnWake {
+                lane: ProgressReceiver::new(Arc::clone(&buffer)),
+                seen: Mutex::new(Vec::new()),
+            });
+            wake.register_waker(&Waker::from(Arc::clone(&worker)));
+            let sender = ProgressSender::local(buffer, wake);
+
+            let root = vec![ProgressChange::source(1, 0, 7u64, 1)];
+            let section = vec![ProgressChange::source(2, 0, Inner::new(7, 3), -1)];
+            let erased: Arc<dyn std::any::Any + Send + Sync> = Arc::new(section.clone());
+            sender.send_batch(ProgressBatch {
+                root: root.clone(),
+                scopes: vec![(1, erased)],
+            });
+            let open = LaneState::default();
+            let commit = (root, vec![(1, Some(section))]);
+            assert_eq!(
+                seen_since_last(&worker),
+                [Ok((vec![commit], open))],
+                "the commit"
+            );
+            if seals {
+                sender.seal();
+                let sealed = LaneState {
+                    sealed: true,
+                    closed: false,
+                };
+                assert_eq!(seen_since_last(&worker), [Ok((vec![], sealed))], "the seal");
+            }
+            drop(sender);
+            let ended = LaneState {
+                sealed: seals,
+                closed: true,
+            };
+            assert_eq!(
+                seen_since_last(&worker),
+                [Ok((vec![], ended))],
+                "the sender going away (sealed: {seals})"
+            );
+        }
+    }
 }

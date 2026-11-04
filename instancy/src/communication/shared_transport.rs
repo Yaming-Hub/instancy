@@ -3115,7 +3115,9 @@ mod tests {
 
     /// Frames the bridge already handed to a connection writer survive the
     /// manager being released, whether it is closed (waiting for its writers)
-    /// or simply dropped (writers finish in the background).
+    /// or simply dropped (writers finish in the background). Then the peer
+    /// sees the connection end at once, not when the readers give up waiting
+    /// 10 s later.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn releasing_the_manager_lets_writers_finish_queued_frames() {
         for close in [true, false] {
@@ -3146,18 +3148,23 @@ mod tests {
                         _ => break,
                     }
                 }
-                got
+                let end = tokio::time::timeout(Duration::from_secs(3), reader.read_frame()).await;
+                (got, end)
             });
             if close {
                 manager.close(Duration::from_secs(5)).await;
             } else {
                 drop(manager);
             }
-            let got = reading.await.unwrap();
+            let (got, end) = reading.await.unwrap();
             assert_eq!(
                 got,
                 (0..100u8).collect::<Vec<_>>(),
                 "close={close}: queued frames were lost"
+            );
+            assert!(
+                matches!(end, Ok(Err(TransportError::ConnectionClosed))),
+                "close={close}: the peer did not see the connection end within 3 s: {end:?}"
             );
         }
     }

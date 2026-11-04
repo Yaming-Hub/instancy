@@ -6260,6 +6260,51 @@ mod tests {
         assert_eq!(t1, vec![10, 20]);
     }
 
+    /// A concat's output waits for every input: once one input has moved past
+    /// a time and closed, and that has propagated, while another is still
+    /// open at the time, the time is not complete downstream. Each time then
+    /// completes once, with every input's records.
+    #[test]
+    fn test_concat_output_waits_for_every_input() {
+        let builder = DataflowBuilder::<u64>::new("concat_frontier");
+        let a = builder.input::<i32>("a").unwrap();
+        let b = builder.input::<i32>("b").unwrap();
+        let a_view = a.clone();
+        let (merged, merged_probe) = Pipe::concat(vec![a, b]).unwrap().probe();
+        // Probes are updated in the order they were added, all from the same
+        // propagation: once this one (the concat's input from `a`) has passed
+        // a time, the concat's probe shows that propagation's frontier too.
+        let (_, a_probe) = a_view.probe();
+        merged.reduce("sum", |x, y| x + y).output("sums").unwrap();
+        let mut handle = rt().spawn(builder.build().unwrap()).unwrap();
+        let a = handle.take_input::<i32>("a").unwrap();
+        let b = handle.take_input::<i32>("b").unwrap();
+        let sums = handle.take_output::<i32>("sums").unwrap();
+
+        // Input `a` moves past 0 and closes; `b` stays open at 0.
+        a.send(1, vec![1, 2]).unwrap();
+        a.close();
+        let waited = std::time::Instant::now();
+        while !a_probe.done_with(&0) {
+            assert!(
+                waited.elapsed() < std::time::Duration::from_secs(10),
+                "input a never passed 0"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            !merged_probe.done_with(&0),
+            "the concat passed 0 while input b is still open at 0"
+        );
+        b.send(0, vec![3]).unwrap();
+        b.close();
+        let mut sums = sums.collect_data();
+        sums.sort();
+        assert_eq!(sums, vec![(0, vec![3]), (1, vec![3])]);
+        handle.join_blocking().unwrap();
+        assert!(merged_probe.is_done());
+    }
+
     // --- Iterate tests ---
 
     #[test]

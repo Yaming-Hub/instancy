@@ -106,8 +106,9 @@ fn assert_residual(what: &str, result: &Result<()>, residual: &str) {
     }
 }
 
-/// The checker reported the fault too (V5, a report even in panic mode),
-/// for `dataflow` when given: returns the workers whose view it was left in.
+/// The checker reported the fault too (V5; these tests run the checker in
+/// report mode), for `dataflow` when given: returns the workers whose view it
+/// was left in.
 fn checker_reports(
     what: &str,
     mark: u64,
