@@ -58,6 +58,30 @@
 (* handshake and ready barrier are one step, whose timeout fires only when *)
 (* the peer's run already ended; and a manager remembers every finished    *)
 (* DataflowId (PR9 keeps the last 16,384).                                 *)
+(*                                                                         *)
+(* Connection liveness (connection-liveness.md), behind switches that are  *)
+(* off in every earlier scenario. A "silence" fault stops one direction of *)
+(* a connection from delivering anything, frames, FIN or reset, without    *)
+(* any error: a partition or a frozen peer. A writer into a silent         *)
+(* direction fills the kernel's buffer (StuckCap frames), then blocks.     *)
+(* With Detect = "silence" a node declares a connection dead exactly when  *)
+(* its inbound direction is silent (ConnSilence.tla checks the timing     *)
+(* that justifies this) and fails it like a read error, aborting its       *)
+(* writer. StallAbort: a writer that has written nothing for the silence  *)
+(* timeout fails its connection like a write error, at any time (as       *)
+(* TCP_USER_TIMEOUT does for gRPC, gRFC A18); the same timing makes that   *)
+(* happen exactly when its writer is stuck on a silent direction (a       *)
+(* healthy peer always reads, so its socket accepts bytes).               *)
+(* SharedBridge models today's single bridge task per peer: one FIFO for   *)
+(* every run's frames, waiting for room in bounded writer queues (WQCap). *)
+(* Without it, as in every earlier scenario, each lane is forwarded on    *)
+(* its own, which is the per-connection queues of the proposal.           *)
+(*                                                                         *)
+(* Not modelled for liveness: Arrive reads the peer's pin, but the code    *)
+(* binds a dataflow to its inbound connection only when its first frame    *)
+(* arrives there; before that, silence ends it at handshake_timeout. The   *)
+(* proposal's numbering at enqueue is modelled per lane, atomically, from  *)
+(* one ordered outbox; races between producers are left to code tests.    *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets, TLC
 
@@ -70,7 +94,7 @@ CONSTANTS
                     \* round, so each connection carries both runs
     Reuse,          \* TRUE: the retry reuses run 1's DataflowId (a contract violation)
     Faults,         \* the transport faults that may occur:
-                    \* a subset of {"reset", "writeerr", "corrupt"}
+                    \* a subset of {"reset", "writeerr", "corrupt", "silence"}
     MaxFaults,      \* how many, in total
     FaultsRun1,     \* TRUE: faults happen only while run 1 is registered
                     \* somewhere and before run 2 starts anywhere, and a node
@@ -94,8 +118,19 @@ CONSTANTS
     SendOutcome,    \* "atomic": old abstraction; "recheck": inspect retirement
                     \* after enqueue; "admission": check atomically with enqueue;
                     \* "unchecked": accept even a deliberately late send
-    LateAttempt     \* TRUE: one extra send may start before retirement and
+    LateAttempt,    \* TRUE: one extra send may start before retirement and
                     \* attempt its actual enqueue after retirement
+    Detect,         \* "none": no liveness rule (today); "silence": a node
+                    \* declares a connection dead when its inbound is silent
+    StallAbort,     \* TRUE: a writer stuck for the silence timeout fails its
+                    \* connection; FALSE: only a release has a deadline
+    SharedBridge,   \* TRUE: one bridge FIFO per node for every run (today);
+                    \* FALSE: each lane forwarded on its own (the proposal)
+    WQCap,          \* writer queue capacity (frames); large means unbounded
+    StuckCap,       \* frames a writer can put into a silent direction
+                    \* (the kernel's buffer) before it blocks
+    SilenceNodes,   \* the nodes whose inbound direction may go silent
+    SilenceConns    \* the connections that may go silent
 
 N == {"a", "b"}
 Other(n) == IF n = "a" THEN "b" ELSE "a"
@@ -120,9 +155,10 @@ VARIABLES
     mem,    \* [N -> SUBSET ids]: DataflowIds of runs that ended here
     pend,   \* [N -> Seq([f, c])]: Cancels for a DataflowId not registered yet,
             \* with the connection they arrived on
-    cnt     \* counters, and ghosts for the properties
+    cnt,    \* counters, and ghosts for the properties
+    bq      \* [N -> Seq([r, f])]: the shared bridge's FIFO (SharedBridge only)
 
-vars == <<rs, cs, br, rel, mem, pend, cnt>>
+vars == <<rs, cs, br, rel, mem, pend, cnt, bq>>
 
 \* A run on one node.
 \*  st: off, run (workers running), done (workers succeeded, tearing down),
@@ -151,9 +187,10 @@ RunInit(r) ==
 \*  wst: its writer is up, shut (FIN sent) or dead; rds: its reader is up or
 \*  done; pool: live, peerclosed (the peer closed cleanly while lanes are
 \*  pinned here) or gone; fin: a FIN follows its wire; closed: the whole
-\*  socket is closed; wq: writer queue; wire: frames written, unread.
+\*  socket is closed; wq: writer queue; wire: frames written, unread;
+\*  silent: nothing written by the peer on this connection reaches this end.
 ConnInit == [wst |-> "up", rds |-> "up", pool |-> "live", fin |-> FALSE,
-             closed |-> FALSE, wq |-> <<>>, wire |-> <<>>]
+             closed |-> FALSE, wq |-> <<>>, wire |-> <<>>, silent |-> FALSE]
 
 \* Each node pins a lane to its least-loaded connection, by its own
 \* registration order, so concurrent runs may be pinned crosswise
@@ -176,6 +213,7 @@ Init ==
     /\ cnt = [f |-> 0, s |-> 0, x |-> 0, faulted |-> {}, needless |-> FALSE, bad |-> FALSE,
               falseLoss |-> FALSE, lateQueued |-> FALSE, lateRejected |-> FALSE,
               lateAccepted |-> FALSE]
+    /\ bq = [n \in N |-> <<>>]
 
 ---------------------------------------------------------------------------
 (* Helpers *)
@@ -199,6 +237,35 @@ Least(n) ==
         \/ Cardinality(Pinned(n, c)) = Cardinality(Pinned(n, d)) /\ c <= d
 
 Retired(rec) == rec.bye \/ rec.ack
+
+\* Frames from the peer wait unread in n's socket (closing it then resets).
+\* Frames sent into a silent direction never reached n.
+Unread(n, c) == cs[Other(n)][c].wire # <<>> /\ ~cs[n][c].silent
+
+\* n's writer on c is stuck: its direction is silent and the kernel's
+\* buffer is full.
+Stuck(n, c) == cs[Other(n)][c].silent /\ Len(cs[n][c].wire) >= StuckCap
+
+\* A frame of run r cannot be queued on its pinned connection: the queue is
+\* full and its writer stuck.
+Blocked(n, r) ==
+    LET p == rs[n][r].pin IN
+    /\ rs[n][r].reg = "reg" /\ ~rs[n][r].obf /\ cs[n][p].wst = "up"
+    /\ Len(cs[n][p].wq) >= WQCap /\ Stuck(n, p)
+
+\* The shared bridge holds a frame it cannot hand on: the queue is full and
+\* its writer stuck.
+BridgeStuck(n) ==
+    /\ bq[n] # <<>> /\ Head(bq[n]).held
+    /\ LET p == rs[n][Head(bq[n]).r].pin IN
+         /\ cs[n][p].wst = "up" /\ Len(cs[n][p].wq) >= WQCap /\ Stuck(n, p)
+
+\* The flush: everything run r queued was handed to a writer queue, unless
+\* what is left cannot move (the flush's timeout).
+Flushed(n, r) ==
+    /\ rs[n][r].ob = <<>> \/ (~SharedBridge /\ Blocked(n, r))
+    /\ \/ \A i \in 1..Len(bq[n]) : bq[n][i].r # r
+       \/ BridgeStuck(n)
 
 \* R48: the peer requested a stop and we need nothing more from it.
 NeedsNothing(rec) == rec.gc /\ rec.cap /\ rec.v = 0
@@ -298,7 +365,7 @@ Read(n, c) ==
     LET m == Other(n)
         f == Head(cs[m][c].wire)
     IN
-    /\ cs[n][c].rds = "up" /\ cs[m][c].wire # <<>>
+    /\ cs[n][c].rds = "up" /\ cs[m][c].wire # <<>> /\ ~cs[n][c].silent
     /\ IF f.bad /\ Crc
        THEN \* The checksum catches it: corruption. The frame's own run fails
             \* in every phase; the others using c are told it was lost. The
@@ -317,18 +384,18 @@ Read(n, c) ==
        ELSE /\ cs' = [cs EXCEPT ![m][c].wire = Tail(@)]
             /\ Process(n, f, c)
             /\ UNCHANGED br
-    /\ UNCHANGED <<rel, mem>>
+    /\ UNCHANGED <<rel, mem, bq>>
 
 \* A read error: the peer's frames on c may be lost. In PR9 it breaks the
 \* whole connection: the lanes pinned to c fail too.
 ReadErr(n, c) ==
     LET m == Other(n) IN
-    /\ cs[n][c].rds = "up" /\ br[c] /\ cs[m][c].wire = <<>>
+    /\ cs[n][c].rds = "up" /\ br[c] /\ cs[m][c].wire = <<>> /\ ~cs[n][c].silent
     /\ rs' = IF Pin THEN [rs EXCEPT ![n] = Broken(n, c, "rfail")] ELSE rs
     /\ cs' = [cs EXCEPT ![n][c] = [@ EXCEPT !.rds = "done", !.wq = <<>>, !.pool = "gone",
                                             !.wst = IF @ = "up" THEN "dead" ELSE @]]
     /\ pend' = ForgetConn(n, c)
-    /\ UNCHANGED <<br, rel, mem, cnt>>
+    /\ UNCHANGED <<br, rel, mem, cnt, bq>>
 
 \* The peer closed its side cleanly (FIN after its last frame).
 \*  - PR9 (CleanEof = "keep"): every run using c is told (Closed); lanes
@@ -340,7 +407,7 @@ CleanEofA(n, c) ==
         keep == CleanEof = "keep"
         pinned == Pinned(n, c)
     IN
-    /\ cs[n][c].rds = "up" /\ ~br[c] /\ cs[m][c].wire = <<>> /\ cs[m][c].fin
+    /\ cs[n][c].rds = "up" /\ ~br[c] /\ cs[m][c].wire = <<>> /\ cs[m][c].fin /\ ~cs[n][c].silent
     /\ rs' = IF Pin
              THEN [rs EXCEPT ![n] = [r \in Runs |->
                      LET a == IF r \in pinned /\ ~keep THEN WfailRec(rs[n][r]) ELSE rs[n][r]
@@ -349,7 +416,7 @@ CleanEofA(n, c) ==
     /\ cs' = [cs EXCEPT ![n][c].rds = "done",
                         ![n][c].pool = IF Pin /\ keep /\ pinned # {} THEN "peerclosed" ELSE "gone"]
     /\ pend' = ForgetConn(n, c)
-    /\ UNCHANGED <<br, rel, mem, cnt>>
+    /\ UNCHANGED <<br, rel, mem, cnt, bq>>
 
 ---------------------------------------------------------------------------
 (* Frames sent *)
@@ -365,7 +432,7 @@ Bridge(n, r) ==
                           /\ cnt' = IF needless THEN [cnt EXCEPT !.needless = TRUE] ELSE cnt
                           /\ UNCHANGED cs
     IN
-    /\ rec.ob # <<>>
+    /\ rec.ob # <<>> /\ ~SharedBridge
     /\ IF Pin
        THEN IF rec.reg # "reg"
             THEN \* The registration ended. PR9 drops the frame (it is bound to
@@ -379,7 +446,8 @@ Bridge(n, r) ==
                  ELSE drop(FALSE)
             ELSE IF rec.obf \/ cs[n][p].wst # "up"
                  THEN drop(cs[n][p].wst = "up" /\ ~br[p] /\ cs[Other(n)][p].rds = "up")
-                 ELSE /\ rs' = [rs EXCEPT ![n][r].ob = Tail(@), ![n][r].tx = @ + 1]
+                 ELSE /\ Len(cs[n][p].wq) < WQCap
+                      /\ rs' = [rs EXCEPT ![n][r].ob = Tail(@), ![n][r].tx = @ + 1]
                       /\ cs' = [cs EXCEPT ![n][p].wq = Append(@, [f EXCEPT !.seq = rec.tx])]
                       /\ UNCHANGED cnt
        ELSE IF rec.reg # "reg" \/ Live(n) = {}
@@ -389,7 +457,7 @@ Bridge(n, r) ==
                     /\ rs' = [rs EXCEPT ![n][r].ob = Tail(@), ![n][r].tx = @ + 1]
                     /\ cs' = [cs EXCEPT ![n][c].wq = Append(@, [f EXCEPT !.seq = rec.tx])]
                     /\ UNCHANGED cnt
-    /\ UNCHANGED <<br, rel, mem, pend>>
+    /\ UNCHANGED <<br, rel, mem, pend, bq>>
 
 \* A connection's writer fails: on a reset connection, or a local write
 \* error while writing. Its queue is lost. PR9: the lanes pinned to it fail
@@ -400,7 +468,7 @@ Bridge(n, r) ==
 WriteFail(n, c) ==
     LET m == Other(n)
         closeAll == ~Pin \/ WriteErrClose
-        rst == closeAll /\ cs[m][c].wire # <<>> /\ ~br[c]
+        rst == closeAll /\ Unread(n, c) /\ ~br[c]
     IN
     /\ rs' = IF ~Pin THEN rs
              ELSE IF closeAll THEN [rs EXCEPT ![n] = Broken(n, c, "rfail")]
@@ -416,18 +484,24 @@ WriteFail(n, c) ==
     /\ pend' = IF closeAll THEN ForgetConn(n, c) ELSE pend
 
 \* The writer writes the next queued frame. Writing to a reset connection
-\* fails; writing to a socket the peer closed draws a reset.
+\* fails; writing to a socket the peer closed draws a reset. Frames written
+\* into a silent direction are lost on the way and draw nothing; once the
+\* kernel's buffer holds StuckCap of them, the writer blocks.
 Write(n, c) ==
     LET m == Other(n) IN
     /\ cs[n][c].wst = "up" /\ cs[n][c].wq # <<>>
     /\ IF br[c]
-       THEN WriteFail(n, c) /\ UNCHANGED <<rel, mem, cnt>>
+       THEN WriteFail(n, c) /\ UNCHANGED <<rel, mem, cnt, bq>>
+       ELSE IF cs[m][c].silent
+       THEN /\ Len(cs[n][c].wire) < StuckCap
+            /\ cs' = [cs EXCEPT ![n][c].wq = Tail(@), ![n][c].wire = Append(@, Head(cs[n][c].wq))]
+            /\ UNCHANGED <<rs, br, rel, mem, pend, cnt, bq>>
        ELSE IF cs[m][c].closed
        THEN /\ br' = [br EXCEPT ![c] = TRUE]
             /\ cs' = [cs EXCEPT ![n][c].wq = Tail(@), ![n][c].wire = <<>>, ![m][c].wire = <<>>]
-            /\ UNCHANGED <<rs, rel, mem, pend, cnt>>
+            /\ UNCHANGED <<rs, rel, mem, pend, cnt, bq>>
        ELSE /\ cs' = [cs EXCEPT ![n][c].wq = Tail(@), ![n][c].wire = Append(@, Head(cs[n][c].wq))]
-            /\ UNCHANGED <<rs, br, rel, mem, pend, cnt>>
+            /\ UNCHANGED <<rs, br, rel, mem, pend, cnt, bq>>
 
 \* The earlier design redials a failed connection in the background and
 \* carries its lanes on: nothing tells the runs.
@@ -436,7 +510,7 @@ Redial(c) ==
     /\ \A n \in N : ~rel[n]
     /\ br' = [br EXCEPT ![c] = FALSE]
     /\ cs' = [cs EXCEPT !["a"][c] = ConnInit, !["b"][c] = ConnInit]
-    /\ UNCHANGED <<rs, rel, mem, pend, cnt>>
+    /\ UNCHANGED <<rs, rel, mem, pend, cnt, bq>>
 
 \* PR9 has no background redial: a registration that finds the pool short
 \* re-establishes a connection both nodes have given up on.
@@ -447,7 +521,7 @@ Refill(c) ==
                     /\ cs[n][c].wst # "up" /\ Pinned(n, c) = {}
     /\ br' = [br EXCEPT ![c] = FALSE]
     /\ cs' = [cs EXCEPT !["a"][c] = ConnInit, !["b"][c] = ConnInit]
-    /\ UNCHANGED <<rs, rel, mem, pend, cnt>>
+    /\ UNCHANGED <<rs, rel, mem, pend, cnt, bq>>
 
 \* A node closes its side of a connection: when it released its manager, or
 \* when the connection left the pool and its last pinned lane unregistered.
@@ -465,7 +539,7 @@ CloseOut(n, c) ==
     /\ \/ rel[n]
        \/ conn.pool # "live" /\ conn.rds = "done" /\ Pinned(n, c) = {}
     /\ abrupt \/ conn.wq = <<>>
-    /\ IF abrupt /\ cs[m][c].wire # <<>> /\ ~br[c]
+    /\ IF abrupt /\ Unread(n, c) /\ ~br[c]
        THEN /\ br' = [br EXCEPT ![c] = TRUE]
             /\ cs' = [cs EXCEPT ![n][c] = [@ EXCEPT !.wst = "shut", !.rds = "done", !.closed = TRUE,
                                                     !.wq = <<>>, !.wire = <<>>],
@@ -474,7 +548,7 @@ CloseOut(n, c) ==
                                                     !.rds = IF abrupt THEN "done" ELSE @,
                                                     !.closed = abrupt]]
             /\ UNCHANGED br
-    /\ UNCHANGED <<rs, rel, mem, pend, cnt>>
+    /\ UNCHANGED <<rs, rel, mem, pend, cnt, bq>>
 
 ---------------------------------------------------------------------------
 (* Runs *)
@@ -491,7 +565,7 @@ Send(n, r) ==
                         ![n][r].ob = @ \o <<Frame("data", Id(r), r, -1, FALSE),
                                             Frame("p1", Id(r), r, -1, FALSE),
                                             Frame("p2", Id(r), r, -1, FALSE)>>]
-    /\ UNCHANGED <<cs, br, rel, mem, pend, cnt>>
+    /\ UNCHANGED <<cs, br, rel, mem, pend, cnt, bq>>
 
 \* The enqueue already happened. Other nodes, bridges and the coordinator
 \* have been free to run while this caller has not returned. Rechecking a
@@ -504,7 +578,7 @@ ReturnSend(n, r) ==
     /\ rs' = [rs EXCEPT ![n][r].sending = FALSE,
                         ![n][r].st = IF lost THEN "fail" ELSE @]
     /\ cnt' = [cnt EXCEPT !.falseLoss = @ \/ (lost /\ rs[Other(n)][r].gd = 1)]
-    /\ UNCHANGED <<cs, br, rel, mem, pend>>
+    /\ UNCHANGED <<cs, br, rel, mem, pend, bq>>
 
 \* Deliberately invalid application: after the ordinary record, start one
 \* more send before the link retires, then delay its enqueue until after.
@@ -515,7 +589,7 @@ ArmLateSend(n, r) ==
     /\ LateAttempt /\ n = "a" /\ rec.st = "run" /\ rec.sent /\ ~rec.sending
     /\ ~Retired(rec) /\ rec.late = "none"
     /\ rs' = [rs EXCEPT ![n][r].late = "armed"]
-    /\ UNCHANGED <<cs, br, rel, mem, pend, cnt>>
+    /\ UNCHANGED <<cs, br, rel, mem, pend, cnt, bq>>
 
 EnqueueLateSend(n, r) ==
     LET rec == rs[n][r]
@@ -528,7 +602,7 @@ EnqueueLateSend(n, r) ==
                                       ELSE Append(@, Frame("data", Id(r), r, -1, FALSE))]
     /\ cnt' = [cnt EXCEPT !.lateQueued = @ \/ ~reject,
                          !.lateRejected = @ \/ reject]
-    /\ UNCHANGED <<cs, br, rel, mem, pend>>
+    /\ UNCHANGED <<cs, br, rel, mem, pend, bq>>
 
 ReturnLateSend(n, r) ==
     LET rec == rs[n][r]
@@ -539,7 +613,7 @@ ReturnLateSend(n, r) ==
                         ![n][r].st = IF reject THEN "fail" ELSE @]
     /\ cnt' = [cnt EXCEPT !.lateAccepted = @ \/ ~reject,
                          !.lateRejected = @ \/ reject]
-    /\ UNCHANGED <<cs, br, rel, mem, pend>>
+    /\ UNCHANGED <<cs, br, rel, mem, pend, bq>>
 
 \* The workers succeed once the view is exactly zero; the goodbye follows.
 Workers(n, r) ==
@@ -548,18 +622,21 @@ Workers(n, r) ==
     /\ ~rec.sending /\ rec.late \notin {"armed", "pending"}
     /\ rs' = [rs EXCEPT ![n][r].st = "done",
                         ![n][r].ob = Append(@, Frame("bye", Id(r), r, -1, FALSE))]
-    /\ UNCHANGED <<cs, br, rel, mem, pend, cnt>>
+    /\ UNCHANGED <<cs, br, rel, mem, pend, cnt, bq>>
 
 \* Teardown: once the link is retired, the peer cancelled, we broadcast a
 \* requested stop, or the link ended for good, and everything queued was
 \* handed to the transport (the flush), the run unregisters with success.
+\* The flush is bounded (`handshake_timeout`): it gives up only when the
+\* frames left cannot move, because a writer queue is full and its writer
+\* stuck on a silent direction.
 Teardown(n, r) ==
     LET rec == rs[n][r] IN
-    /\ rec.st = "done" /\ rec.ob = <<>>
+    /\ rec.st = "done" /\ Flushed(n, r)
     /\ Retired(rec) \/ rec.gc \/ rec.cx \/ rec.ended
     /\ rs' = [rs EXCEPT ![n][r].st = "ok", ![n][r].reg = "gone"]
     /\ mem' = [mem EXCEPT ![n] = @ \cup {Id(r)}]
-    /\ UNCHANGED <<cs, br, rel, pend, cnt>>
+    /\ UNCHANGED <<cs, br, rel, pend, cnt, bq>>
 
 \* A failed run unregisters and broadcasts Cancel (unless it failed on the
 \* peer's Cancel), on its pinned connection, ahead of its outbox.
@@ -573,7 +650,7 @@ Cleanup(n, r) ==
     /\ IF ~rec.pf /\ to # {}
        THEN \E c \in to : cs' = [cs EXCEPT ![n][c].wq = Append(@, Frame("cxl", Id(r), r, -1, TRUE))]
        ELSE UNCHANGED cs
-    /\ UNCHANGED <<br, rel, pend, cnt>>
+    /\ UNCHANGED <<br, rel, pend, cnt, bq>>
 
 \* A requested stop: broadcast Cancel, then drain (keep running).
 RequestStop(n, r) ==
@@ -586,14 +663,14 @@ RequestStop(n, r) ==
        THEN \E c \in to : cs' = [cs EXCEPT ![n][c].wq = Append(@, Frame("cxl", Id(r), r, -1, FALSE))]
        ELSE UNCHANGED cs
     /\ cnt' = [cnt EXCEPT !.s = @ + 1]
-    /\ UNCHANGED <<br, rel, mem, pend>>
+    /\ UNCHANGED <<br, rel, mem, pend, bq>>
 
 \* A local worker failure in run 1.
 LocalFail(n) ==
     /\ cnt.x < MaxFails /\ rs[n][1].st = "run"
     /\ rs' = [rs EXCEPT ![n][1].st = "fail"]
     /\ cnt' = [cnt EXCEPT !.x = @ + 1]
-    /\ UNCHANGED <<cs, br, rel, mem, pend>>
+    /\ UNCHANGED <<cs, br, rel, mem, pend, bq>>
 
 \* The handshake or ready barrier times out (`handshake_timeout`): the
 \* peer's run ended before the barrier passed and its Cancel, if any, was
@@ -602,14 +679,14 @@ LocalFail(n) ==
 BarrierTimeout(n, r) ==
     /\ rs[n][r].st = "run" /\ ~rs[n][r].sent /\ Terminal(rs[Other(n)][r].st)
     /\ rs' = [rs EXCEPT ![n][r].st = "fail"]
-    /\ UNCHANGED <<cs, br, rel, mem, pend, cnt>>
+    /\ UNCHANGED <<cs, br, rel, mem, pend, cnt, bq>>
 
 \* The earlier design's gap timer fires while a frame is missing (a timer
 \* abstracts time: under load any delay may exceed it, audit H7).
 GapTimeout(n, r) ==
     /\ ~Pin /\ rs[n][r].rb # {} /\ rs[n][r].st \in {"run", "done"}
     /\ rs' = [rs EXCEPT ![n][r].st = "fail"]
-    /\ UNCHANGED <<cs, br, rel, mem, pend, cnt>>
+    /\ UNCHANGED <<cs, br, rel, mem, pend, cnt, bq>>
 
 \* The retry registers once run 1 ended here. PR9 refuses an id that ended
 \* here (InvalidRegistration): the run fails loudly. With RejectCancel its
@@ -633,13 +710,13 @@ Start(n) ==
                IN /\ rs' = [rs EXCEPT ![n][2] = ApplyPend(rec0, q, 2)]
                   /\ pend' = [pend EXCEPT ![n] = SelectSeq(@, LAMBDA e : e.f.id # Id(2))]
             /\ UNCHANGED cs
-    /\ UNCHANGED <<br, rel, mem, cnt>>
+    /\ UNCHANGED <<br, rel, mem, cnt, bq>>
 
 Release(n) ==
     /\ PerJob /\ ~rel[n]
     /\ \A r \in Runs : Terminal(rs[n][r].st) /\ rs[n][r].reg # "reg"
     /\ rel' = [rel EXCEPT ![n] = TRUE]
-    /\ UNCHANGED <<rs, cs, br, mem, pend, cnt>>
+    /\ UNCHANGED <<rs, cs, br, mem, pend, cnt, bq>>
 
 ---------------------------------------------------------------------------
 (* Faults *)
@@ -657,7 +734,7 @@ Reset(c) ==
     /\ br' = [br EXCEPT ![c] = TRUE]
     /\ cs' = [cs EXCEPT !["a"][c].wire = <<>>, !["b"][c].wire = <<>>]
     /\ cnt' = Hit(c)
-    /\ UNCHANGED <<rs, rel, mem, pend>>
+    /\ UNCHANGED <<rs, rel, mem, pend, bq>>
 
 \* A local write error (a TLS error, say) while writing the next frame: the
 \* peer's side is untouched.
@@ -666,7 +743,7 @@ WriteErr(n, c) ==
     /\ cs[n][c].wst = "up" /\ cs[n][c].wq # <<>> /\ ~br[c]
     /\ WriteFail(n, c)
     /\ cnt' = Hit(c)
-    /\ UNCHANGED <<rel, mem>>
+    /\ UNCHANGED <<rel, mem, bq>>
 
 \* A payload frame is corrupted on the wire.
 Corrupt(n, c) ==
@@ -675,7 +752,102 @@ Corrupt(n, c) ==
          /\ cs[n][c].wire[i].k # "cxl" /\ ~cs[n][c].wire[i].bad
          /\ cs' = [cs EXCEPT ![n][c].wire[i].bad = TRUE]
     /\ cnt' = Hit(c)
-    /\ UNCHANGED <<rs, br, rel, mem, pend>>
+    /\ UNCHANGED <<rs, br, rel, mem, pend, bq>>
+
+\* The direction of c into n goes silent: from now on nothing the peer
+\* wrote, or writes, on c reaches n, and nothing reports an error (a
+\* partition, a frozen host, state dropped by a firewall). Silence hits one
+\* connection, in one direction or, as a second fault, both.
+Silence(n, c) ==
+    /\ FaultAllowed("silence") /\ cnt.faulted \subseteq {c}
+    /\ n \in SilenceNodes /\ c \in SilenceConns
+    /\ cs[n][c].rds = "up" /\ ~cs[n][c].silent
+    /\ cs' = [cs EXCEPT ![n][c].silent = TRUE]
+    /\ cnt' = Hit(c)
+    /\ UNCHANGED <<rs, br, rel, mem, pend, bq>>
+
+---------------------------------------------------------------------------
+(* Liveness and the shared bridge *)
+
+\* The liveness rule (connection-liveness.md): a node declares c dead once
+\* nothing has arrived on it for the silence timeout. ConnSilence.tla checks
+\* that, under the rule's timing condition, this happens exactly when the
+\* direction into n is silent; here it is enabled exactly then. The verdict
+\* is a read error that also aborts the writer at once, dropping what is
+\* queued: the lanes pinned to c fail, the runs whose frames arrive on c are
+\* told, c leaves the pool, and the whole socket closes (FIN after what is
+\* already on the wire; nothing unread is waiting, since nothing arrives).
+DeclareDead(n, c) ==
+    /\ Detect = "silence"
+    /\ cs[n][c].rds = "up" /\ cs[n][c].silent
+    /\ rs' = IF Pin THEN [rs EXCEPT ![n] = Broken(n, c, "rfail")] ELSE rs
+    /\ cs' = [cs EXCEPT ![n][c] = [@ EXCEPT !.rds = "done", !.pool = "gone", !.wq = <<>>,
+                                            !.wst = IF @ = "up" THEN "dead" ELSE @,
+                                            !.closed = TRUE, !.fin = TRUE]]
+    /\ pend' = ForgetConn(n, c)
+    /\ UNCHANGED <<br, rel, mem, cnt, bq>>
+
+\* The writer stall rule, like TCP_USER_TIMEOUT as gRPC sets it (gRFC A18):
+\* a writer that has had frames waiting and written nothing for the silence
+\* timeout fails its connection, as a write error does (the whole connection
+\* closes, its lanes fail, the runs whose frames arrive on it are told). It
+\* applies at any time, in the pool or out of it. Under the rule's timing
+\* condition and CL6 (a peer always reads) that happens exactly when the
+\* writer is stuck on a silent direction, so it never fails a connection
+\* that could still deliver.
+WriteStall(n, c) ==
+    /\ StallAbort /\ Pin
+    /\ cs[n][c].wst = "up" /\ cs[n][c].wq # <<>> /\ Stuck(n, c)
+    /\ WriteFail(n, c)
+    /\ UNCHANGED <<rel, mem, cnt, bq>>
+
+\* Today's shared bridge (SharedBridge): each run's outbox feeds one FIFO
+\* per node (the manager's payload queue) ...
+ToBridge(n, r) ==
+    /\ SharedBridge /\ rs[n][r].ob # <<>>
+    /\ rs' = [rs EXCEPT ![n][r].ob = Tail(@)]
+    /\ bq' = [bq EXCEPT ![n] = Append(@, [r |-> r, f |-> Head(rs[n][r].ob), held |-> FALSE])]
+    /\ UNCHANGED <<cs, br, rel, mem, pend, cnt>>
+
+\* ... and one task takes its head. A frame of an ended registration, or of
+\* a lane that failed, is dropped; any other is numbered and held while the
+\* task waits for room in the writer queue of the run's pinned connection
+\* (`writer.send(frame).await`). From then on the task is committed to that
+\* frame, whatever happens to its registration, and nothing behind it
+\* moves, whichever connection it is for (PR9 settings only).
+BridgeTake(n) ==
+    LET e == Head(bq[n])
+        rec == rs[n][e.r]
+        p == rec.pin
+        drop(needless) == /\ bq' = [bq EXCEPT ![n] = Tail(@)]
+                          /\ cnt' = IF needless THEN [cnt EXCEPT !.needless = TRUE] ELSE cnt
+                          /\ UNCHANGED <<rs, cs>>
+    IN
+    /\ SharedBridge /\ bq[n] # <<>> /\ ~e.held
+    /\ IF rec.reg # "reg"
+       THEN drop(FALSE)
+       ELSE IF rec.obf \/ cs[n][p].wst # "up"
+       THEN drop(cs[n][p].wst = "up" /\ ~br[p] /\ cs[Other(n)][p].rds = "up")
+       ELSE /\ bq' = [bq EXCEPT ![n][1] = [e EXCEPT !.held = TRUE, !.f.seq = rec.tx]]
+            /\ rs' = [rs EXCEPT ![n][e.r].tx = @ + 1]
+            /\ UNCHANGED <<cs, cnt>>
+    /\ UNCHANGED <<br, rel, mem, pend>>
+
+\* The held frame goes into the writer queue once there is room. A writer
+\* that has stopped refuses it: the frame is lost with its connection.
+BridgePush(n) ==
+    LET e == Head(bq[n])
+        p == rs[n][e.r].pin
+    IN
+    /\ SharedBridge /\ bq[n] # <<>> /\ e.held
+    /\ IF cs[n][p].wst = "up"
+       THEN /\ Len(cs[n][p].wq) < WQCap
+            /\ cs' = [cs EXCEPT ![n][p].wq = Append(@, e.f)]
+       ELSE UNCHANGED cs
+    /\ bq' = [bq EXCEPT ![n] = Tail(@)]
+    /\ UNCHANGED <<rs, br, rel, mem, pend, cnt>>
+
+SharedBridgeStep(n) == BridgeTake(n) \/ BridgePush(n)
 
 ---------------------------------------------------------------------------
 (* Specification *)
@@ -693,9 +865,11 @@ Next ==
                             \/ Cleanup(n, r) \/ RequestStop(n, r) \/ GapTimeout(n, r)
                             \/ BarrierTimeout(n, r) \/ ReturnSend(n, r)
                             \/ ArmLateSend(n, r) \/ EnqueueLateSend(n, r) \/ ReturnLateSend(n, r)
-         \/ LocalFail(n) \/ Start(n) \/ Release(n)
+                            \/ ToBridge(n, r)
+         \/ LocalFail(n) \/ Start(n) \/ Release(n) \/ SharedBridgeStep(n)
          \/ \E c \in Conns : Write(n, c) \/ Read(n, c) \/ ReadErr(n, c) \/ CleanEofA(n, c)
                              \/ CloseOut(n, c) \/ WriteErr(n, c) \/ Corrupt(n, c)
+                             \/ Silence(n, c) \/ DeclareDead(n, c) \/ WriteStall(n, c)
     \/ \E c \in Conns : Reset(c) \/ Redial(c) \/ Refill(c)
     \/ Terminated
 
@@ -705,15 +879,17 @@ Spec == Init /\ [][Next]_vars
 \* faults, stops and failures are not fair.
 Fairness ==
     /\ \A n \in N :
-        /\ WF_vars(Start(n)) /\ WF_vars(Release(n))
+        /\ WF_vars(Start(n)) /\ WF_vars(Release(n)) /\ WF_vars(SharedBridgeStep(n))
         /\ \A r \in Runs : /\ WF_vars(Send(n, r)) /\ WF_vars(Bridge(n, r))
                            /\ WF_vars(ReturnSend(n, r))
                            /\ WF_vars(EnqueueLateSend(n, r)) /\ WF_vars(ReturnLateSend(n, r))
                            /\ WF_vars(Workers(n, r)) /\ WF_vars(Teardown(n, r))
                            /\ WF_vars(Cleanup(n, r)) /\ WF_vars(BarrierTimeout(n, r))
+                           /\ WF_vars(ToBridge(n, r))
         /\ \A c \in Conns : /\ WF_vars(Write(n, c)) /\ WF_vars(Read(n, c))
                             /\ WF_vars(ReadErr(n, c)) /\ WF_vars(CleanEofA(n, c))
                             /\ WF_vars(CloseOut(n, c))
+                            /\ WF_vars(DeclareDead(n, c)) /\ WF_vars(WriteStall(n, c))
     /\ \A c \in Conns : WF_vars(Redial(c)) /\ WF_vars(Refill(c))
 LiveSpec == Spec /\ Fairness
 
@@ -731,6 +907,7 @@ TypeOK ==
     /\ \A n \in N, c \in Conns :
          /\ cs[n][c].wst \in {"up", "shut", "dead"} /\ cs[n][c].rds \in {"up", "done"}
          /\ cs[n][c].pool \in {"live", "peerclosed", "gone"}
+         /\ cs[n][c].silent \in BOOLEAN
     /\ cnt.faulted \subseteq Conns
 
 \* Never Ok with lost data: a run whose workers succeeded consumed the record
@@ -785,6 +962,20 @@ ReuseRejected == \A n \in N : rs[n][2].st \in {"off", "rej"}
 \* nodes: every failure the transport can detect is seen by both sides, and
 \* nothing hangs.
 Termination == <>AllDone
+
+\* Liveness: a dead connection holds up nobody else. Every run ends on both
+\* nodes unless one of its lanes, in either direction, uses a faulted
+\* connection.
+UnfaultedRunsEnd ==
+    \A r \in Runs : <>(\/ \A n \in N : Terminal(rs[n][r].st) /\ rs[n][r].reg # "reg"
+                       \/ \E n \in N : rs[n][r].pin \in cnt.faulted)
+
+\* Liveness: a connection that left a node's pool, with no lane pinned to it
+\* there, is eventually closed there (its writer stops), even when the
+\* manager is kept.
+LeftPoolCloses ==
+    \A n \in N, c \in Conns :
+        [](cs[n][c].pool # "live" /\ Pinned(n, c) = {} => <>(cs[n][c].wst # "up"))
 
 \* Liveness: the retry eventually succeeds on both nodes.
 RetryEventuallyOk == <>(\A n \in N : rs[n][2].st = "ok")

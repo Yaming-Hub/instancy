@@ -187,9 +187,13 @@ $ctBase = [ordered]@{
     Pin = 'TRUE'; WriteErrClose = 'TRUE'; Split = 'TRUE'; CleanEof = '"keep"'; Linger = 'TRUE'
     RunIds = '"pr9"'; RejectCancel = 'FALSE'; Crc = 'TRUE'
     SendOutcome = '"atomic"'; LateAttempt = 'FALSE'
+    Detect = '"none"'; StallAbort = 'FALSE'; SharedBridge = 'FALSE'; WQCap = '99'; StuckCap = '1'
+    SilenceNodes = '{"a", "b"}'; SilenceConns = '{1, 2}'
 }
 $ctSafety = @('TypeOK', 'NoLossOk', 'NoCrossRun', 'NoCorruptAccepted', 'NoNeedlessDrop', 'NoSpuriousFail')
 $allFaults = '{"reset", "writeerr", "corrupt"}'
+# The liveness rule: silence faults, the dead verdict and the writer stall rule.
+$silence = @{ Faults = '{"silence"}'; Detect = '"silence"'; StallAbort = 'TRUE' }
 $ctScenarios = @(
     # ---- Split enqueue and caller return; one run and one connection ----
     @{ n = 'ct_send_return_recheck'; e = 'violated:NoFalseLoss'; d = 'A frame is consumed and the peer retires before the sender returns: the post-enqueue retirement recheck reports false loss.'; o = @{ SendOutcome = '"recheck"' }; inv = @('TypeOK', 'NoLossOk', 'NoFalseLoss') }
@@ -231,6 +235,19 @@ $ctScenarios = @(
 
     # ---- Open on main (a7c4b1c): must fail as named until fixed ----
     @{ n = 'ct_reuse_cancel'; e = 'violated:NoSpuriousFail'; d = 'a7c4b1c: a spawn refused for a reused DataflowId broadcasts a failure Cancel under that id; the peer''s run 1, which a finished with, takes it as its own and fails although nothing failed.'; o = @{ Runs = '{1, 2}'; Reuse = 'TRUE'; PerJob = 'FALSE'; RejectCancel = 'TRUE' }; inv = @('NoSpuriousFail') }
+
+    # ---- Connection liveness (connection-liveness.md): silence and the rule ----
+    @{ n = 'ct_silence_hang'; e = 'deadlock'; d = 'Today: a direction of the connection goes silent, with no error. With no liveness rule, the runs wait forever.'; o = @{ Faults = '{"silence"}'; MaxFaults = '1' } }
+    @{ n = 'ct_silence'; e = 'pass'; d = 'The rule: two dataflows on two connections; one connection goes silent in one direction or both. A node declares it dead when its input is silent, or when its writer has had frames waiting and written nothing for the silence timeout, and fails it like a read or write error. Nothing is Ok with lost data, and only the dataflow using that connection fails.'; o = (With $silence @{ Conns = '{1, 2}'; Runs = '{1, 2}'; Concurrent = 'TRUE'; MaxFaults = '2' }); inv = $ctSafety + 'NoCollateralFail' }
+    @{ n = 'live_ct_silence'; e = 'pass'; sym = $false; spec = 'LiveSpec'; prop = @('Termination', 'UnfaultedRunsEnd', 'LeftPoolCloses'); d = 'The rule, liveness: with silence in one direction or both and a requested stop, every run ends and every connection closes on both nodes.'; o = (With $silence @{ MaxFaults = '2'; MaxStops = '1' }) }
+    @{ n = 'live_ct_silence_kept'; e = 'pass'; sym = $false; spec = 'LiveSpec'; prop = @('Termination', 'LeftPoolCloses'); d = 'The rule with managers kept (no release, so no release deadline): every run ends, and a connection that left the pool still closes on both nodes.'; o = (With $silence @{ MaxFaults = '2'; PerJob = 'FALSE' }) }
+    @{ n = 'live_ct_silence_concurrent'; e = 'pass'; sym = $false; spec = 'LiveSpec'; prop = @('Termination'); d = 'The rule, liveness, two dataflows on two connections, managers per job: every run ends and every connection closes on both nodes (so the dataflow on the healthy connection is never held up). Silence into b on connection 1 stands for every one-way case: the model is symmetric under swapping the nodes and swapping the connections.'; o = (With $silence @{ Conns = '{1, 2}'; Runs = '{1, 2}'; Concurrent = 'TRUE'; MaxFaults = '1'; SilenceNodes = '{"b"}'; SilenceConns = '{1}' }) }
+    @{ n = 'ct_silence_crosswise'; e = 'pass'; d = 'The rule with the two dataflows pinned crosswise, so each connection carries both, managers kept: a dataflow fails only if it used the silent connection in either direction. Silence into b on either connection stands for every one-way case: swapping both the nodes and the connections maps the crosswise pinning onto itself.'; o = (With $silence @{ Conns = '{1, 2}'; Runs = '{1, 2}'; Concurrent = 'TRUE'; Crosswise = 'TRUE'; PerJob = 'FALSE'; MaxFaults = '1'; SilenceNodes = '{"b"}' }); inv = $ctSafety + 'NoCollateralFail' }
+    @{ n = 'ct_reach_silence_contained'; e = 'violated:NeverContained'; d = 'Silence fails the dataflow on one connection while the other succeeds on both nodes.'; o = (With $silence @{ Conns = '{1, 2}'; Runs = '{1, 2}'; Concurrent = 'TRUE'; MaxFaults = '1' }); inv = $ctSafety + 'NeverContained' }
+    @{ n = 'live_ct_silence_noexit'; e = 'temporal'; sym = $false; spec = 'LiveSpec'; prop = @('LeftPoolCloses'); d = 'The rule without the writer stall rule, managers kept: the node that saw a clean close keeps writing into the silent direction, its writer blocks, and the connection never closes there.'; o = (With $silence @{ StallAbort = 'FALSE'; PerJob = 'FALSE'; MaxFaults = '1' }) }
+    @{ n = 'ct_silence_sharedbridge'; e = 'deadlock'; flags = '-simulate num=2000000 -depth 150'; d = 'Today''s shared bridge, with bounded writer queues and no writer stall rule, managers kept; b''s input on connection 1 goes silent. a''s bridge holds a frame for its stuck writer on connection 1, and the dataflow on the healthy connection 2 never ends. Found by simulation.'; o = (With $silence @{ Conns = '{1, 2}'; Runs = '{1, 2}'; Concurrent = 'TRUE'; PerJob = 'FALSE'; MaxFaults = '1'; StallAbort = 'FALSE'; SharedBridge = 'TRUE'; WQCap = '1'; SilenceNodes = '{"b"}'; SilenceConns = '{1}' }); inv = $ctSafety + 'NoCollateralFail' }
+    @{ n = 'ct_silence_sharedbridge_stall'; e = 'deadlock'; flags = '-simulate num=2000000 -depth 150'; d = 'Today''s shared bridge even with the writer stall rule: the dataflow on the healthy connection finishes while the bridge is stuck, its flush times out, and the bridge later drops its last frames (ack, goodbye) as late. Its peer waits forever. Any bridge stall longer than the flush deadline does this today. Found by simulation.'; o = (With $silence @{ Conns = '{1, 2}'; Runs = '{1, 2}'; Concurrent = 'TRUE'; PerJob = 'FALSE'; MaxFaults = '1'; SharedBridge = 'TRUE'; WQCap = '1'; SilenceNodes = '{"b"}'; SilenceConns = '{1}' }); inv = $ctSafety + 'NoCollateralFail' }
+    @{ n = 'ct_silence_wq1'; e = 'pass'; d = 'The proposal with writer queues of one frame: a full queue on the stuck connection holds up only its own lanes, and a flush gives up only when its own connection is stuck.'; o = (With $silence @{ Conns = '{1, 2}'; Runs = '{1, 2}'; Concurrent = 'TRUE'; PerJob = 'FALSE'; MaxFaults = '1'; WQCap = '1' }); inv = $ctSafety + 'NoCollateralFail' }
 )
 foreach ($s in $ctScenarios) {
     $c = [ordered]@{}; foreach ($k in $ctBase.Keys) { $c[$k] = $ctBase[$k] }
@@ -247,3 +264,35 @@ foreach ($s in $ctScenarios) {
     Set-Content -Path (Join-Path $dir "$($s.n).cfg") -Value $lines -Encoding ascii
 }
 "$($ctScenarios.Count) cluster-transport scenarios written to $dir"
+
+# ---- Timing of the connection liveness rule (ConnSilence.tla) ----
+# The rule (T > P + D + 2S), with frames larger than T, and the bounds used
+# unless a scenario overrides them. The horizon leaves room to fall silent
+# and be detected.
+$csBase = [ordered]@{
+    P = '2'; D = '1'; S = '1'; T = '6'; F = '7'; Q = '2'; MaxApp = '2'; MaxPauses = '1'
+    Unit = '"bytes"'; Blocking = 'FALSE'; Silence = 'TRUE'; H = '16'
+}
+$csSafety = @('TypeOK', 'NoFalseDeath', 'DetectInTime')
+$csScenarios = @(
+    @{ n = 'cs_rule'; e = 'pass'; d = 'The rule, T = P + D + 2S + 1: a connection that keeps delivering is never declared dead, through probes skipped for a full queue, frames longer than T and a pause on each node; a silent one is declared dead within T + P + S.' }
+    @{ n = 'cs_tight'; e = 'violated:NoFalseDeath'; d = 'T = P + D + 2S: a probe delayed by a pause on x, the link and a pause on y lets a check find no byte for T. The condition is tight.'; o = @{ T = '5' } }
+    @{ n = 'cs_short'; e = 'violated:NoFalseDeath'; d = 'T = P + D with no pauses: a healthy, idle connection is declared dead between two probes.'; o = @{ S = '0'; T = '3'; Silence = 'FALSE' } }
+    @{ n = 'cs_frames'; e = 'violated:NoFalseDeath'; d = 'A timer reset only by complete frames: a frame longer than T, still arriving byte by byte, looks like silence.'; o = @{ Unit = '"frames"' } }
+    @{ n = 'cs_blocking'; e = 'violated:NoFalseDeath'; d = 'A reader that blocks on a full consumer (a naively bounded receiver, the M7 trap): the bytes wait unread and a healthy connection is declared dead.'; o = @{ Blocking = 'TRUE'; Silence = 'FALSE' } }
+    @{ n = 'cs_reach_detect'; e = 'violated:NeverDead'; d = 'A silent connection is declared dead.'; inv = @('TypeOK', 'NeverDead') }
+    @{ n = 'cs_reach_skip'; e = 'violated:NeverProbeSkipped'; d = 'A probe is skipped because the writer queue is full (the rule still holds: the queued frames are flowing).'; inv = @('TypeOK', 'NeverProbeSkipped') }
+)
+foreach ($s in $csScenarios) {
+    $c = [ordered]@{}; foreach ($k in $csBase.Keys) { $c[$k] = $csBase[$k] }
+    if ($s.o) { foreach ($k in $s.o.Keys) { $c[$k] = $s.o[$k] } }
+    # Time stops at the horizon, so a run always ends stuck there: not a hang.
+    $lines = @('\* MODULE: ConnSilence', "\* EXPECT: $($s.e)", '\* TLCFLAGS: -deadlock', "\* $($s.d)")
+    $lines += 'CONSTANTS'
+    foreach ($k in $c.Keys) { $lines += "    $k = $($c[$k])" }
+    $lines += 'SPECIFICATION Spec'
+    $inv = if ($s.inv) { $s.inv } else { $csSafety }
+    $lines += 'INVARIANTS'; foreach ($i in $inv) { $lines += "    $i" }
+    Set-Content -Path (Join-Path $dir "$($s.n).cfg") -Value $lines -Encoding ascii
+}
+"$($csScenarios.Count) liveness-timing scenarios written to $dir"

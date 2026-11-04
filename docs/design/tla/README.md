@@ -13,11 +13,12 @@ There are three kinds of scenario:
 - **Bug scenarios** use today's rules, or the design with one rule removed. Each must break in the named way. That shows the model is detailed enough to catch the real bug, and that the rule is needed.
 - **Sanity scenarios** show that the interesting outcomes actually happen, for example that a run with real traffic, including a loop, can finish. Without them a "pass" could be empty.
 
-There are four specs:
+There are five specs:
 - **[`PortCountedProgress.tla`](./PortCountedProgress.tla)** is generic over small graphs. It covers acyclic dataflows, and loops folded into the outer book as instancy tracks them today, with and without the guard edge an earlier plan proposed. That loop handling is no longer planned (design doc §5.1.7). The model is kept because, without the guard, it reproduces today's "probe after a loop" bug (H11).
 - **[`LoopScopes.tla`](./LoopScopes.tla)** is a focused model of nested loop scopes, the end state built in step 3 of the plan, with timestamps of the form (minute, lap).
 - **[`NestedScopes.tla`](./NestedScopes.tla)** puts one loop on another loop's feedback path, three levels deep, and keeps the links between levels cached as an incremental tracker does (decision log O1).
-- **[`ClusterTransport.tla`](./ClusterTransport.tla)** models the cluster transport and teardown after PR9 (#300): pooled connections with pinned lanes, faults, clean closes, linger, `Cancel` and `DataflowId` reuse (decision log O16). It has its own section below.
+- **[`ClusterTransport.tla`](./ClusterTransport.tla)** models the cluster transport and teardown after PR9 (#300): pooled connections with pinned lanes, faults, clean closes, linger, `Cancel` and `DataflowId` reuse (decision log O16). Behind switches, it also models silent connections and the proposed connection liveness rule (O17). It has its own section below.
+- **[`ConnSilence.tla`](./ConnSilence.tla)** models the timing of that liveness rule on one connection, with ticks (O17). It is described with the liveness scenarios below.
 
 **Old labels in the files.** Comments in the specs, MC modules and `make-models.ps1` still use the earlier plan's labels: "PR4c", "PR5", "PR6a" and "interim". All of them are now part of step 3 (design doc §5.7; label table in Appendix B), and "interim" means flattened loops. The comments were left unchanged so that the spec and config hashes recorded with the results still match.
 
@@ -408,6 +409,92 @@ three-worker behavior or memory-model ordering is proved by these small models.
 - **Data-channel close sentinels and real progress.** Completion is the abstract "record and progress received"; the progress models cover the rest.
 - **Dedicated mode,** where each dataflow has its own connections.
 
+## Connection liveness (`ClusterTransport.tla` and `ConnSilence.tla`, O17)
+
+Design: [`connection-liveness.md`](../connection-liveness.md), decision log R54–R58. The proposed rule:
+- every node probes every pooled connection every P;
+- a node declares a connection dead once it has read no bytes from it for T;
+- the reaction is a read error that aborts the writer at once;
+- a writer that has had frames waiting and written nothing for T fails its connection, as TCP_USER_TIMEOUT does (gRFC A18);
+- nothing is shared between connections: each has its own writer queues.
+
+Two models check it, splitting logic from timing:
+- **`ClusterTransport.tla`, extended, without clocks,** checks the logic: who fails, what closes, what hangs. A silence fault stops one direction of a connection from delivering anything, frames, FIN or reset, without an error; a writer into it fills the kernel's buffer (`StuckCap` frames), then blocks. A node may declare a connection dead exactly when its inbound direction is silent.
+- **`ConnSilence.tla`, new, with ticks,** justifies that abstraction on one direction of one connection: the verdict comes only after the direction fell silent, and always within T + P + S, provided T > P + D + 2S and the reader never blocks (CL6).
+
+### The rules checked
+
+| Property | Model | Meaning |
+|---|---|---|
+| `NoLossOk`, `NoCrossRun`, `NoCorruptAccepted`, `NoNeedlessDrop`, `Termination` | ClusterTransport | As above, now with silence faults. |
+| `NoCollateralFail` | ClusterTransport | A silent connection counts as faulted: only dataflows that used it fail. |
+| `UnfaultedRunsEnd` | ClusterTransport | Every run that uses no faulted connection, in either direction, ends on both nodes: a dead connection holds up nobody else. |
+| `LeftPoolCloses` | ClusterTransport | A connection that left a node's pool, with no lane pinned to it there, is eventually closed there, even when the manager is kept. |
+| `NoFalseDeath` | ConnSilence | A connection is declared dead only after it fell silent. |
+| `DetectInTime` | ConnSilence | A silent connection is declared dead within T + P + S ticks. |
+| `NeverContained`, `NeverDead`, `NeverProbeSkipped` | both | Reachability witnesses, deliberately violated. |
+
+### Switches
+
+**`ClusterTransport.tla`.** Every switch is off in the earlier scenarios, so their state counts are unchanged.
+
+| Switch | The proposal | Today or broken |
+|---|---|---|
+| `"silence"` in `Faults`, `SilenceNodes`, `SilenceConns` | where silence may strike (default: any direction of any connection, one connection per run) | — |
+| `Detect` | `"silence"`: the dead verdict | `"none"`: today, no rule |
+| `StallAbort` | `TRUE`: a writer stuck on a silent direction fails its connection like a write error, at any time | `FALSE`: only a release ends a writer, and the model gives a release no deadline |
+| `SharedBridge`, `WQCap` | `FALSE`: each lane is forwarded on its own | `TRUE`: today's one bridge per node. It takes the head of one FIFO, numbers it, holds it and waits for room in a bounded writer queue (`WQCap`), committed to that frame. |
+| `StuckCap` | frames a writer puts into a silent direction before it blocks | — |
+
+**`ConnSilence.tla`.** The base configuration is P = 2, D = 1, S = 1 and T = 6, which is P + D + 2S + 1. Frames are up to F = 7 bytes, longer than T, at one byte per tick. The writer queue holds 2 frames, the application sends 2 frames, there is one pause per node, and the horizon is 16 ticks.
+- `Unit = "frames"` resets the timer only on a complete frame.
+- `Blocking` lets a consumer hold up the reader.
+- `Silence` lets the connection fall silent.
+
+### Results
+
+TLC 2.19, 4 workers. A scenario that finds a violation stops at the first one, so its state count varies a little from run to run. The two shared-bridge scenarios were found by simulation (random behaviours, up to depth 150), because their breadth-first search is too large for this budget; a simulation can find a counterexample but can't show its absence.
+
+| Scenario | Expected | Result |
+|---|---|---|
+| `cs_rule` | pass | **Pass**, 36,768,554 states (2 minutes). With T = P + D + 2S + 1: no false death, through probes skipped for a full queue, frames longer than T and a pause on each node; a silent connection is declared dead within T + P + S. |
+| `cs_tight` | `NoFalseDeath` | **Fails as expected** (about 900,000 states). With T = P + D + 2S, a probe delayed by a pause on x and the link is read just after y's check, delayed by a pause on y. The condition is tight. |
+| `cs_short` | `NoFalseDeath` | **Fails as expected.** T = P + D with no pauses: the check falls between two probes. |
+| `cs_frames` | `NoFalseDeath` | **Fails as expected.** A timer reset only by complete frames: a frame still arriving byte by byte looks like silence. |
+| `cs_blocking` | `NoFalseDeath` | **Fails as expected.** A reader that waits on a full consumer: delivered bytes sit unread and a healthy connection is declared dead (CL6). |
+| `cs_reach_detect`, `cs_reach_skip` | violated | Witnesses: a silent connection is declared dead; a probe is skipped for a full queue. |
+| `ct_silence_hang` | deadlock | **Fails as expected** (today). A direction goes silent, and the runs wait forever. |
+| `ct_silence` | pass | **Pass**, 47,119,269 states (42 minutes). Two dataflows on two connections, one connection silent in one direction or both: nothing lost, crossed or corrupted, and only the dataflow on the silent connection fails. |
+| `ct_silence_wq1` | pass | **Pass**, 12,425,860 states (13 minutes). The same with writer queues of one frame: a full queue on the stuck connection holds up only its own lanes. |
+| `live_ct_silence` | pass | **Pass**, 482,586 states. Silence in one direction or both, and a requested stop: every run ends, every connection closes, and a connection that left the pool closes. |
+| `live_ct_silence_kept` | pass | **Pass**, 29,219 states. The same with managers kept, so no release deadline helps. |
+| `live_ct_silence_concurrent` | pass | **Pass**, 7,635,183 states (48 minutes, most of it the liveness check). Two dataflows on two connections, per-job managers: every run ends and every connection closes on both nodes, so the dataflow on the healthy connection is never held up. Silence into b on connection 1 stands for every one-way case, since the model is symmetric under swapping the nodes and the connections. |
+| `ct_silence_crosswise` | pass | **Pass**, 254,052,528 states (about 4 hours). The two dataflows are pinned crosswise, so each connection carries both, one per direction; managers are kept. Silence into b on either connection stands for every one-way case, by symmetry. A dataflow fails only if it used the silent connection in either direction. |
+| `ct_reach_silence_contained` | `NeverContained` | Witness (15,734,359 states): silence fails the dataflow on one connection while the other succeeds on both nodes. |
+| `live_ct_silence_noexit` | `LeftPoolCloses` | **Fails as expected** without the writer stall rule. Managers are kept; the node that saw the clean close keeps writing into the silent direction, its writer blocks, and the connection never closes. |
+| `ct_silence_sharedbridge` | deadlock | **Fails as expected** (today's bridge, no stall rule; simulation). a's bridge holds a frame for its stuck writer on connection 1, and the dataflow on the healthy connection 2 never ends. |
+| `ct_silence_sharedbridge_stall` | deadlock | **Fails as expected** (today's bridge with the stall rule; simulation). The dataflow on the healthy connection finishes during the stall; its flush gives up, the bridge later drops its ack and goodbye as late, and its peer waits forever. Any stall longer than the flush deadline does this today (R58). The multi-process harness reproduces it on real processes (`finished_dataflow_survives_a_one_way_stall_longer_than_handshake`, scenario `one_way_stall_schedule`). |
+
+Every earlier `ClusterTransport.tla` scenario was re-run on the extended spec with the same results and the same state counts for the passing ones, `ct_pr9_crosswise` included (226,561,926 states).
+
+### What they show, and what they do not
+
+**They show,** for two nodes and these bounds:
+- **With the rule, the right dataflows fail and nothing hangs.** A connection silent in one direction or both fails only the dataflows that used it, on both nodes, however the nodes pinned them (alike or crosswise). Every run ends, every connection closes, and nothing is Ok with lost data. Without the rule, the runs hang (`ct_silence_hang`).
+- **The writer stall rule is needed.** Without it, the node that saw a clean close keeps writing into the silent direction, and with a kept manager that connection never closes (`live_ct_silence_noexit`).
+- **Today's shared bridge turns one stuck writer into a hang of a dataflow on a healthy connection** (`ct_silence_sharedbridge`). Even with the stall rule it still does, through the flush deadline (`ct_silence_sharedbridge_stall`, R58). That is why the design also removes the bridge.
+- **The timing condition T > P + D + 2S is exact** in the timed model: at T = P + D + 2S, a probe delayed by a pause on each node is read just after the check (`cs_tight`).
+- **Each part of the rule is needed:** counting frames instead of bytes, a timeout shorter than P + D, and a reader that can block each kill a healthy connection.
+
+**They do not show:**
+- **The writer stall rule's timing.** `ConnSilence.tla` models the read side. That a healthy writer always makes progress within T rests on CL6 and the same argument; `WriteStall` fires only on a writer that is stuck.
+- **The inbound binding.** `Arrive` reads the peer's pin, but the code binds a dataflow to its inbound connection only when a first frame arrives there. Before that, silence ends the dataflow at `handshake_timeout`.
+- **Races between a lane's producers** once numbering happens at enqueue (R57's obligations). The model numbers each lane atomically, from one ordered outbox.
+- **Fixed deadlines.** The teardown flush, and in the code a release's linger, have fixed deadlines that can also expire on a slow but healthy writer. Here they expire only on a stuck one; this behaviour is existing and unchanged.
+- **More than one pause per node in a detection window.** With k pauses, the detection bound is T + P + kS.
+- **TCP's own timers,** real frame and probe sizes, and links slower than one byte per tick: D covers delay, not bandwidth.
+- **More than two nodes, and Dedicated mode.**
+
 ## Reviews
 
 GPT-6 Astra reviewed each model for fidelity. Neither review found a counterexample to the proposal.
@@ -472,6 +559,18 @@ After that review, checking the counterexamples led to three more changes:
 | `FreshRetryOk` and `ReuseRejected` are invariants, so a retry that never ran would pass | medium | Added `RetryEventuallyOk` and `ReuseEventuallyRejected` under fairness: `live_ct_freshretry`, `live_ct_reuse` |
 | `Pin` and `RunIds` switch several mechanisms at once, so they can't show each part is needed | medium | Claim narrowed: they show the earlier designs were broken. Splitting them is left as a limit. |
 
+**Sixth review, of the liveness extension and `ConnSilence.tla`** (a rubber-duck review). It found no counterexample to the rule's logic, and it confirmed that the extension leaves the earlier scenarios' behaviour unchanged, and that T + P + S and T > P + D + 2S are right within `ConnSilence`.
+
+| Finding | Severity | Resolution |
+|---|---|---|
+| CL6 (the reader never waits on a consumer) is assumed, but `on_frame` awaits a bounded per-channel queue | high | The design states CL6 precisely: it holds today only because an inbound bridge drains that queue at once. The implementation makes the hand-off unbounded; `cs_blocking` shows what happens without CL6. |
+| The writer grace was a fixed 10 s, while the model aborted only stuck writers, and a frame being written is off the queue | high | The grace became a stall rule: fail the connection after T with no bytes written, measured on the write half. A later review against proven practice made it apply at any time, as TCP_USER_TIMEOUT does for gRPC (gRFC A18). `StallAbort` models exactly that. |
+| `TransportDegraded` documents an unrecoverable state and advises a restart, yet is emitted for every pooled-connection failure | high | A pre-existing mismatch; the design requires a recoverable event or corrected documentation (R55). |
+| `Arrive` knows the peer's pin before the code binds a dataflow to its inbound connection | medium | Stated as a limit: before a dataflow's first frame arrives, silence ends it at `handshake_timeout`. |
+| Numbering at enqueue with several producers per lane isn't modelled | medium | Stated as a limit, with obligations for a Loom or Shuttle test (R57). |
+
+Checking the shared-bridge scenario's state space then showed a fidelity defect of our own: the modelled bridge re-checked the registration whenever it found room, so it could drop a frame of a dataflow that had torn down meanwhile. The real bridge awaits with the frame already taken. It now takes, numbers and holds the frame, then waits; the earlier model could not reach the hang.
+
 ## Running it
 
 You need Java 11 or newer and `tla2tools.jar` from the [TLA+ releases](https://github.com/tlaplus/tlaplus/releases).
@@ -486,4 +585,4 @@ $env:TLA2TOOLS_JAR = 'C:\path\to\tla2tools.jar'
 
 `models/*.cfg` are generated from the scenario table and are not committed; `run.ps1` regenerates them on every run, so they always match the table. `run.ps1` prints one line per scenario and whether the result matched exactly. It appends results, with spec and config hashes, to `results.csv`, and keeps TLC's full output, including counterexample traces, in a temporary folder.
 
-The large scenarios take 10 to 30 minutes each on 6 threads: `chain_pcp`, `direct3_pcp`, `async_pcp` and `loop_interim`. `chain3_pcp` takes about an hour. Of the transport scenarios, `ct_pr9_crosswise` takes about 1 hour 45 minutes on 4 threads, `ct_pr9_concurrent` about 15 minutes and `ct_reach_contained` about 6. Everything else finishes in seconds to a few minutes.
+The large scenarios take 10 to 30 minutes each on 6 threads: `chain_pcp`, `direct3_pcp`, `async_pcp` and `loop_interim`. `chain3_pcp` takes about an hour. Of the transport scenarios, `ct_silence_crosswise` and `ct_pr9_crosswise` take about 2 to 4 hours each on 4 threads, and their TLC queues need tens of gigabytes of disk (put `-OutDir` on a drive with room); `ct_pr9_concurrent` about 15 minutes and `ct_reach_contained` about 6. Of the liveness scenarios, `ct_silence` takes about 40 minutes, `ct_silence_wq1` and `ct_reach_silence_contained` about 13 each, and `cs_rule` about 2; `live_ct_silence_concurrent` takes about 50, most of it the liveness check. Everything else finishes in seconds to a few minutes.
