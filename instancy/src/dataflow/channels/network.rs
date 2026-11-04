@@ -879,7 +879,7 @@ impl InboundChannel<'_> {
         if !self.reported {
             self.reported = true;
             let detail = format!("channel {}: {why}", self.channel_id);
-            // The report first: a dump must never delay the failure.
+            // Reported, and noted in the link's ring (an observation only).
             #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
             let traced = detail.clone();
             self.peer
@@ -887,7 +887,7 @@ impl InboundChannel<'_> {
                     detail,
                 ));
             traced! {
-                self.peer.trace_lost(&traced);
+                self.peer.note_lost(&traced);
             }
         }
     }
@@ -1033,7 +1033,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Drop for NetworkPull<T, D> {
                  consumed",
                 monitor.channel_id
             );
-            // The report first: a dump must never delay the failure.
+            // Reported, and noted in the link's ring (an observation only).
             #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
             let traced = detail.clone();
             monitor
@@ -1042,7 +1042,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Drop for NetworkPull<T, D> {
                     detail,
                 ));
             traced! {
-                monitor.peer.trace_lost(&traced);
+                monitor.peer.note_lost(&traced);
             }
         }
     }
@@ -2360,6 +2360,91 @@ mod tests {
                 .await
                 .expect("bridges exit on drain");
             assert!(events.try_recv().is_err(), "one report per channel");
+        }
+
+        /// The flight recorder: records a bridge could not deliver (left
+        /// unconsumed by the pull, or arriving after it) are reported and
+        /// noted in the link's ring, but not dumped: whether they are a data
+        /// loss is the lifecycle's to decide, and it dumps the losses it
+        /// accepts. A dump on request still shows the notes.
+        #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+        #[tokio::test]
+        async fn undelivered_records_are_noted_but_not_dumped() {
+            use crate::progress::trace;
+            let dir = std::env::temp_dir().join(format!(
+                "instancy-trace-undelivered-{}",
+                DataflowId::new().as_uuid()
+            ));
+            let id = DataflowId::new();
+            let ring = trace::recorder_for_test(id, "node-b", None, "node-a", 4, &dir);
+            let rt = tokio::runtime::Handle::current();
+            let (mut mat_a, mat_b) =
+                create_connected_materializers(DataflowId::new(), two_node_topology(), 16, &rt);
+            let (outbox, mut events, _sink) = monitored_outbox("node-a");
+            outbox.link().attach_trace(Some(Arc::clone(&ring)));
+            let bridges = InboundBridges::default();
+            // Worker 2's wake handle: the bridge notifies it once it handed a
+            // frame to the pull.
+            let delivered = mat_b.wake_handles[2].clone();
+            let mut mat_b = mat_b
+                .with_peer_outboxes(std::collections::HashMap::from([(
+                    "node-a".to_string(),
+                    outbox,
+                )]))
+                .with_inbound_bridges(bridges.clone());
+            let (mut push0, _) = mat_a.materialize_worker(0).unwrap();
+            // Every other sender to worker 2 stays alive (a dropped push
+            // sends its close marker, which would wake worker 2 too).
+            let others = (
+                mat_a.materialize_worker(1).unwrap(),
+                mat_b.materialize_worker(3).unwrap(),
+            );
+            let (pushes2, pull2) = mat_b.materialize_worker(2).unwrap();
+
+            // Delivered to the pull, which drops without consuming it.
+            let _ = delivered.take_notification();
+            push0[2].push(Envelope::data(1, vec![1])).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !delivered.take_notification() {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the frame reaches the pull");
+            drop(pull2);
+            assert!(next_loss(&mut events).await.contains("never consumed"));
+            // Arriving after the pull was dropped.
+            push0[2].push(Envelope::data(2, vec![2])).unwrap();
+            assert!(
+                next_loss(&mut events)
+                    .await
+                    .contains("after the receiving operator finished")
+            );
+            // Every bridge is done with what it found.
+            drop((push0, pushes2, others));
+            bridges.drain();
+            tokio::time::timeout(std::time::Duration::from_secs(2), bridges.wait_idle())
+                .await
+                .expect("bridges exit on drain");
+
+            let root = dir.join(id.as_uuid().to_string());
+            assert!(!root.exists(), "an observed loss is not dumped");
+            let dumped = trace::dump_traces(id, "the test asked").expect("a dump on request");
+            let ring_file =
+                std::fs::read_to_string(dumped.join("node-b-bridge-node-a.jsonl")).unwrap();
+            let notes: String = ring_file
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|event| event["ev"] == "note")
+                .filter_map(|event| event["text"].as_str().map(str::to_string))
+                .collect();
+            assert!(
+                notes.contains("never consumed")
+                    && notes.contains("after the receiving operator finished"),
+                "{notes}"
+            );
+            drop((ring, mat_a, mat_b));
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[tokio::test]

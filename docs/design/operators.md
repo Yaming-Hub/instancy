@@ -637,13 +637,27 @@ dataflow. The runtime manages the producer's lifecycle:
 3. **Runtime**: The pump thread executes `producer(sender)`. Data flows
    through the bounded tokio channel into the operator. Backpressure
    is natural — `sender.send()` yields when the channel is full.
-4. **Completion**: When the producer returns (Ok or Err), the sender is
-   dropped, closing the channel. The `ChannelSourceOperator` detects
-   disconnection and releases its capability, allowing the dataflow to
-   complete.
+4. **Completion**: The input ends once the producer returns `Ok` and the
+   channel is closed (the sender, and any clone of it, dropped). The
+   `ChannelSourceOperator` then releases its capability, allowing the
+   dataflow to complete. If the producer returns `Err`, the source fails
+   the dataflow with that error in its operator context, at once, even
+   while a sender clone keeps the channel open; a producer that panics
+   fails it too. A closed channel alone does not end the input: a producer
+   that drops its sender and keeps running keeps the source unfinished
+   until it returns or the dataflow is cancelled. The pump publishes the
+   producer's outcome to the source before it wakes the worker.
 5. **Cancellation**: The pump thread runs in a `tokio::select!` with the
-   dataflow's `CancellationToken`. On cancellation, the sender is dropped
-   immediately, and any in-flight `send()` in the producer returns an error.
+   dataflow's `CancellationToken`. On cancellation, the producer is dropped
+   (with its sender), and any in-flight `send()` in the producer returns an
+   error. An error the producer returns counts as the cancellation, not as
+   a failure, when the cancellation has already been observed as the pump
+   classifies the result (not by when the producer created the error): with
+   a drain the source ends after everything it accepted; without one it
+   stays unfinished and the executor stops as cancelled. A producer panic
+   still fails a drain, even one raised while the producer is dropped: the
+   cancellation's outcome is published only after the producer's future
+   is destroyed.
 
 #### Frontier propagation
 
@@ -657,8 +671,8 @@ new time, allowing downstream frontier-sensitive operators (e.g.,
 
 Each `source_async` port increments the `external_inputs_open` counter
 at spawn time (same as `input()` ports). The counter is decremented when
-the pump's sender is dropped and the `ChannelSourceOperator` finishes,
-allowing the executor to detect quiescence and complete.
+the `ChannelSourceOperator` finishes (its producer completed and its channel
+closed), allowing the executor to detect quiescence and complete.
 
 ---
 

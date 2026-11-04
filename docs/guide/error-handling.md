@@ -75,6 +75,9 @@ builder
     .output("clean");
 ```
 
+### Async operator failures
+A `unary_async` task that returns `Err` fails the dataflow with that error, and a task that panics fails it with `Error::OperatorPanic`. A task that ends without a result because its Tokio runtime shut down (the runtime that was current when `unary_async` was called) fails the dataflow with `Error::Operator` naming the operator; it is not reported as a panic. Keep that runtime alive and running while the dataflow runs.
+
 ## Error Policy
 
 instancy also exposes a per-dataflow error policy in `instancy::execute::ErrorPolicy`:
@@ -153,6 +156,8 @@ std::thread::spawn(move || {
 
 Cancellation is **cooperative**: it signals operators at their next check point. Operators wind down in an orderly fashion — they don't get forcibly killed mid-operation.
 
+`unary_async` tasks that are already running are not aborted either: they run to their end on their Tokio runtime, even after the dataflow returned, and their results are discarded.
+
 #### Cancellation Reasons
 
 Every cancellation carries a `CancellationReason` that explains *why* the dataflow was cancelled. This helps distinguish user-initiated stops from system failures:
@@ -214,10 +219,10 @@ let handle = rt.spawn(dataflow, opts).unwrap();
 
 When cancellation is triggered with drain enabled:
 
-1. **External inputs are closed** — no new data is accepted: `send()` and `advance_to()` return `Err(ChannelClosed)` and `source_async` producers are stopped. Every send that already returned `Ok` is still processed, and the drain does not wait for callers to drop their senders.
+1. **External inputs are closed** — no new data is accepted: `send()` and `advance_to()` return `Err(ChannelClosed)` and `source_async` producers are stopped. Every send that already returned `Ok` is still processed, and the drain does not wait for callers to drop their senders. An error a producer returns once the cancellation is observed counts as the cancellation, not as a failure (its source ends), but a producer that panics fails the drain.
 2. **In-flight data continues flowing** through operators normally.
 3. **If all operators complete** within the timeout, the dataflow returns successfully (`Ok`).
-4. **If the timeout expires**, the dataflow returns `Err(Cancelled)` with the original reason.
+4. **If the timeout expires**, the dataflow returns `Err(Cancelled)` with the original reason. The timeout bounds the dataflow's completion, not user code: a stopped `source_async` producer whose destruction blocks may keep its pump thread running, after the dataflow has ended, until that code returns.
 
 Cancellation caused by a failure (an operator error, a failed sibling worker, a lost peer) never drains — the computation can no longer succeed, so it stops immediately. A sibling failure reported while a drain is in progress ends that drain at once.
 
@@ -336,6 +341,7 @@ assert!(sender.send(0, vec![0]).is_err()); // The drain closed the input.
 - Check that all `InputSender`s are dropped (closing the input)
 - Check that `unary_notify` operators consume all notifications (`ctx.next_notification()`)
 - Check that capabilities aren't held indefinitely
+- Check that the Tokio runtime each `unary_async` operator was built in is still running its tasks: a current-thread runtime whose only thread is blocked (for example in `join_blocking()`) never runs them. A runtime that shut down fails the dataflow with `Error::Operator` instead.
 
 ## Related Examples
 
