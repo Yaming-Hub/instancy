@@ -10,6 +10,7 @@ CI runs the unit and integration tests with
 | No default features | `cargo nextest run -p instancy --no-default-features --features test-utils --lib --tests --profile ci --no-tests fail` |
 | Schedule tests (Shuttle) | See [Schedule tests](#schedule-tests-shuttle-and-loom) |
 | Model-checked tests (Loom) | See [Schedule tests](#schedule-tests-shuttle-and-loom) |
+| Multi-process harness | `cargo nextest run -p instancy-integration --profile ci --no-tests fail` (the job installs `protoc`, see below) |
 
 Doc tests, the full conformance matrix and the release flight-recorder check
 keep their own `cargo test` commands.
@@ -27,14 +28,23 @@ keep their own `cargo test` commands.
   `tcp-cluster` group). The group's filter names whole binaries where TCP
   tests are mixed with local ones, and the library's transport tests. The
   audit repros (`tests/audit_repros.rs`) are in the group too, so they run
-  two at a time. Check what it selects with
-  `cargo nextest show-config test-groups -p instancy --all-features --profile ci`.
+  two at a time, as is every test of the multi-process harness
+  (`instancy-integration`). Check what it selects with
+  `cargo nextest show-config test-groups -p instancy -p instancy-integration --all-features --profile ci`
+  (the harness needs `protoc`, see below).
 - `--no-tests fail` fails a run that selects no tests.
 
 ## Running locally
 
 ```sh
 cargo nextest run -p instancy --all-features --lib --tests --profile ci
+```
+
+The multi-process harness builds dactor, whose build script needs `protoc`
+on `PATH` or named by `PROTOC`:
+
+```sh
+cargo nextest run -p instancy-integration --profile ci
 ```
 
 Plain `cargo test` still works.

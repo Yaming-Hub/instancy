@@ -123,11 +123,96 @@ pub enum NodeCommand {
     /// Cancel a running dataflow.
     CancelDataflow { dataflow_id: String },
 
-    /// Wait for a dataflow to complete (blocks until all workers finish).
-    WaitForCompletion { dataflow_id: String },
+    /// Bind this process's listener for Shared-transport peer connections.
+    /// Once per process.
+    BindPeerListener,
 
-    /// Shut down the node process gracefully.
+    /// Configure the Shared transport: the address this node dials for each
+    /// peer with a lower ID (a relay address), this process's incarnation,
+    /// and the pool size of every manager set created from now on.
+    ConfigurePeers {
+        peers: HashMap<String, SocketAddr>,
+        incarnation: u64,
+        connections: usize,
+    },
+
+    /// Build and spawn a cluster dataflow over the Shared transport, with the
+    /// managers of the topology's node set.
+    SpawnShared {
+        dataflow_id: String,
+        dataflow_type: DataflowType,
+        topology: SerializableTopology,
+        handshake_timeout_ms: u64,
+    },
+
+    /// Report a node as left the cluster (`RuntimeHandle::report_node_leave`).
+    ReportNodeLeave { node_id: String },
+
+    /// Report a node as joined the cluster (`RuntimeHandle::report_node_join`).
+    ReportNodeJoin { node_id: String },
+
+    /// Report every Shared-transport peer manager the node holds, with its
+    /// live pooled connections (`SharedPeerManager::metrics_snapshot`).
+    SnapshotPools,
+
+    /// Harness tests only: how this process answers a later `Shutdown`, so a
+    /// test can show that the coordinator catches a node that misbehaves at
+    /// exit. Handled by the process, not its agent.
+    SetShutdownBehavior(ShutdownBehavior),
+
+    /// Shut the node process down: drop its Shared-transport managers, wait
+    /// for its runtime to shut down (`RuntimeHandle::shutdown_async`), reply,
+    /// then exit at once. instancy closes a dropped manager's connections in
+    /// the background, and the exit right after the reply can cut that close
+    /// short: the managers are not known to close gracefully.
     Shutdown,
+}
+
+/// How a node process answers `Shutdown` (see
+/// [`NodeCommand::SetShutdownBehavior`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShutdownBehavior {
+    /// Whether it replies once its runtime has shut down.
+    pub reply: bool,
+    /// The code it then exits with, or `None` to never exit.
+    pub exit_code: Option<i32>,
+}
+
+impl ShutdownBehavior {
+    /// Reply, then exit with success.
+    pub const NORMAL: ShutdownBehavior = ShutdownBehavior {
+        reply: true,
+        exit_code: Some(0),
+    };
+}
+
+/// One Shared-transport peer manager a node holds (see
+/// [`NodeCommand::SnapshotPools`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PoolSnapshot {
+    /// The key of the node set whose dataflows share the manager
+    /// (`peer_link::node_set_key`).
+    pub node_set: String,
+    /// The peer the manager's connections lead to.
+    pub peer: String,
+    /// Its live pooled connections, by id.
+    pub connections: Vec<PooledConnection>,
+}
+
+/// One live pooled connection of a manager: the fields of instancy's
+/// `ConnectionSnapshot` the harness uses.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PooledConnection {
+    /// Its id in the manager's pool.
+    pub id: usize,
+    /// Frames queued for its writer and not yet written.
+    pub queued_frames: usize,
+    /// Dataflow lanes pinned to it.
+    pub pinned_lanes: usize,
+    /// Frames written to it so far, probes included.
+    pub total_frames: u64,
+    /// Frame payload bytes written to it so far, probes included.
+    pub total_bytes: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +234,8 @@ pub enum NodeResponse {
     DataflowSpawned {
         dataflow_id: String,
         num_local_workers: usize,
+        /// Global index of this node's first worker.
+        first_worker: usize,
     },
 
     /// Data fed to input port.
@@ -160,15 +247,27 @@ pub enum NodeResponse {
     /// Collected output data: `(timestamp, bincode-serialized records)`.
     OutputData { data: Vec<(u64, Vec<u8>)> },
 
+    /// The Shared-transport peer listener is bound.
+    PeerListenerReady { addr: SocketAddr },
+
+    /// The Shared transport is configured.
+    PeersConfigured,
+
+    /// The node was reported left; this many dataflows were newly cancelled.
+    NodeLeaveReported { cancelled: usize },
+
+    /// The node was reported joined; `was_left` says if it had been left.
+    NodeJoinReported { was_left: bool },
+
+    /// Every Shared-transport peer manager the node holds, ordered by node
+    /// set and peer.
+    Pools { pools: Vec<PoolSnapshot> },
+
+    /// `SetShutdownBehavior` took effect.
+    ShutdownBehaviorSet,
+
     /// An error occurred while processing a command.
     Error { message: String },
-
-    /// Dataflow completed.
-    DataflowCompleted {
-        dataflow_id: String,
-        success: bool,
-        error: Option<String>,
-    },
 }
 
 // ---------------------------------------------------------------------------
@@ -177,7 +276,8 @@ pub enum NodeResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NodeEvent {
-    /// A dataflow completed (naturally or via cancellation).
+    /// A dataflow completed (naturally or via cancellation). Sent once the
+    /// node has drained all of the dataflow's outputs.
     DataflowCompleted {
         dataflow_id: String,
         success: bool,
