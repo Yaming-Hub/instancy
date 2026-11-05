@@ -56,7 +56,7 @@ pub fn assert_output_matches<T: PartialEq + Ord + std::fmt::Debug>(
     actual: &[(u64, Vec<T>)],
     expected: &[(u64, Vec<T>)],
 ) {
-    fn normalize<'a, T: Ord>(data: &'a [(u64, Vec<T>)]) -> BTreeMap<u64, Vec<&'a T>> {
+    fn normalize<T: Ord>(data: &[(u64, Vec<T>)]) -> BTreeMap<u64, Vec<&T>> {
         let mut grouped = BTreeMap::new();
         for (timestamp, batch) in data {
             grouped

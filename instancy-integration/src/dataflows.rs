@@ -58,26 +58,26 @@ pub fn build_dataflow(
 /// PassThrough: source → map(identity with marker) → output.
 /// No exchange — data stays on the node where it was fed.
 fn build_pass_through(builder: &mut DataflowBuilder<u64>) -> Result<(Vec<String>, String)> {
-    let input = builder.input::<Vec<u8>>("data");
-    input.map("identity", |_t, x| x).output("results");
+    let input = builder.input::<Vec<u8>>("data")?;
+    input.map("identity", |_t, x| x).output("results")?;
     Ok((vec!["data".into()], "results".into()))
 }
 
 /// ExchangeRoundTrip: source → exchange_by_hash(key) → map → output.
 /// Data is repartitioned across workers/nodes by the first 8 bytes as u64 hash.
 fn build_exchange_round_trip(builder: &mut DataflowBuilder<u64>) -> Result<(Vec<String>, String)> {
-    let input = builder.input::<(u64, String)>("data");
+    let input = builder.input::<(u64, String)>("data")?;
     input
         .exchange_by_hash("partition", |item: &(u64, String)| item.0)
         .map("tag", |_t, item| item)
-        .output("results");
+        .output("results")?;
     Ok((vec!["data".into()], "results".into()))
 }
 
 /// MultiEpochExchange: source → exchange(key) → unary_notify(sum per epoch) → output.
 /// Tests frontier propagation across many epochs.
 fn build_multi_epoch_exchange(builder: &mut DataflowBuilder<u64>) -> Result<(Vec<String>, String)> {
-    let input = builder.input::<(u64, i64)>("data");
+    let input = builder.input::<(u64, i64)>("data")?;
     input
         .exchange_by_hash("partition", |item: &(u64, i64)| item.0)
         .unary_notify("epoch_sum", {
@@ -101,7 +101,7 @@ fn build_multi_epoch_exchange(builder: &mut DataflowBuilder<u64>) -> Result<(Vec
                 Ok(())
             }
         })
-        .output("results");
+        .output("results")?;
     Ok((vec!["data".into()], "results".into()))
 }
 
@@ -109,7 +109,7 @@ fn build_multi_epoch_exchange(builder: &mut DataflowBuilder<u64>) -> Result<(Vec
 fn build_distributed_word_count(
     builder: &mut DataflowBuilder<u64>,
 ) -> Result<(Vec<String>, String)> {
-    let input = builder.input::<String>("sentences");
+    let input = builder.input::<String>("sentences")?;
     input
         .flat_map("split", |_t, sentence| {
             sentence
@@ -137,7 +137,7 @@ fn build_distributed_word_count(
                 Ok(())
             }
         })
-        .output("results");
+        .output("results")?;
     Ok((vec!["sentences".into()], "results".into()))
 }
 
@@ -146,7 +146,7 @@ fn build_distributed_word_count(
 fn build_iterative_filter(builder: &mut DataflowBuilder<u64>) -> Result<(Vec<String>, String)> {
     use instancy::dataflow::dataflow_builder::IterateResult;
 
-    let input = builder.input::<(u64, i64)>("data");
+    let input = builder.input::<(u64, i64)>("data")?;
     input
         .iterate::<u32>("converge", 10u32, |iter_stream| {
             let processed = iter_stream
@@ -159,14 +159,14 @@ fn build_iterative_filter(builder: &mut DataflowBuilder<u64>) -> Result<(Vec<Str
                 output: done,
             }
         })
-        .output("results");
+        .output("results")?;
     Ok((vec!["data".into()], "results".into()))
 }
 
 /// DistributedJoin: two inputs → exchange both → binary join on key → output.
 fn build_distributed_join(builder: &mut DataflowBuilder<u64>) -> Result<(Vec<String>, String)> {
-    let left_input = builder.input::<(u64, String)>("left");
-    let right_input = builder.input::<(u64, i64)>("right");
+    let left_input = builder.input::<(u64, String)>("left")?;
+    let right_input = builder.input::<(u64, i64)>("right")?;
 
     let left = left_input.exchange_by_hash("left_partition", |item: &(u64, String)| item.0);
     let right = right_input.exchange_by_hash("right_partition", |item: &(u64, i64)| item.0);
@@ -196,7 +196,7 @@ fn build_distributed_join(builder: &mut DataflowBuilder<u64>) -> Result<(Vec<Str
                 for (lk, lv) in &lefts {
                     for (rk, rv) in &rights {
                         if lk == rk {
-                            joined.push((lk.clone(), lv.clone(), *rv));
+                            joined.push((*lk, lv.clone(), *rv));
                         }
                     }
                 }
@@ -206,8 +206,8 @@ fn build_distributed_join(builder: &mut DataflowBuilder<u64>) -> Result<(Vec<Str
             }
             Ok(())
         }
-    })
-    .output("results");
+    })?
+    .output("results")?;
 
     Ok((vec!["left".into(), "right".into()], "results".into()))
 }
@@ -224,13 +224,13 @@ fn build_staged_fan_out_fan_in(
         .into());
     }
 
-    let input = builder.input::<i64>("data");
+    let input = builder.input::<i64>("data")?;
     input
         .map("stage_one", |_t, x| x * 2)
-        .exchange_by_hash_to("fan_out", fan_out_parallelism, |x: &i64| *x as u64)
+        .exchange_by_hash_to("fan_out", fan_out_parallelism, |x: &i64| *x as u64)?
         .map("stage_two", |_t, x| x + 1)
         .gather("fan_in")
-        .output("results");
+        .output("results")?;
     Ok((vec!["data".into()], "results".into()))
 }
 
@@ -239,25 +239,25 @@ fn build_filter_aggregate(
     builder: &mut DataflowBuilder<u64>,
     threshold: i64,
 ) -> Result<(Vec<String>, String)> {
-    let input = builder.input::<i64>("data");
+    let input = builder.input::<i64>("data")?;
     input
         .filter("gt_threshold", move |_t, x| *x > threshold)
         .exchange_by_hash("aggregate_route", |_x| 0u64)
         .reduce("sum", |a, b| a + b)
-        .output("results");
+        .output("results")?;
     Ok((vec!["data".into()], "results".into()))
 }
 
 /// BranchMerge: source → branch(even/odd) → map(path-specific) → merge → exchange → reduce → output.
 fn build_branch_merge(builder: &mut DataflowBuilder<u64>) -> Result<(Vec<String>, String)> {
-    let input = builder.input::<i64>("data");
+    let input = builder.input::<i64>("data")?;
     let (evens, odds) = input.branch("split", |_t, x| x % 2 == 0);
     evens
         .map("double_even", |_t, x| x * 2)
-        .merge(odds.map("triple_odd", |_t, x| x * 3))
+        .merge(odds.map("triple_odd", |_t, x| x * 3))?
         .exchange_by_hash("aggregate_route", |_x| 0u64)
         .reduce("sum", |a, b| a + b)
-        .output("results");
+        .output("results")?;
     Ok((vec!["data".into()], "results".into()))
 }
 
@@ -266,7 +266,7 @@ fn build_delayed_aggregation(
     builder: &mut DataflowBuilder<u64>,
     delay_offset: u64,
 ) -> Result<(Vec<String>, String)> {
-    let input = builder.input::<i64>("data");
+    let input = builder.input::<i64>("data")?;
     input
         .delay_batch("delay", move |t| t + delay_offset)
         .exchange_by_hash("aggregate_route", |_x| 0u64)
@@ -286,7 +286,7 @@ fn build_delayed_aggregation(
                 Ok(())
             }
         })
-        .output("results");
+        .output("results")?;
     Ok((vec!["data".into()], "results".into()))
 }
 
@@ -297,7 +297,7 @@ fn build_iterative_exchange(
 ) -> Result<(Vec<String>, String)> {
     use instancy::dataflow::dataflow_builder::IterateResult;
 
-    let input = builder.input::<i64>("data");
+    let input = builder.input::<i64>("data")?;
     input
         .iterate::<u32>("loop", 1u32, move |iter_stream| {
             let processed = iter_stream
@@ -309,6 +309,6 @@ fn build_iterative_exchange(
             let output = processed.filter("done", move |_t, x| *x >= threshold);
             IterateResult { feedback, output }
         })
-        .output("results");
+        .output("results")?;
     Ok((vec!["data".into()], "results".into()))
 }

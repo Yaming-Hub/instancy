@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use instancy_integration::coordinator::TestCoordinator;
+use instancy_integration::coordinator::{Outcome, TestCoordinator, OUTCOME_DEADLINE};
 use instancy_integration::protocol::*;
 use serde::de::DeserializeOwned;
 
@@ -99,21 +99,24 @@ async fn test_node_crash_mid_dataflow() {
     coord.kill_node("node-c").await;
     coord.close_all_inputs("df-node-crash-mid").await;
 
-    // After killing a node, the remaining nodes may or may not succeed depending
-    // on whether data exchange with the killed node was already complete.
-    // The key property is: the coordinator does not panic or hang.
-    let result = coord
-        .wait_for_completion_tolerant("df-node-crash-mid")
-        .await;
+    // Node-c's inputs never closed, so neither survivor can finish `Ok`.
+    let outcomes = coord
+        .wait_for_outcomes("df-node-crash-mid", &["node-a", "node-b"], OUTCOME_DEADLINE)
+        .await
+        .unwrap_or_else(|hang| panic!("survivors hung after node-c was killed: {hang:?}"));
     assert!(
-        result.is_ok(),
-        "tolerant completion wait should not return Err after a node crash: {result:?}"
+        matches!(outcomes["node-a"], Outcome::Err(_)),
+        "node-a should fail after node-c was killed: {outcomes:?}"
+    );
+    assert!(
+        matches!(outcomes["node-b"], Outcome::Err(_)),
+        "node-b should fail after node-c was killed: {outcomes:?}"
     );
 
     coord.shutdown().await;
 }
 
-/// Simulates a node crashing before any input is fed, ensuring the remaining node can still be cleaned up.
+/// Simulates a node crashing before any input is fed: the surviving node fails instead of finishing.
 #[tokio::test]
 async fn test_node_crash_before_data() {
     let mut coord = TestCoordinator::start(&["node-a", "node-b"], 1).await;
@@ -129,16 +132,23 @@ async fn test_node_crash_before_data() {
 
     coord.kill_node("node-b").await;
     coord.close_all_inputs("df-node-crash-before-data").await;
-    let result = coord
-        .wait_for_completion_tolerant("df-node-crash-before-data")
+
+    // Decision R47 (docs/design/progress-accounting-decisions.md): on a cluster,
+    // no node finishes while another node's input is open. Node-b's input never
+    // closed, so node-a can't finish `Ok`, even though PassThrough has no exchange.
+    let outcomes = coord
+        .wait_for_outcomes(
+            "df-node-crash-before-data",
+            &["node-a", "node-b"],
+            OUTCOME_DEADLINE,
+        )
         .await
-        .expect("tolerant completion wait should return even if a node is gone");
-    // PassThrough has no exchange, so node-a should complete successfully
-    // regardless of node-b being killed.
+        .unwrap_or_else(|hang| panic!("node-a hung after node-b was killed: {hang:?}"));
     assert!(
-        result,
-        "surviving node should complete a no-exchange dataflow"
+        matches!(outcomes["node-a"], Outcome::Err(_)),
+        "node-a should fail after node-b was killed: {outcomes:?}"
     );
+    assert_eq!(outcomes["node-b"], Outcome::Dead, "{outcomes:?}");
 
     coord.shutdown().await;
 }

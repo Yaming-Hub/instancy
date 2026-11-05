@@ -11,6 +11,7 @@ dactor = "0.3"
 dactor-ractor = "0.3"
 ractor = "0.15"
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = "1"

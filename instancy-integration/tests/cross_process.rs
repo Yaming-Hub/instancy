@@ -210,7 +210,7 @@ async fn test_two_node_multi_worker() {
 ///
 /// Verifies that cancelling a cross-process dataflow works correctly:
 /// the CancelDataflow command causes both nodes to cancel their local
-/// workers, and WaitForCompletion returns indicating cancellation.
+/// workers, and both report the cancellation as the dataflow's completion.
 #[tokio::test]
 async fn test_two_node_cancellation() {
     let mut coord = TestCoordinator::start(&["node-a", "node-b"], 1).await;

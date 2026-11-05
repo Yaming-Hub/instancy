@@ -1030,7 +1030,7 @@ Process
 
 ## Cross-process integration testing model
 
-The former `CROSS_PROCESS_INTEGRATION.md` design has been merged here and updated to match the current required-connection-factory model.
+The `instancy-integration` crate runs clusters of real OS processes. For the Shared transport its aim is to show that a dataflow never reports `Ok` with lost or wrong data, and never hangs, under node kills, restarts, membership events and connection faults.
 
 ### Problem and goals
 
@@ -1039,44 +1039,78 @@ instancy's in-process cluster tests validate protocol behavior, but they do not 
 1. Start multiple node processes, each hosting its own `RuntimeHandle`.
 2. Coordinate cluster startup from a test-side coordinator.
 3. Feed data, collect outputs, and assert correctness across nodes.
-4. Clean up reliably on success, failure, or timeout.
+4. Inject faults: kill and restart processes, report membership changes, and slow or break single connections.
+5. Clean up reliably on success, failure, or timeout.
 
 ### Architecture
 
-- **Coordinator process**: starts child node processes, sends control commands, gathers progress/results, and tears everything down.
-- **Node process**: hosts a long-lived runtime plus a control-plane agent that can bind listeners, establish peer connections through the current connection-factory path, spawn a cluster dataflow, feed inputs, collect outputs, and cancel/shutdown.
+- **Coordinator** (`TestCoordinator`, in the test process): starts the `instancy-test-node` processes, sends them commands, records each node's completion events and its stdout and stderr (`node_log`), and kills every process it started when dropped.
+- **Node process**: hosts a long-lived runtime and an agent that serves commands concurrently, so a command is answered while another one's work (a spawn handshake, a blocked feed) runs.
 - **Two independent communication layers**:
-  - **Control plane**: coordinator ↔ node process, for orchestration messages.
-  - **Data plane**: node ↔ node, for instancy exchange/progress/control traffic carried by the runtime transport.
+  - **Control plane**: coordinator ↔ node, length-prefixed JSON with request IDs, plus unsolicited `DataflowCompleted` events.
+  - **Data plane**: node ↔ node, instancy's own transport.
 
 ### Control protocol
 
-The coordinator protocol remains length-prefixed JSON with request correlation:
+- Dedicated transport: `BindListener`, `ConnectPeers`, `SpawnDataflow`.
+- Shared transport: `BindPeerListener`, `ConfigurePeers`, `SpawnShared`; `SnapshotPools` reports each peer manager a node holds, with its connections' queued frames, pinned lanes and frames written (`SharedPeerManager::metrics_snapshot`).
+- Membership: `ReportNodeLeave`, `ReportNodeJoin`.
+- Every dataflow: `FeedData`, `CloseInputs`, `CollectOutput`, `CancelDataflow`; and `Shutdown`.
 
-- `BindListener` / `ListenerReady`
-- `ConnectPeers` / `PeersConnected`
-- `SpawnDataflow` / `DataflowSpawned`
-- `FeedData`, `CloseInputs`, `CollectOutput`, `CancelDataflow`, and `Shutdown`
-- unsolicited `DataflowCompleted` events
+### Shared transport, relay and membership
 
-### Coordinator and node responsibilities
+`TestCoordinator::start_shared` starts a Shared-transport cluster:
 
-- The coordinator decides which nodes participate and in what topology.
-- Each node owns its local `DataflowHandle`, input senders, and output receivers.
-- Cluster spawn is still synchronized by the runtime handshake and ready barrier; the coordinator's orchestration ensures every node reaches `spawn_cluster()` with the same topology and `DataflowId`.
-- Connection establishment in tests must use the same current application-facing connection factory path rather than bypassing the pool with ad-hoc pre-established sockets.
+- Each node binds one peer listener for its life and keeps one set of `SharedPeerManager`s per node set, created by the first `SpawnShared` on that node set. Connections are made through the application's `ConnectionFactory`: the node with the higher ID dials, and a short prefix names it, its incarnation and the node set (`src/peer_link.rs`).
+- Every node-to-node connection goes through a relay (`src/relay.rs`), with one route per pair of nodes, from dialer to acceptor. The relay forwards bytes unchanged until told to apply a fault to one connection: a delay, a throttle, a stall (until healed), a one-way stall, a close (FIN both ways) or a reset (RST both ways). A stall stops all I/O on the connection's two sockets, so it hides even one side's end (a FIN, a reset, a killed process) from the other until the heal: stalling every connection of a node partitions it. A one-way stall stops only the direction from one side: the relay stops reading that side's socket, so once the socket buffers fill its writes block (TCP backpressure), while the other direction flows. The relay counts the bytes it forwards from each side of a live connection. A close or reset drops the bytes the relay has read and not yet written, so a close can deliver a stream cut short and then a clean FIN, which real TCP never does. The relay also reads the node set each connection serves from the dialer's prefix as it forwards it, so a fault can be aimed at one node set's connection.
+- The coordinator is the membership layer. After `kill_node` it reports the node left to every survivor. `restart_node` starts a new process under the same ID as the next incarnation, points the relay's routes into it at its new listener, and `report_join` reports it back. A failed connection is not a departure, so it gets no membership event.
+- At the end of a test, `TestCoordinator::shutdown` sends `Shutdown` to every node the test left running. Each must answer within 20 s, once its runtime has shut down, and its process must then exit with success within 10 s: a hang or a crash at exit fails the test, with every node's log. A node exits once the coordinator has closed its end of the control connection, which it does once it has the answer: a process that exits with the connection open may reset it (Windows does), and the reset can overtake the answer. Nodes the test killed or already shut down are not held to it.
 
-### Recommended test scenarios
+### What every check requires
 
-- basic two-node pass-through
-- cross-process exchange routing
-- distributed word count over multiple timestamps
-- iterative/feedback computation across processes
-- three-node topologies
-- multiple workers per node
-- distributed cancellation
-- parallel dataflows sharing the same runtime
-- node crash / peer disconnect failure paths
+`check_run` (`tests/support/scenarios.rs`) checks one dataflow:
+
+- every node gives an outcome within 30 s (`OUTCOME_DEADLINE`): a hang is a failure. The outcomes of a scenario's dataflows share one such deadline;
+- each worker of a node that reports `Ok` output exactly what its workload's reference says (`src/workloads.rs`);
+- `Err`, or `Dead` from a process the test killed or shut down, is allowed only on a dataflow a fault touched;
+- no process exits on its own.
+
+The workloads (`src/workloads.rs`) cover exchange, multi-epoch sums, word count, join, iterate (`IterativeExchange`: values double round a loop that exchanges them, and leave it on the worker of their last round) and staged fan-out and fan-in (`StagedFanOutFanIn`: every result is gathered on worker 0; in a cluster the fan-out must be the total worker count).
+
+Tests run under nextest's `ci` profile (`docs/testing/nextest.md`): no retries, and at most 120 s per test.
+
+### Scenarios
+
+- `shared_cluster`: a healthy cluster, a killed node, a dataflow that leaves out the killed node, a restart, kills during spawn and teardown, and a node killed behind a partition: every connection to and from it stalled, so its death reaches the survivors only through the leave report, which must cancel every dataflow on each survivor, each then failing with "peer node down".
+- `shared_connection_faults`: one connection delayed, throttled or stalled (exact output), stalled for 15 s, longer than the spawn handshake timeout, from before the input or from as the dataflows finish (exact output after the heal), or reset or closed (only the dataflows between its two nodes fail). And R58 of the connection-liveness design: dataflow Y ends on a while a one-way stall of the connection carrying dataflow X from a has blocked a's manager bridge task (its writer queue full behind a full socket), holding Y's goodbye and acknowledgement to b, for longer than the handshake timeout; after the heal Y must end `Ok` and exact on b. Today b's Y never ends (a drops those frames when its bounded teardown flush gives up), so the test is ignored until that fix lands; run it with `--run-ignored only -E 'test(=finished_dataflow_survives_a_one_way_stall_longer_than_handshake)'`.
+- `shared_graceful_exit`: a node that exits after `Ok` while its peers still run the dataflow.
+- `fault_campaign`: the randomized campaign below.
+- `relay`, `harness_control`: the harness's own parts, including a shutdown that must fail when a node hangs or crashes at exit.
+- `cross_process`, `comprehensive`, `failure_and_scaling`: the Dedicated transport.
+
+### Randomized fault campaign
+
+`tests/fault_campaign.rs` runs seeded schedules (rules in `tests/support/campaign.rs`) on four nodes, a–d, with two workers each and two pooled connections per pair. A seed fixes:
+
+- three dataflows, each a random workload (one of the six kinds) on a random three or four nodes, fed five epochs of input, 300 records a feed, so data is in flight when a fault hits;
+- one to three faults, each fired after a random epoch: at most one kill (plain, or behind a partition), resets, closes, delays (1–100 ms), throttles (32–256 KiB/s) and stalls (0.5–2 s, or for a quarter of them 11–13 s, longer than the spawn handshake timeout; then healed). A link fault names a route within the node set of one of the dataflows, and which of that node set's connections on the route it hits.
+
+After a kill the node is reported left. A partition kill first stalls every connection to and from the node (but one an earlier close or reset ended, which a stall no longer holds), then kills it: the stalled connections must still be live when it is reported left, and the survivors' reports together must cancel at least every dataflow on it that no earlier fault touched (one survivor's count can be lower, since a survivor that cancels tells the others); then the partition heals. Half the kills of either kind restart the node: it is reported joined and one more dataflow runs on all four nodes, which must be exact. A kill touches the dataflows on the killed node, and a reset or close touches the dataflows of the node set whose connection it hit; slowing a connection touches nothing, and a fault that finds no live connection to hit did not happen. Every dataflow passes `check_run`. A feed or close a node refuses is allowed only on a touched dataflow; one it never answers (within 30 s) is a hang, a failure on any dataflow. A seed's run, its clean shutdown included, must finish within 90 s. A failing seed's panic message is its bug report: the seed, its schedule, what the run did, every dataflow's outcomes and every node's log.
+
+Seeds 1–6 run with the rest of the harness:
+
+```sh
+cargo nextest run -p instancy-integration --profile ci
+```
+
+The long campaign is an ignored test, run on purpose. Each seed must finish within 90 s, but many seeds in one test take far longer than nextest's 120 s limit under the `ci` profile, so run it without that profile:
+
+```sh
+INSTANCY_CAMPAIGN_SEEDS=50 INSTANCY_CAMPAIGN_FIRST_SEED=1000 \
+  cargo nextest run -p instancy-integration --run-ignored only -E 'test(=campaign_long)'
+```
+
+It runs `INSTANCY_CAMPAIGN_SEEDS` seeds (200 by default) from `INSTANCY_CAMPAIGN_FIRST_SEED` (1000 by default), in order, and stops at the first failing seed. To rerun one seed, set the first seed to it and the count to 1.
 
 ### Notes carried forward from the original design
 
