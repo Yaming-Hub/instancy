@@ -12,28 +12,30 @@ env:
 
 jobs:
   check:
-    name: Check & Clippy
+    name: Check, Clippy, Docs & Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: cargo check (all features)
-        run: cargo check -p instancy --all-features
+      - name: cargo fmt --check (workspace)
+        run: cargo fmt --all -- --check
       - name: cargo clippy (all features, lib + tests)
         run: cargo clippy -p instancy --all-features --lib --tests -- -D warnings
       - name: Build examples (all features)
         run: cargo build -p instancy --examples --all-features
       # Release builds compile out debug-only code (the progress checker), so
-      # code used only there must not leave dead code behind.
-      - name: cargo check (release, default features)
-        run: cargo check -p instancy --release
-      # The progress flight recorder is compiled out of release builds: the
-      # test checks its own release binary.
+      # code used only there must not leave dead code behind. This builds the
+      # library in release with default features, and the test checks that
+      # the progress flight recorder is compiled out of that build.
       - name: Flight recorder absent from release builds
         run: cargo test -p instancy --release --test trace_release
+      - name: cargo doc (all features)
+        run: cargo doc -p instancy --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -Dwarnings
 
   no-default-features:
     name: No default features
@@ -147,6 +149,26 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  integration:
+    name: Multi-process harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # dactor's build script runs prost-build, which needs protoc.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2 pin
+        with:
+          tool: nextest@0.9.150
+      - name: Clippy (harness)
+        run: cargo clippy -p instancy-integration --all-targets -- -D warnings
+      - name: Multi-process tests
+        run: cargo nextest run -p instancy-integration --profile ci --no-tests fail
+
   conformance:
     name: Full conformance matrix
     runs-on: ubuntu-latest
@@ -171,26 +193,3 @@ jobs:
           path: ${{ github.workspace }}/trace-dumps
           if-no-files-found: ignore
           retention-days: 14
-
-  doc:
-    name: Documentation
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo doc (all features)
-        run: cargo doc -p instancy --all-features --no-deps
-        env:
-          RUSTDOCFLAGS: -Dwarnings
-
-  format:
-    name: Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: cargo fmt --check
-        run: cargo fmt -p instancy -- --check

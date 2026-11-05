@@ -10,6 +10,7 @@ CI runs the unit and integration tests with
 | No default features | `cargo nextest run -p instancy --no-default-features --features test-utils --lib --tests --profile ci --no-tests fail` |
 | Schedule tests (Shuttle) | See [Schedule tests](#schedule-tests-shuttle-and-loom) |
 | Model-checked tests (Loom) | See [Schedule tests](#schedule-tests-shuttle-and-loom) |
+| Multi-process harness | `cargo nextest run -p instancy-integration --profile ci --no-tests fail` (the job installs `protoc`, see below) |
 
 Doc tests, the full conformance matrix and the release flight-recorder check
 keep their own `cargo test` commands.
