@@ -139,7 +139,7 @@ Lifecycle and health events emitted by the runtime. Subscribe via `RuntimeHandle
 
 Variants:
 
-- `TransportDegraded { peer_id: String, detail: String }` — a shared transport component is permanently degraded (e.g., background thread panicked while holding a lock). Recommended action: shut down the runtime and create a fresh `RuntimeHandle`.
+- `TransportDegraded { peer_id: String, detail: String }` — one pooled connection to `peer_id` failed (Shared mode): a read or write error, the peer closing it under running dataflows, or the liveness rule (`SharedConnectionConfig::silence_timeout`). The dataflows that used it have failed with their own errors; nothing else is affected, and the pool replaces the connection on the next registration. No action is needed: restarting the runtime on it would fail every running dataflow. It never means a node left.
 
 See also: [Observability](../guide/observability.md).
 
@@ -630,14 +630,14 @@ Feature-gated shared-transport manager at `instancy::communication::SharedPeerMa
 Key methods:
 
 - `pub fn new(peer_node_id: String, config: SharedConnectionConfig, connection_factory: Arc<dyn DynConnectionFactory>, runtime_handle: &tokio::runtime::Handle, health_tx: broadcast::Sender<RuntimeEvent>) -> Result<Self>`
-- `pub async fn register_dataflow(&self, dataflow_id: DataflowId, channel_ids: &[u64], channel_capacity: usize) -> Result<(HashMap<u64, tokio::sync::mpsc::Receiver<Vec<u8>>>, tokio::sync::mpsc::Receiver<PeerIoNotice>), TransportError>` — fills the pool first (`SharedConnectionConfig::connections`, each connection bounded by `connect_timeout`) and pins the dataflow's lane to one pooled connection; fails with `TransportError::InvalidRegistration` for a zero capacity, a duplicate or probe channel id, or a dataflow id that is already registered or already ran with this peer (a `DataflowId` identifies one run: a retry needs a fresh id), and with `TransportError::Io` if the pool cannot be filled. The second receiver reports the dataflow's connection events (`PeerIoEvent`: a pooled connection it uses failed, a frame from the peer was out of sequence, or one of its frames was rejected).
-- `pub fn dataflow_sender(&self, dataflow_id: &DataflowId) -> Option<DataframeSender>` — sends the dataflow's payload frames (data and progress); bound to its current registration, so frames sent after it unregisters are dropped
-- `pub async fn unregister_dataflow(&self, dataflow_id: &DataflowId)` — drops the dataflow's payload frames still queued
+- `pub async fn register_dataflow(&self, dataflow_id: DataflowId, channel_ids: &[u64], channel_capacity: usize) -> Result<(HashMap<u64, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>, tokio::sync::mpsc::Receiver<PeerIoNotice>), TransportError>` — fills the pool first (`SharedConnectionConfig::connections`, each connection bounded by `connect_timeout`) and pins the dataflow's lane to one pooled connection; fails with `TransportError::InvalidRegistration` for a zero capacity, a duplicate or probe channel id, or a dataflow id that is already registered or already ran with this peer (a `DataflowId` identifies one run: a retry needs a fresh id), and with `TransportError::Io` if the pool cannot be filled. The channel receivers are unbounded: a connection's reader never waits for a consumer, so `channel_capacity` must be at least 1 and is otherwise unused. The second receiver reports the dataflow's connection events (`PeerIoEvent`: a pooled connection it uses failed or fell silent, a frame from the peer was out of sequence, or one of its frames was rejected).
+- `pub fn dataflow_sender(&self, dataflow_id: &DataflowId) -> Option<DataframeSender>` — sends the dataflow's payload frames (data and progress) straight to its pinned connection, numbering each as it is queued; `try_send` returns `Full` when that connection's queue (256 frames) is full. Bound to its current registration, so frames sent after it unregisters are dropped
+- `pub async fn unregister_dataflow(&self, dataflow_id: &DataflowId)` — frames already queued on the connection are still written; frames sent later are dropped
 - `pub fn peer_node_id(&self) -> &str`
 - `pub fn connection_count(&self) -> usize`
-- `pub fn metrics_snapshot(&self) -> Vec<ConnectionSnapshot>` — per pooled connection: RTT, queued frames, pinned lanes, bytes and frames written
+- `pub fn metrics_snapshot(&self) -> Vec<ConnectionSnapshot>` — per pooled connection: RTT, queued payload frames, pinned lanes, bytes and frames written
 
-`SharedConnectionConfig { connections, connect_timeout, probe_interval, rtt_ema_alpha }` configures a fixed pool (default one connection per peer). Shared mode is fail-stop: see the "Transport Contract" and "Connection Failures" sections of [Distributed Execution](../guide/distributed.md).
+`SharedConnectionConfig { connections, connect_timeout, probe_interval, silence_timeout, rtt_ema_alpha }` configures a fixed pool (default one connection per peer). Each node probes every connection every `probe_interval` (default 1 s); a connection that delivers no bytes for `silence_timeout` (default `Some(30 s)`, at least 3 × `probe_interval`), or whose writer writes nothing for that long while bytes wait, fails exactly the dataflows using it (`TransportError::ConnectionSilent`, `TransportError::WriteStalled`). `None` disables the rule, and a connection that silently stops delivering then makes its dataflows wait forever. Shared mode is fail-stop: see the "Transport Contract" and "Connection Failures" sections of [Distributed Execution](../guide/distributed.md).
 
 See also: [Distributed Execution](../guide/distributed.md).
 

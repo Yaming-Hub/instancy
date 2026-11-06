@@ -737,15 +737,21 @@ impl Drop for SpawnAbortGuard {
                     }
                     SpawnAbortTarget::Nobody => {}
                 }
-                // The Cancel is queued on the managers' bridges: wait until
-                // each bridge has handed it to a connection writer before
-                // letting the managers go (the writers finish what they were
-                // handed, even once the managers are dropped). Bounded by the
-                // timeout below; if it expires, or the tokio runtime shuts
-                // down first, the Cancel may be lost and peers fall back to
-                // their own handshake timeout.
+                // The Cancel is queued on the managers' control routers: wait
+                // until each router has put it on a connection before letting
+                // the managers go (the writers send what they were handed,
+                // even once the managers are dropped). Bounded by the timeout
+                // below; if it expires, or the tokio runtime shuts down
+                // first, the Cancel may be lost and peers fall back to their
+                // own handshake timeout.
                 if let Some(managers) = &managers {
-                    join_all(managers.values().map(|manager| manager.flush()).collect()).await;
+                    join_all(
+                        managers
+                            .values()
+                            .map(|manager| manager.route_queued_control())
+                            .collect(),
+                    )
+                    .await;
                 }
             };
             let _ = tokio::time::timeout(timeout, notify).await;
@@ -2674,13 +2680,10 @@ impl RuntimeHandle {
         // After this block: `transport`, `receivers`, `control_receivers` are set.
         // For dedicated mode, `dedicated_session` holds the raw session for handshake/barrier.
         let transport: Arc<ClusterTransport>;
-        let mut receivers: std::collections::HashMap<
-            String,
-            std::collections::HashMap<u64, tokio::sync::mpsc::Receiver<Vec<u8>>>,
-        >;
+        let mut receivers: crate::communication::cluster_transport::PeerReceivers;
         let mut control_receivers: std::collections::HashMap<
             String,
-            tokio::sync::mpsc::Receiver<Vec<u8>>,
+            crate::communication::cluster_transport::PeerChannelReceiver,
         > = std::collections::HashMap::new();
         let dedicated_session: Option<Arc<TransportSession>>;
         // Shared mode: the token of this spawn's registrations.
@@ -2787,7 +2790,7 @@ impl RuntimeHandle {
                     }
                 }
 
-                let (session, mut raw_receivers) = TransportSession::new(
+                let (session, raw_receivers) = TransportSession::new(
                     dataflow_id,
                     connections,
                     &data_regs,
@@ -2799,6 +2802,8 @@ impl RuntimeHandle {
                 peer_io_events = session.take_io_events();
                 let session = Arc::new(session);
                 transport = Arc::new(ClusterTransport::Dedicated(Arc::clone(&session)));
+                let mut raw_receivers =
+                    crate::communication::cluster_transport::peer_receivers(raw_receivers);
 
                 // Extract control receivers.
                 for (peer_id, peer_map) in raw_receivers.iter_mut() {
@@ -2933,11 +2938,13 @@ impl RuntimeHandle {
                     }
                 };
 
-                let mut raw_receivers = session.take_receivers().ok_or_else(|| {
+                let raw_receivers = session.take_receivers().ok_or_else(|| {
                     Error::Runtime(RuntimeError::AlreadyConsumed {
                         resource: "receivers".into(),
                     })
                 })?;
+                let mut raw_receivers =
+                    crate::communication::cluster_transport::peer_receivers(raw_receivers);
                 peer_io_events = session.take_io_events();
 
                 transport = Arc::new(ClusterTransport::Shared {
@@ -3033,10 +3040,8 @@ impl RuntimeHandle {
                 crate::progress::trace::describe_exchanges(dataflow_id, [(edge_order, edge_idx)]);
             }
             // Extract receivers for this specific exchange edge from the shared map.
-            let mut edge_receivers: std::collections::HashMap<
-                String,
-                std::collections::HashMap<u64, tokio::sync::mpsc::Receiver<Vec<u8>>>,
-            > = std::collections::HashMap::new();
+            let mut edge_receivers: crate::communication::cluster_transport::PeerReceivers =
+                std::collections::HashMap::new();
             for node in &topology.nodes {
                 if node.node_id == local_node_id {
                     continue;

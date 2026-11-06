@@ -184,7 +184,7 @@ This is how instancy's own integration tests work — see `tests/cluster.rs` for
 
 ### Handling Node Failures
 
-Cluster health monitoring (heartbeats, liveness probes) is the hosting application's responsibility — instancy does not run its own health checks. When the application detects a peer node is unreachable, it notifies the runtime:
+Node health monitoring (heartbeats, membership) is the hosting application's responsibility: instancy never decides that a node is dead. It watches only its own pooled connections (see [Connection Liveness](#connection-liveness)), and a connection that fails ends only the dataflows that used it. When the application detects a peer node is unreachable, it notifies the runtime:
 
 ```rust
 // Application detects node-3 is unreachable (via its own health monitoring)
@@ -230,22 +230,36 @@ instancy does not open or own the connections between nodes: your application pr
 
 - **Reliable, ordered byte streams.** Any transport works (TCP, TLS, QUIC, pipes) as long as each stream delivers bytes in order, without loss or duplication, while it lives.
 - **Paired connections (Shared mode).** Both nodes of a pool establish their connections independently; your factory must pair each connection one node establishes with one the peer establishes (one side dials, the other accepts and hands the accepted stream to its factory, for example). Both nodes must use the same `SharedConnectionConfig::connections`.
-- **Liveness.** Detecting that a peer is dead, partitioned or unreachable is yours: make your streams fail when the peer is gone (TCP keepalive with short timers, a TLS or QUIC idle timeout), or tell instancy through `report_node_leave` (see above). instancy runs no heartbeat of its own. The bundled `TcpConnectionFactory` sets no keepalive.
+- **Node membership.** Telling instancy that a peer node has left (`report_node_leave`, see above) is yours. In Dedicated mode, detecting a dead or partitioned peer is yours too: make your streams fail when the peer is gone (TCP keepalive with short timers, a TLS or QUIC idle timeout).
 
 **instancy guarantees:**
 
 - **Never a wrong result.** A dataflow never reports success with lost, duplicated, reordered or corrupted data. Every frame is checksummed (CRC32 of its header and of its payload), every Shared-mode lane is sequenced, a stream that ends before its close markers fails the dataflow, and a connection to the wrong peer is rejected at the handshake.
-- **Prompt, loud failure when told.** When a connection reports an error or EOF, or you report a node leaving, the affected dataflows fail (on every node) with an error you can inspect; they never hang waiting for frames that were lost.
+- **Prompt, loud failure.** When a connection reports an error or EOF, a Shared-mode connection stops delivering (see below), or you report a node leaving, the affected dataflows fail (on every node) with an error you can inspect; they never hang waiting for frames that were lost.
 - **No hangs of its own.** With a healthy transport, a dataflow finishes or fails.
 
-**If your side isn't met:** a stream that silently stops delivering without ever failing (a network partition with no keepalive) makes the dataflows using it wait. They never report success; they wait until the stream fails or you report the node leaving.
+**If your side isn't met:** in Dedicated mode, or in Shared mode with `silence_timeout: None`, a stream that silently stops delivering without ever failing (a network partition with no keepalive) makes the dataflows using it wait. They never report success; they wait until the stream fails or you report the node leaving.
+
+### Connection Liveness
+
+In Shared mode instancy detects a pooled connection that stops delivering without failing: a partition, a frozen peer, a firewall that dropped the connection's state, a half-open connection after a crash. It works for any stream your factory returns, TLS and pipes included.
+
+- Every `SharedConnectionConfig::probe_interval` (P, default 1 s), each node sends a small probe on each pooled connection, so a healthy connection, even an idle one, always has bytes arriving.
+- A connection that has delivered no bytes for `silence_timeout` (T, default 30 s) is dead: it fails with `TransportError::ConnectionSilent`, exactly the dataflows using it fail on that node, and the peer fails them too, by its own timer or by seeing the connection end.
+- A connection whose writer has had bytes waiting and written none for T fails with `TransportError::WriteStalled`, as `TCP_USER_TIMEOUT` does for a TCP socket.
+- Both rules count bytes, not frames, so a large frame on a slow link is never failed while its bytes move, and a slow consumer never stops a connection's reader.
+- The failure is reported as `RuntimeEvent::TransportDegraded`, which needs no action: the next dataflow that registers replaces the connection. A connection failing never means a node left, and it never cancels dataflows on other connections.
+
+Choose T longer than P plus the longest a healthy connection takes to deliver a byte plus twice the longest pause of either node's network tasks: the transport runs on your Tokio runtime, so keep that runtime responsive (blocking code in an async operator, for example, pauses it). A shorter T can fail a healthy connection; its dataflows then fail with an error, never with a wrong result. T below 3 × P is rejected. A connection that stops delivering is failed within about T + P on both nodes. `silence_timeout: None` turns the rule off, for streams that detect a dead peer themselves; a stream that silently stops delivering then makes its dataflows wait forever.
+
+Dataflows that run on a single node use no pooled connection, so the rule never touches them.
 
 ### Connection Failures
 
 Both modes are **fail-stop**, like timely: frames on a connection that fails may be lost, and nothing resends them, so a failed connection fails the dataflows that used it.
 
 - **Dedicated:** each dataflow has its own connection to each peer; if it fails while the dataflow runs, the dataflow fails on every node.
-- **Shared:** a pooled connection that fails (a write error, or its read side ending) fails exactly the dataflows pinned to it, on both nodes. Other dataflows on the pool's other connections are unaffected. With the default pool of one connection, a failure fails every dataflow running between the two nodes.
+- **Shared:** a pooled connection that fails (a write error, its read side ending, or the liveness rule above) fails exactly the dataflows pinned to it, on both nodes. Other dataflows on the pool's other connections are unaffected, and so is their traffic: each connection has its own queues, so a slow or stuck connection holds up only its own dataflows. With the default pool of one connection, a failure fails every dataflow running between the two nodes.
 
 The failed connection leaves the pool. instancy does not redial in the background: the next dataflow that registers re-establishes the missing connections through your factory, bounded by `SharedConnectionConfig::connect_timeout` (and the spawn by its handshake timeout). Re-run failed dataflows from your application if you want them retried, each retry with a fresh `DataflowId`.
 

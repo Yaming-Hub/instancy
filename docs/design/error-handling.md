@@ -183,33 +183,31 @@ use `into_inner()` recovery. The data behind these locks is safe to recover
 (registration maps, topology snapshots, cancellation tokens). This ensures that
 a panic in one dataflow never poisons shared runtime state permanently.
 
-**Shared transport locks** — `PeerPool` — propagate poison via `or_poison()` + `?`.
-If a transport thread panics and poisons the pool, subsequent calls to
-`select_connection()` / `add_connection()` return `Err(LockPoisoned)`. The
-transport layer distinguishes poison from normal connection failures using
-`TransportError::LockPoisoned` (instead of `ConnectionClosed`) and emits a
-`RuntimeEvent::TransportDegraded` on the health event channel. Affected
-dataflows are cancelled with `CancellationReason::InternalError`. The hosting
-application monitors `RuntimeHandle::health_events()` and can decide the
-appropriate recovery strategy — e.g., abandon the runtime and create a fresh
-`RuntimeHandle`.
+**Shared transport locks** — a `SharedPeerManager`'s state and its dataflows'
+lane locks — recover with `into_inner()`: their critical sections never panic,
+so the data is consistent. A failed pooled connection is not a poisoned lock:
+it fails exactly the dataflows that used it and emits
+`RuntimeEvent::TransportDegraded` (see §8.4.4), and the pool replaces it.
 
 #### 8.4.4 Runtime Health Events
 
-When the runtime encounters an error that may fail **all future dataflow
-submissions** and cannot self-recover, it emits a `RuntimeEvent` on a broadcast
-channel. This is the general notification mechanism for unrecoverable runtime
-degradation — PeerPool poison is one example, but any future unrecoverable
-condition should follow the same pattern.
+The runtime reports transport conditions to the hosting application as
+`RuntimeEvent`s on a broadcast channel (`RuntimeHandle::health_events()`).
+The only event today is `RuntimeEvent::TransportDegraded`: one pooled
+connection to a peer failed (Shared mode), through a read or write error, the
+peer closing it under running dataflows, or the liveness rule
+([connection-liveness.md](./connection-liveness.md)). The dataflows that used
+it have already failed, each with its own error; nothing else is affected, and
+the pool replaces the connection when the next dataflow registers. It needs no
+action: restarting the runtime on it would fail every running dataflow.
 
 ```rust
 // Hosting application subscribes to health events
 let mut health_rx = runtime.health_events();
 tokio::spawn(async move {
     while let Ok(event) = health_rx.recv().await {
-        tracing::error!("Runtime degraded: {event}");
-        runtime_handle.shutdown();
-        // Create a fresh RuntimeHandle to replace the degraded one.
+        // For monitoring: the pool recovers on its own.
+        tracing::warn!("{event}");
     }
 });
 ```

@@ -14,8 +14,13 @@
 //! other side never reads or a link failure. Coordinated resizing, agreed by
 //! both sides, may come later.
 //!
-//! RTT probes measure each connection's round-trip time for
-//! [`ConnectionSnapshot`]s; they never drive any decision.
+//! Probes go out on every connection every
+//! [`probe_interval`](SharedConnectionConfig::probe_interval). They measure
+//! each connection's round-trip time for [`ConnectionSnapshot`]s, and they
+//! keep an idle connection's bytes flowing, so that a connection that reads
+//! nothing for [`silence_timeout`](SharedConnectionConfig::silence_timeout)
+//! is known to have stopped delivering (see the
+//! [`shared_transport`](super::shared_transport) module documentation).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -40,8 +45,32 @@ pub struct SharedConnectionConfig {
     /// How long establishing one connection through the application's
     /// factory may take before registration fails.
     pub connect_timeout: Duration,
-    /// Interval between RTT probes on each connection (metrics only).
+    /// Interval between probes on each connection (P). Probes measure the
+    /// RTT and keep an idle connection's bytes flowing for
+    /// [`silence_timeout`](Self::silence_timeout).
     pub probe_interval: Duration,
+    /// How long a connection may go without delivering a byte (T) before it
+    /// is declared dead. Default 30 s.
+    ///
+    /// Each pooled connection whose reader is open and that has read no
+    /// bytes for this long fails like a read error: exactly the dataflows
+    /// using it fail, on both nodes, and the next registration replaces it.
+    /// A writer that has had bytes waiting and written none for this long
+    /// fails its connection too. Neither ever reports a node leaving: that
+    /// stays with
+    /// [`RuntimeHandle::report_node_leave`](crate::RuntimeHandle::report_node_leave).
+    ///
+    /// It must exceed P + D + 2S, where D is the longest a healthy connection
+    /// takes to deliver a byte, and S the longest this node's or the peer's
+    /// network tasks can be paused (a busy Tokio runtime, a stop-the-world
+    /// pause): a shorter one can fail a healthy connection. Values under
+    /// 3 × P are rejected. A connection that stops delivering is failed
+    /// within T + P + S.
+    ///
+    /// `None` disables the rule, for an application whose streams detect a
+    /// dead peer themselves. A stream that silently stops delivering then
+    /// makes its dataflows wait forever (they never report success).
+    pub silence_timeout: Option<Duration>,
     /// EMA smoothing factor for RTT (0.0–1.0, higher = more weight to recent).
     pub rtt_ema_alpha: f64,
 }
@@ -52,6 +81,7 @@ impl Default for SharedConnectionConfig {
             connections: 1,
             connect_timeout: Duration::from_secs(10),
             probe_interval: Duration::from_secs(1),
+            silence_timeout: Some(Duration::from_secs(30)),
             rtt_ema_alpha: 0.2,
         }
     }
@@ -62,8 +92,9 @@ impl SharedConnectionConfig {
     ///
     /// # Errors
     ///
-    /// [`RuntimeError::InvalidConfig`] if `connections` is 0, or
-    /// `connect_timeout` or `probe_interval` is zero.
+    /// [`RuntimeError::InvalidConfig`] if `connections` is 0,
+    /// `connect_timeout` or `probe_interval` is zero, or `silence_timeout`
+    /// is shorter than 3 × `probe_interval`.
     pub fn validate(&self) -> crate::Result<()> {
         let invalid = |reason: &str| {
             Err(crate::Error::Runtime(RuntimeError::InvalidConfig(
@@ -78,6 +109,16 @@ impl SharedConnectionConfig {
         }
         if self.probe_interval.is_zero() {
             return invalid("probe_interval must be positive");
+        }
+        if let Some(timeout) = self.silence_timeout {
+            let floor = self.probe_interval.checked_mul(3);
+            if floor.is_none_or(|floor| timeout < floor) {
+                return Err(crate::Error::Runtime(RuntimeError::InvalidConfig(format!(
+                    "silence_timeout ({timeout:?}) must be at least 3 × probe_interval \
+                     ({:?}): probes keep a healthy connection's bytes flowing",
+                    self.probe_interval
+                ))));
+            }
         }
         Ok(())
     }
@@ -333,8 +374,35 @@ mod tests {
                 probe_interval: Duration::ZERO,
                 ..Default::default()
             },
+            // Under 3 probe intervals.
+            SharedConnectionConfig {
+                silence_timeout: Some(Duration::from_millis(2_999)),
+                ..Default::default()
+            },
+            SharedConnectionConfig {
+                silence_timeout: Some(Duration::ZERO),
+                ..Default::default()
+            },
+            SharedConnectionConfig {
+                probe_interval: Duration::MAX,
+                ..Default::default()
+            },
         ] {
             assert!(config.validate().is_err(), "{config:?}");
+        }
+    }
+
+    #[test]
+    fn silence_timeout_defaults_to_30_s_and_may_be_disabled() {
+        let config = SharedConnectionConfig::default();
+        assert_eq!(config.silence_timeout, Some(Duration::from_secs(30)));
+        for silence_timeout in [None, Some(Duration::from_secs(3))] {
+            SharedConnectionConfig {
+                silence_timeout,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap();
         }
     }
 

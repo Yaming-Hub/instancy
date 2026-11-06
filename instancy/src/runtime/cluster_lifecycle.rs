@@ -472,6 +472,10 @@ struct PeerState {
     lost: bool,
     /// A soft failure waiting for the link to close fully.
     soft_failure: Option<LinkFailure>,
+    /// The first failure the peer's connection reported: what a generic end
+    /// of the link (a channel closing, a failed send) is reported as. Only
+    /// names the failure; it decides nothing.
+    cause: Option<TransportError>,
     /// A data channel from the peer ended without its close sentinel (never
     /// in a healthy run). If the peer's goodbye completes anyway, records
     /// may be missing.
@@ -583,6 +587,7 @@ impl LifecycleMachine {
                             control_closed: false,
                             lost: false,
                             soft_failure: None,
+                            cause: None,
                             unclean_data_channel: false,
                             cancel_received: false,
                             stopped: false,
@@ -987,6 +992,9 @@ impl LifecycleMachine {
                 // closes right after this (and not before: see
                 // `PeerIoNotice`), so a corrupt or oversize frame is never
                 // mistaken for a clean disconnect.
+                if peer.cause.is_none() {
+                    peer.cause = Some(error.duplicate());
+                }
                 let failure = LinkFailure::Transport(error);
                 if is_inbound_corruption(&failure, true) {
                     actions.extend(self.on_corruption(peer_id, failure));
@@ -1262,6 +1270,15 @@ impl LifecycleMachine {
                     return Self::defer_soft_failure(peer, peer_id, failure);
                 }
                 peer.lost = true;
+                // A generic end (a channel closing, a failed send) follows
+                // from the connection's failure, when one was reported: name
+                // that cause (the connection failed or fell silent, say).
+                let failure = match (failure, peer.cause.take()) {
+                    (LinkFailure::ChannelClosed | LinkFailure::SendFailed, Some(cause)) => {
+                        LinkFailure::Transport(cause)
+                    }
+                    (failure, _) => failure,
+                };
                 self.cancel_broadcast = true;
                 vec![
                     Action::LinkFailed {
@@ -1830,32 +1847,34 @@ impl ClusterLifecycle {
             for forwarder in forwarders.values() {
                 forwarder.abort();
             }
-        } else {
+        } else if managers.is_some() {
             // Peers may still need what we queued: our goodbye, the
             // acknowledgements of their goodbyes (both in-band on the payload
             // lane) and, for a peer we stopped waiting for (it cancelled and
-            // may still be draining), our final progress. Hand our lanes to
-            // the transport and, in Shared mode, let the bridges sequence
-            // those frames before unregistering, which would drop them.
-            // One task per peer, all bounded together, so an unreachable peer
-            // does not hold up the others.
+            // may still be draining), our final progress. Each forwarder
+            // hands its lane to its pooled connection, and a frame queued
+            // there is written even once we unregister (R58), so this waits
+            // with no fixed deadline: only on a connection that accepts no
+            // frames, which the liveness rule fails (a dead verdict on either
+            // node, or the stall rule here) and which then refuses the rest.
+            // Every local worker has finished (graceful), so the forwarders
+            // hold the only outboxes, and the lanes end.
+            for forwarder in forwarders.into_values() {
+                let _ = forwarder.await;
+            }
+        } else {
+            // Dedicated mode: as above, bounded, one task per peer, all
+            // bounded together, so an unreachable peer does not hold up the
+            // others.
             let mut flushes = tokio::task::JoinSet::new();
-            for (peer, forwarder) in forwarders {
-                let managers = managers.clone();
-                flushes.spawn(async move {
-                    let _ = forwarder.await;
-                    if let Some(manager) = managers.as_ref().and_then(|m| m.get(&peer)) {
-                        manager.flush().await;
-                    }
-                });
+            for forwarder in forwarders.into_values() {
+                flushes.spawn(forwarder);
             }
             let finished = tokio::time::timeout(self.cancel_broadcast_timeout, async {
                 while flushes.join_next().await.is_some() {}
             })
             .await;
             if finished.is_err() {
-                // Release the managers the unfinished flushes hold before
-                // checking below whether ours is the last reference.
                 flushes.abort_all();
                 while flushes.join_next().await.is_some() {}
             }
@@ -2203,6 +2222,43 @@ mod tests {
             actions.as_slice(),
             [Action::SendGoodbye, Action::Teardown { graceful: true }]
         ));
+    }
+
+    /// A link's failure is reported by its connection's cause, once the
+    /// whole link has closed: its channels closing, or our sends failing,
+    /// after its connection fell silent only follow from that, whichever is
+    /// seen first.
+    #[test]
+    fn a_failed_link_reports_its_first_cause() {
+        let silent = || {
+            LinkEvent::ConnectionFailed(TransportError::ConnectionSilent {
+                timeout: Duration::from_secs(30),
+            })
+        };
+        for send_failed_first in [false, true] {
+            let (mut m, _) = machine(1, &[("b", 1)]);
+            if send_failed_first {
+                m.on_event(send_failed("b"));
+            }
+            m.on_event(link_event("b", silent()));
+            m.on_event(eof("b"));
+            let actions = m.on_event(link_event("b", LinkEvent::ControlClosed));
+            assert!(
+                matches!(
+                    actions.as_slice(),
+                    [
+                        Action::LinkFailed {
+                            failure: LinkFailure::Transport(
+                                TransportError::ConnectionSilent { .. }
+                            ),
+                            ..
+                        },
+                        Action::BroadcastCancel
+                    ]
+                ),
+                "send failed first: {send_failed_first}: {actions:?}"
+            );
+        }
     }
 
     /// An EOF is a link failure only once every channel from the peer has

@@ -1,5 +1,5 @@
-//! Shared-transport clusters with one slow, stalled or failed node-to-node
-//! connection (scenarios 6, 7, 9 and 10).
+//! Shared-transport clusters with one slow, stalled, silent or failed
+//! node-to-node connection (scenarios 6, 7, 9, 10 and 11).
 //!
 //! Faults go to the connections on the relay route from b to a: b has the
 //! higher ID, so it dials a. A failed connection is not a node departure,
@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use instancy_integration::coordinator::TestCoordinator;
 use instancy_integration::relay::{LinkAction, Relay, RelayConnId};
-use support::scenarios::{self, fail, finish, StallFrom, CONNECTIONS, WORKERS};
+use support::scenarios::{self, fail, finish, Silence, StallFrom, CONNECTIONS, WORKERS};
 
 const NODES: [&str; 3] = ["a", "b", "c"];
 
@@ -109,18 +109,40 @@ async fn long_stall(from: StallFrom) {
 }
 
 /// Scenario 10 (R58 of the connection-liveness design): with kept managers,
-/// dataflow Y ends on a while a one-way stall of the connection carrying
-/// dataflow X from a to b has blocked a's bridge task, holding Y's goodbye
-/// and acknowledgement to b behind X's frames, for longer than the
-/// handshake timeout; Y's own connection stays healthy. After the heal, Y
-/// must still end `Ok` with exact output on b, and X on both nodes.
+/// dataflow Y ends while a one-way stall of the connection carrying
+/// dataflow X from a to b holds a's writer for X; Y's own connection stays
+/// healthy. Y must end `Ok` with exact output on a and on b while the stall
+/// holds (nothing shared between the connections holds its last frames),
+/// and, after the heal, so must X.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "reproduces R58 (connection-liveness design): fails until that fix lands"]
-async fn finished_dataflow_survives_a_one_way_stall_longer_than_handshake() {
+async fn finished_dataflow_survives_a_one_way_stall_of_another_connection() {
     let mut coord = TestCoordinator::start_shared(&NODES[..2], WORKERS, CONNECTIONS).await;
     let steps = scenarios::finished_behind_a_one_way_stall(&mut coord)
         .await
         .unwrap_or_else(|e| fail(e));
     println!("steps:\n  {}", steps.join("\n  "));
+    finish(coord).await;
+}
+
+/// Scenario 11: the one connection from b to a stops delivering both ways,
+/// with no membership report. Each node fails it by its own timer, failing
+/// exactly the dataflows between a and b; the next registration replaces it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connection_silent_both_ways_fails_only_its_dataflows() {
+    silent_connection(Silence::BothWays).await;
+}
+
+/// Scenario 11, silent one way: b reads nothing from a and fails the
+/// connection by its timer; a sees it close, or has finished its part.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connection_silent_one_way_fails_only_its_dataflows() {
+    silent_connection(Silence::FromAcceptor).await;
+}
+
+async fn silent_connection(silence: Silence) {
+    let mut coord = TestCoordinator::start_shared(&NODES, WORKERS, 1).await;
+    scenarios::silent_connection(&mut coord, silence)
+        .await
+        .unwrap_or_else(|e| fail(e));
     finish(coord).await;
 }

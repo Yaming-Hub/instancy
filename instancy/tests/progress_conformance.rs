@@ -1611,7 +1611,6 @@ impl ConnectionFactory for PreEstablished {
 fn peer_manager(peer: &str, halves: Halves) -> Arc<HashMap<String, SharedPeerManager>> {
     let config = SharedConnectionConfig {
         connections: 1,
-        probe_interval: Duration::from_secs(3600),
         rtt_ema_alpha: 0.2,
         ..SharedConnectionConfig::default()
     };

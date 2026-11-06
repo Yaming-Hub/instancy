@@ -13,7 +13,7 @@ This document is the entry point for the instancy design set. It keeps the archi
 - [Error handling](./error-handling.md) — error hierarchy, propagation, poison handling, panic-removal policy, and no-global-state guarantees for failure handling.
 - [Observability](./observability.md) — metrics, tracing, message envelopes, activation/frontier/transfer timelines, and cluster-level reporting.
 - [Cluster & distributed execution](./cluster.md) — cancellation, startup handshake, coordinator integration, dynamic membership, multi-cluster isolation, and cross-process testing.
-- [Connection liveness](./connection-liveness.md) — detecting a silent pooled connection in Shared mode and failing exactly its dataflows, with TLA+ models. Design only, not implemented yet.
+- [Connection liveness](./connection-liveness.md) — detecting a silent pooled connection in Shared mode and failing exactly its dataflows, with TLA+ models.
 - [Serialization](./serialization.md) — codec trait, default bincode codec, and data/exchange bounds.
 - [Operators](./operators.md) — core operators, extension model, error policy, and user-facing API examples.
 - [Design decisions & trade-offs](./decisions.md) — major architectural choices, checkpointing, throughput trade-offs, task scheduling policy, and open questions.

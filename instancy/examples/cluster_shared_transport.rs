@@ -10,7 +10,6 @@
 //! Run with: `cargo run --all-features --example cluster_shared_transport`
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use instancy::communication::shared_pool::SharedConnectionConfig;
 use instancy::communication::shared_transport::{
@@ -74,7 +73,6 @@ async fn main() {
     // Configuration: 2 pooled connections, no scaling during this demo
     let config = SharedConnectionConfig {
         connections: 2,
-        probe_interval: Duration::from_secs(3600),
         rtt_ema_alpha: 0.2,
         ..SharedConnectionConfig::default()
     };

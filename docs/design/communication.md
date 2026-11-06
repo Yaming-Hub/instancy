@@ -271,7 +271,7 @@ In **shared connection mode** many dataflows share a small, fixed pool of connec
 
 Data and progress frames of one dataflow to one peer share a single **payload lane**, which preserves the timely ordering invariant (data at time T is sent before the progress message releasing T). When a dataflow registers with a manager, its lane — and its control frames (handshake, ready, cancel) — is **pinned** to one pooled connection, the one with the fewest pinned lanes, and never moves. TCP therefore keeps the lane's frames in order, exactly as in Dedicated mode; different dataflows spread over the pool's connections.
 
-Every payload frame carries the lane's next sequence number (`u64`, 8 bytes in front of the payload). The receiver checks it:
+Every payload frame carries the lane's next sequence number (`u64`, 8 bytes in front of the payload), taken as the frame is queued on the pinned connection: numbering and queueing are one step under the lane's lock, so only a queued frame takes a number and the connection's queue holds the lane's frames in number order, whichever task sends them (worker threads pushing records, the outbox forwarder carrying progress and end-of-stream markers). There is no shared step between the dataflows and the connections: each connection has its own queues, so a slow or stuck connection holds up only the dataflows pinned to it (see [connection-liveness.md](./connection-liveness.md) §5). The receiver checks the number:
 
 - a frame that does not carry exactly the next number — a lost or duplicated frame — fails the dataflow (`TransportError::OutOfSequence`);
 - a lane whose payload frames arrive on two connections (a peer breaking the pinning contract), or a frame for a channel the dataflow never registered, fails it too (`TransportError::LaneViolation`).
@@ -284,8 +284,8 @@ An earlier design spread one lane's frames over all pooled connections and resto
 
 Frames queued on, or in flight in, a connection that fails may be lost, and nothing resends them. Shared mode is therefore fail-stop, like Dedicated mode and timely:
 
-- when a pooled connection's **writer** fails, every dataflow whose lane is pinned to it is told (`PeerIoEvent::WriteFailed`), the connection leaves the pool, and the whole connection is closed: its reader stops too, and the dataflows whose frames from the peer arrive on it are told as below. Dropping only the write half would tell the peer nothing when the halves come from `tokio::io::split` (TLS streams, pipes): the peer would wait for frames that never come, and keep the connection in its pool while this node replaced it. Closing the whole connection makes the peer fail the same dataflows, and both pools refill together;
-- when its **reader** fails (an I/O error, EOF mid-frame, a corrupt or oversize frame), every dataflow whose frames from the peer arrive on it is told (`PeerIoEvent::ReadFailed`) and its channels close once that was handed on, and every dataflow whose lane is pinned to it is told too. A corrupt or oversize frame is reported as such (corruption, fatal in every phase) only to the dataflow named in its verified header; the others sharing the connection are told the connection was lost, which is fatal only while they still need the peer's frames;
+- when a pooled connection's **writer** fails (a write error, or the writer stall rule below), every dataflow whose lane is pinned to it is told (`PeerIoEvent::WriteFailed`), the connection leaves the pool, and the whole connection is closed: its reader stops too, and the dataflows whose frames from the peer arrive on it are told as below. Dropping only the write half would tell the peer nothing when the halves come from `tokio::io::split` (TLS streams, pipes): the peer would wait for frames that never come, and keep the connection in its pool while this node replaced it. Closing the whole connection makes the peer fail the same dataflows, and both pools refill together;
+- when its **reader** fails (an I/O error, EOF mid-frame, a corrupt or oversize frame, or the silence rule below), every dataflow whose frames from the peer arrive on it is told (`PeerIoEvent::ReadFailed`) and its channels close once that was handed on, and every dataflow whose lane is pinned to it is told too. A corrupt or oversize frame is reported as such (corruption, fatal in every phase) only to the dataflow named in its verified header; the others sharing the connection are told the connection was lost, which is fatal only while they still need the peer's frames;
 - when the peer **closes its side cleanly** (EOF at a frame boundary), the same dataflows are told (`PeerIoEvent::Closed`), but the lanes pinned to the connection keep writing until a write fails. A released manager shuts its writers down and keeps reading for its peers' last frames (goodbyes, acknowledgements, a `Cancel`), so dropping them would defeat that; Dedicated mode behaves the same way. The connection takes no new lanes, leaves the pool (the next registration replaces it), and is closed once its last lane unregisters. Safety rests on the `Closed` event, not on a later write error: like any link failure it is fatal unless the link is already retired (the peer then holds everything we sent and needs nothing more). If the peer is in fact gone, a later write fails and is reported (`WriteFailed`), but with TCP the first writes after the peer's close may still succeed locally;
 - a payload frame that cannot be sent — over the frame size limit, or on a reserved channel — fails its own dataflow (`PeerIoEvent::FrameRejected`) without consuming a sequence number; the connection and every other dataflow are untouched.
 
@@ -298,25 +298,37 @@ There is no background redial. The failed connection leaves the pool, and the ne
 ```rust
 pub struct SharedConnectionConfig {
     /// Pooled connections per peer (at least 1; both peers use the same value).
-    pub connections: usize,          // default 1
+    pub connections: usize,                  // default 1
     /// How long establishing one connection may take.
-    pub connect_timeout: Duration,   // default 10 s
-    /// Interval between RTT probes on each connection (metrics only).
-    pub probe_interval: Duration,    // default 1 s
+    pub connect_timeout: Duration,           // default 10 s
+    /// Interval between probes on each connection (RTT, and liveness).
+    pub probe_interval: Duration,            // default 1 s
+    /// A connection delivering no bytes for this long is dead (None: off).
+    pub silence_timeout: Option<Duration>,   // default Some(30 s), at least 3 × probe_interval
     /// EMA smoothing factor for the RTT.
-    pub rtt_ema_alpha: f64,          // default 0.2
+    pub rtt_ema_alpha: f64,                  // default 0.2
 }
 ```
 
-The pool does not resize itself. An earlier design grew and shrank it from each node's own RTT probes and idle time, but neither node told the other: frames on a connection only one side opened were never read, and a connection one side closed looked like a failure to the other (audit H7). Resizing needs both nodes to agree on each connection (a coordinated protocol over the control lane); it may come later, together with performance work. RTT probes still run, at data priority, and feed `SharedPeerManager::metrics_snapshot` (per-connection RTT, queued frames, pinned lanes, bytes and frames written); nothing is decided from them.
+The pool does not resize itself. An earlier design grew and shrank it from each node's own RTT probes and idle time, but neither node told the other: frames on a connection only one side opened were never read, and a connection one side closed looked like a failure to the other (audit H7). Resizing needs both nodes to agree on each connection (a coordinated protocol over the control lane); it may come later, together with performance work. Probes run at data priority (skipped when a connection's payload queue is full, since bytes are then already waiting to flow). They keep each connection's bytes flowing for the liveness rule, and feed `SharedPeerManager::metrics_snapshot` (per-connection RTT, queued frames, pinned lanes, bytes and frames written).
+
+#### Connection liveness
+
+A pooled connection can stop delivering without ever failing (a partition, a frozen peer, a firewall that dropped its state, a half-open connection). Each node therefore judges its own connections, by the rule of [connection-liveness.md](./connection-liveness.md) (R54–R58):
+
+- a connection whose reader has read no bytes for `silence_timeout` (T) is dead: it fails like a read error (`TransportError::ConnectionSilent`), its writer is aborted at once, and exactly the dataflows using it fail, on both nodes (the peer by its own timer, or by seeing the connection end);
+- a writer that has had bytes waiting and written none for T fails its connection like a write error (`TransportError::WriteStalled`), as `TCP_USER_TIMEOUT` does for gRPC;
+- both count bytes, not frames, so a large frame on a slow link keeps its connection alive; and a connection's reader never waits for a consumer (its per-channel queues are unbounded), so a slow consumer cannot make a healthy connection look silent. Cross-node backpressure (M7) must keep that.
+
+The rule judges one connection, never a node: node membership stays the application's (`RuntimeHandle::report_node_leave`), so the two detectors judge different things and cannot disagree. T must exceed P + D + 2S (D: the longest a healthy connection takes to deliver a byte; S: the longest either node's network tasks can be paused); it then fails a dead connection within T + P + S. `silence_timeout: None` disables it.
 
 #### Transport contract
 
-The application provides the connections and owns their **liveness**: detecting that a peer is dead, partitioned or unreachable, through its transport (TCP keepalive, TLS or QUIC idle timeouts) or its membership layer (`RuntimeHandle::report_node_leave`). instancy runs no heartbeat: a second failure detector could disagree with the application's membership, and a false positive would fail every dataflow on a connection at once.
+The application provides the connections and owns node **membership**: telling instancy that a peer node is dead or gone (`RuntimeHandle::report_node_leave`). instancy detects a pooled connection that stops delivering (above), and fails only that connection's dataflows.
 
-instancy owns **safety**: it never reports success with lost, duplicated, reordered or corrupted data — every frame is checksummed, every lane is sequenced, a stream that ends without its close markers fails the dataflow, and the handshake verifies the peer's identity — and it fails the affected dataflows promptly when a connection reports an error or EOF or the application reports a node leaving. With a healthy transport, a hang inside instancy is a bug.
+instancy owns **safety**: it never reports success with lost, duplicated, reordered or corrupted data — every frame is checksummed, every lane is sequenced, a stream that ends without its close markers fails the dataflow, and the handshake verifies the peer's identity — and it fails the affected dataflows promptly when a connection reports an error or EOF, falls silent, or the application reports a node leaving. With a healthy transport, a hang inside instancy is a bug.
 
-A connection that silently stops delivering without ever failing makes its dataflows wait; they are never reported as successful. The factory must also pair the connections the two nodes establish (one dials, the other accepts and hands over the accepted stream, for example): a connection whose other end no manager reads delivers nothing, and the dataflows pinned to it fail their handshake.
+With `silence_timeout: None`, a connection that silently stops delivering without ever failing makes its dataflows wait; they are never reported as successful. The factory must also pair the connections the two nodes establish (one dials, the other accepts and hands over the accepted stream, for example): a connection whose other end no manager reads delivers nothing, the dataflows pinned to it fail their handshake, and the connection is failed by the silence rule.
 
 #### Per-dataflow state at scale
 
@@ -406,14 +418,14 @@ the event that ended the read side was handed on. `NetworkPush` rejects an
 envelope whose encoding exceeds the transport's frame limit
 (`ClusterTransport::max_payload_len`; shared frames carry an 8-byte sequence
 prefix) with `CommunicationError::FrameTooLarge`, and the data decoder accepts
-any record count the encoder can produce. With shared connections, a
-dataflow that must not lose what it has queued (its end-of-stream markers and
-acknowledgements, or final progress for a peer that is still draining) calls
-`SharedPeerManager::flush` before
-unregistering: it puts a local-only barrier (an entry of the manager's own
-queue, never a frame) on the payload queue and returns once
-the bridge task reaches it, that is, once every earlier frame has been
-sequenced and handed to a connection writer. See
+any record count the encoder can produce. With shared connections, a frame
+is numbered and queued on its pinned connection as it is sent, and a queued
+frame is written even once its dataflow unregisters. So a dataflow that must
+not lose what it has queued (its end-of-stream markers and acknowledgements,
+or final progress for a peer that is still draining) only waits, before
+unregistering, until its outbox forwarders have handed everything to the
+connection; the wait has no fixed deadline, and the liveness rule bounds it.
+See
 [cluster.md §5.5.3](./cluster.md#553-cluster-shutdown-protocol-clean-teardown).
 
 ### 6.5 Dataflow Isolation

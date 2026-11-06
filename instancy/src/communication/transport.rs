@@ -140,8 +140,7 @@ pub enum TransportError {
 
     /// A shared lock was poisoned (another thread panicked while holding it).
     ///
-    /// This is an unrecoverable transport error — the hosting application
-    /// should be notified via [`RuntimeEvent::TransportDegraded`](crate::RuntimeEvent::TransportDegraded).
+    /// The affected dataflows fail with it.
     #[error("transport lock poisoned: {detail}")]
     LockPoisoned { detail: String },
 
@@ -155,6 +154,25 @@ pub enum TransportError {
     /// (the control or probe channel) through the payload path.
     #[error("channel {channel_id} is reserved and cannot carry payload frames")]
     ReservedChannel { channel_id: u64 },
+
+    /// A pooled connection (Shared mode) read no bytes for its silence
+    /// timeout ([`SharedConnectionConfig::silence_timeout`](crate::communication::SharedConnectionConfig::silence_timeout)):
+    /// it stopped delivering (a partition, a frozen peer, a half-open
+    /// connection) and was failed like a read error.
+    #[error("no bytes read from the pooled connection for {timeout:?}: it stopped delivering")]
+    ConnectionSilent {
+        /// The silence timeout that elapsed.
+        timeout: std::time::Duration,
+    },
+
+    /// A pooled connection's writer (Shared mode) had bytes waiting and
+    /// wrote none of them for its silence timeout: the connection stopped
+    /// accepting bytes and was failed like a write error.
+    #[error("nothing written to the pooled connection for {timeout:?} while bytes were waiting")]
+    WriteStalled {
+        /// The silence timeout that elapsed.
+        timeout: std::time::Duration,
+    },
 }
 
 #[cfg(feature = "transport")]
@@ -193,6 +211,8 @@ impl TransportError {
             Self::ReservedChannel { channel_id } => Self::ReservedChannel {
                 channel_id: *channel_id,
             },
+            Self::ConnectionSilent { timeout } => Self::ConnectionSilent { timeout: *timeout },
+            Self::WriteStalled { timeout } => Self::WriteStalled { timeout: *timeout },
         }
     }
 }
@@ -244,18 +264,55 @@ mod tokio_impl {
 
         /// Write one frame (already size-checked) without flushing.
         async fn write_unflushed(&mut self, frame: &Frame) -> Result<(), TransportError> {
+            self.write_parts(frame, &[]).await
+        }
+
+        /// Write `frame` with `prefix` in front of its payload, as one frame
+        /// whose payload is `prefix` followed by `frame.payload`, without
+        /// copying the payload. Flushed.
+        ///
+        /// # Errors
+        ///
+        /// [`TransportError::PayloadTooLarge`] if the combined payload exceeds
+        /// [`MAX_MESSAGE_SIZE`], or [`TransportError::Io`] on write failure.
+        pub(crate) async fn write_prefixed_frame(
+            &mut self,
+            frame: &Frame,
+            prefix: &[u8],
+        ) -> Result<(), TransportError> {
+            let len = prefix.len() + frame.payload.len();
+            if len > MAX_MESSAGE_SIZE {
+                return Err(TransportError::PayloadTooLarge {
+                    size: len,
+                    max: MAX_MESSAGE_SIZE,
+                });
+            }
+            self.write_parts(frame, prefix).await?;
+            self.writer.flush().await?;
+            Ok(())
+        }
+
+        /// Write one frame whose payload is `prefix` then `frame.payload`.
+        async fn write_parts(
+            &mut self,
+            frame: &Frame,
+            prefix: &[u8],
+        ) -> Result<(), TransportError> {
             // The wire length includes the frame CRC trailer.
-            let wire_len = frame.payload.len() + CRC_SIZE;
+            let wire_len = prefix.len() + frame.payload.len() + CRC_SIZE;
             let header = encode_header(frame, wire_len as u32);
+            let mut crc = crc32fast::Hasher::new();
+            crc.update(&header);
+            crc.update(prefix);
+            crc.update(&frame.payload);
 
             self.writer.write_all(&header).await?;
             self.writer
                 .write_all(&crc32fast::hash(&header).to_le_bytes())
                 .await?;
+            self.writer.write_all(prefix).await?;
             self.writer.write_all(&frame.payload).await?;
-            self.writer
-                .write_all(&frame_crc(&header, &frame.payload).to_le_bytes())
-                .await?;
+            self.writer.write_all(&crc.finalize().to_le_bytes()).await?;
             Ok(())
         }
 

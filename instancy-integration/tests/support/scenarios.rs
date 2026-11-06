@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use instancy::communication::SharedConnectionConfig;
 use instancy_integration::coordinator::{Outcome, SpawnInfo, TestCoordinator, OUTCOME_DEADLINE};
 use instancy_integration::dataflows::port_names;
 use instancy_integration::node_actor::SPAWN_HANDSHAKE_TIMEOUT;
@@ -787,31 +788,40 @@ pub async fn long_stall(
     all_ok(results).map(|()| ended)
 }
 
-/// The capacity of a pooled connection's writer queue in instancy
+/// The capacity of a pooled connection's payload queue in instancy
 /// (`WRITER_QUEUE`, instancy/src/communication/shared_transport.rs). A
 /// connection whose `queued_frames` stays there, with no frame written, has
-/// its writer stuck behind a full socket. Once one more frame for it reaches
-/// its manager's bridge task, the bridge waits for room in that queue, and
-/// every frame queued on the manager behind that one, for any dataflow and
-/// any connection, waits with it.
+/// its writer stuck behind a full socket: the dataflows pinned to it see
+/// backpressure, and nothing else waits for it.
 pub const WRITER_QUEUE: usize = 256;
 
-/// How long [`finished_behind_a_one_way_stall`] holds its stall after Y has
-/// ended on a: longer than the handshake timeout, which bounds a's flush of
-/// Y's last frames as Y tears down there.
-pub const HOLD_AFTER_Y: Duration = Duration::from_secs(SPAWN_HANDSHAKE_TIMEOUT.as_secs() + 2);
+/// The silence timeout of the harness's pooled connections (instancy's
+/// default): a connection that delivers nothing for this long is failed.
+pub fn silence_timeout() -> Duration {
+    SharedConnectionConfig::default()
+        .silence_timeout
+        .expect("the default silence timeout is set")
+}
+
+/// How long before the silence timeout [`finished_behind_a_one_way_stall`]
+/// heals its stall at the latest, so the liveness rule (checked every probe
+/// interval, 1 s) never fails the stalled connection.
+pub const SILENCE_MARGIN: Duration = Duration::from_secs(5);
+
+/// The time [`finished_behind_a_one_way_stall`] leaves Y to end on both
+/// nodes during the stall, at least.
+const Y_ENDS_WITHIN: Duration = Duration::from_secs(5);
 
 /// Records in each feed of the dataflow [`finished_behind_a_one_way_stall`]
 /// streams through its stall.
 const X_RECORDS_PER_FEED: usize = 4096;
 
-/// How long X may stream through the one-way stall before a's bridge must be
-/// blocked.
-const BLOCK_DEADLINE: Duration = Duration::from_secs(30);
+/// How long X may stream through the one-way stall before a's writer for X
+/// must be blocked.
+const BLOCK_DEADLINE: Duration = Duration::from_secs(12);
 
-/// Rounds of X fed after its connection's writer queue on a was first seen
-/// full: their frames reach the bridge after the queue filled, so the bridge
-/// holds one of them for that connection.
+/// Rounds of X fed after its connection's payload queue on a was first seen
+/// full: X's operators then push against the full queue.
 const EXTRA_ROUNDS: u64 = 2;
 
 /// How long a full writer queue must stay full, with no frame written, to
@@ -921,10 +931,10 @@ fn add_x_round(run: &mut Run, from: &str, onto: &str, round: u64) -> usize {
 }
 
 /// What [`finished_behind_a_one_way_stall`]'s stall must still hold: a's
-/// connection `x_conn` to `b` (in `node_set`) with its writer queue full,
+/// connection `x_conn` to `b` (in `node_set`) with its payload queue full,
 /// and the relay connection `c1` with no byte from a forwarded since the
 /// stall (`from_a` before it).
-struct HeldBridge<'a> {
+struct HeldWriter<'a> {
     node_set: &'a str,
     a: &'a str,
     b: &'a str,
@@ -933,8 +943,8 @@ struct HeldBridge<'a> {
     from_a: u64,
 }
 
-impl HeldBridge<'_> {
-    /// Fails, saying `when`, unless the stall still holds a's bridge.
+impl HeldWriter<'_> {
+    /// Fails, saying `when`, unless the stall still holds a's writer for X.
     /// Returns a's connection `x_conn`.
     async fn check(
         &self,
@@ -952,23 +962,12 @@ impl HeldBridge<'_> {
                 Ok(conn)
             }
             _ => Err(format!(
-                "precondition not reached: {when}, the stall no longer held {a}'s bridge: \
-                 {a}'s connection {} to {b}: {conn:?} (blocked: {WRITER_QUEUE} frames \
+                "precondition not reached: {when}, the stall no longer held {a}'s writer for \
+                 X: {a}'s connection {} to {b}: {conn:?} (blocked: {WRITER_QUEUE} frames \
                  queued); bytes forwarded from {a} on {:?}: {from_a:?} ({} at the stall)",
                 self.x_conn, self.c1, self.from_a
             )),
         }
-    }
-}
-
-/// How `node` has ended `dataflow_id` so far.
-async fn outcome_so_far(coord: &mut TestCoordinator, dataflow_id: &str, node: &str) -> String {
-    match coord
-        .wait_for_outcomes(dataflow_id, &[node], Duration::ZERO)
-        .await
-    {
-        Ok(outcomes) => format!("{:?}", outcomes[node]),
-        Err(_) => "no outcome yet".to_string(),
     }
 }
 
@@ -987,11 +986,11 @@ async fn pinned_lanes(coord: &mut TestCoordinator, pair: [&str; 2]) -> String {
     by_node.join(", ")
 }
 
-/// Scenario 10 (R58 of the connection-liveness design): a dataflow that has
-/// ended on one node while a one-way stall holds its last frames to the
-/// other, with kept managers, for longer than the handshake timeout. Needs
-/// two nodes, a and b, with two pooled connections per pair. b dials, so
-/// both connections are on the relay route from b to a.
+/// Scenario 10 (R58 of the connection-liveness design): a dataflow that ends
+/// while a one-way stall of another connection between the same nodes holds
+/// that connection's writer, with kept managers. Needs two nodes, a and b,
+/// with two pooled connections per pair. b dials, so both connections are on
+/// the relay route from b to a.
 ///
 /// 1. Pin: dataflow X (MultiEpochExchange), then Y (ExchangeRoundTrip), on
 ///    {a, b}. Each node pins a lane to the connection with the fewest, so X
@@ -1004,19 +1003,19 @@ async fn pinned_lanes(coord: &mut TestCoordinator, pair: [&str; 2]) -> String {
 ///    bytes on it. b to a on c1, and the other connection c2 both ways, keep
 ///    flowing.
 /// 4. X streams from a, round after round, until a's connection for X has
-///    its writer queue full ([`WRITER_QUEUE`] frames), then
+///    its payload queue full ([`WRITER_QUEUE`] frames), then
 ///    [`EXTRA_ROUNDS`] more, and it must write nothing for
-///    [`BLOCK_SETTLE`]: a's writer is stuck behind a full socket, and a's
-///    bridge task behind it, holding every frame a queues for b after it.
-/// 5. Y's input closes on b. Y must end `Ok` on a while the stall holds: its
-///    goodbye and acknowledgement to b, which go through the blocked bridge,
-///    wait behind X's frames.
-/// 6. The stall is held [`HOLD_AFTER_Y`] after Y ended on a, longer than
-///    the handshake timeout, and still holding a's bridge, then healed.
+///    [`BLOCK_SETTLE`]: a's writer for X is stuck behind a full socket.
+/// 5. Y's input closes on b. Y must end `Ok` on a and on b while the stall
+///    holds: its last frames (goodbyes, acknowledgements) go out on c2, so
+///    nothing about X's stuck connection holds them. With a shared bridge
+///    per peer, they waited behind X's frames, a's teardown flush gave up at
+///    the handshake timeout and dropped them, and b never ended Y.
+/// 6. The stall heals [`SILENCE_MARGIN`] before the silence timeout at the
+///    latest, so the liveness rule never fails c1.
 ///
-/// Each precondition (pins apart, the bridge blocked, Y `Ok` on a while the
-/// stall holds a's bridge, the stall held past the handshake timeout after
-/// that) fails the scenario, naming it, if it is not reached. Then, within
+/// Each precondition (pins apart, a's writer for X blocked in time) fails
+/// the scenario, naming it, if it is not reached. Then, within
 /// [`OUTCOME_DEADLINE`] of the heal (three handshake timeouts), Y and X must
 /// end `Ok` with exact output on a and b; and no process may crash.
 ///
@@ -1159,7 +1158,7 @@ async fn one_way_stall_schedule(
          from {a}, {on_route:?} forwarded {grown:?} bytes from {a}"
     ));
 
-    // 4. Stall c1 from a, and stream X until a's bridge is blocked.
+    // 4. Stall c1 from a, and stream X until a's writer for X is blocked.
     apply(
         coord.relay(),
         SCENARIO,
@@ -1168,7 +1167,7 @@ async fn one_way_stall_schedule(
         LinkAction::StallOneWay { from_dialer: false },
     )?;
     let stalled = Instant::now();
-    let held = HeldBridge {
+    let held = HeldWriter {
         node_set: &node_set,
         a,
         b,
@@ -1199,10 +1198,10 @@ async fn one_way_stall_schedule(
         }
         if Instant::now() >= give_up {
             return Err(format!(
-                "precondition not reached: {a}'s bridge never blocked: {} s after the one-way \
-                 stall of c1, with {round} rounds ({:.1} MiB of X's records) streamed through \
-                 it, X's connection {x_conn} on {a} was {conn:?}, not at the writer queue's \
-                 {WRITER_QUEUE} frames",
+                "precondition not reached: {a}'s writer for X never blocked: {} s after the \
+                 one-way stall of c1, with {round} rounds ({:.1} MiB of X's records) streamed \
+                 through it, X's connection {x_conn} on {a} was {conn:?}, not at the payload \
+                 queue's {WRITER_QUEUE} frames",
                 BLOCK_DEADLINE.as_secs(),
                 streamed as f64 / MIB
             ));
@@ -1219,63 +1218,70 @@ async fn one_way_stall_schedule(
         ));
     }
     steps.step(format!(
-        "{a}'s bridge blocked: X's connection {x_conn} on {a} had its writer queue full \
-         ({WRITER_QUEUE} frames) {:.2} s after the stall, at round {first_full}; {EXTRA_ROUNDS} \
-         more rounds were fed, and it wrote nothing for {BLOCK_SETTLE:?} ({blocked:?}). \
-         {round} rounds, {:.1} MiB of X's records, streamed in {:.2} s since the stall",
+        "{a}'s writer for X blocked: X's connection {x_conn} on {a} had its payload queue \
+         full ({WRITER_QUEUE} frames) {:.2} s after the stall, at round {first_full}; \
+         {EXTRA_ROUNDS} more rounds were fed, and it wrote nothing for {BLOCK_SETTLE:?} \
+         ({blocked:?}). {round} rounds, {:.1} MiB of X's records, streamed in {:.2} s since \
+         the stall",
         full_after.as_secs_f64(),
         streamed as f64 / MIB,
         stalled.elapsed().as_secs_f64()
     ));
 
-    // 5. Let Y finish: it must end Ok on a while the stall holds.
+    // 5. Let Y finish: it must end Ok on both nodes while the stall holds,
+    // before the stall reaches the silence timeout.
+    let heal_by = stalled + silence_timeout() - SILENCE_MARGIN;
+    if Instant::now() + Y_ENDS_WITHIN > heal_by {
+        return Err(format!(
+            "precondition not reached: {a}'s writer for X blocked only {:.2} s after the stall, \
+             leaving less than {Y_ENDS_WITHIN:?} for Y before the stall must heal, \
+             {SILENCE_MARGIN:?} short of the silence timeout ({:?})",
+            stalled.elapsed().as_secs_f64(),
+            silence_timeout()
+        ));
+    }
     coord.close_inputs(&y.id, &[b]).await;
     let closed = Instant::now();
     steps.step(format!("closed Y's input on {b}"));
+    let left = heal_by.saturating_duration_since(Instant::now());
     let outcomes = coord
-        .wait_for_outcomes(&y.id, &[a], OUTCOME_DEADLINE)
+        .wait_for_outcomes(&y.id, &pair, left)
         .await
         .map_err(|hang| {
             format!(
-                "precondition not reached: Y did not end on {a} within {} s of its input \
-                 closing on {b}, while the stall held: {hang:?}",
-                OUTCOME_DEADLINE.as_secs()
+                "{}: no outcome from {:?} within {:.2} s of its input closing on {b}, while \
+                 the one-way stall of c1 held {a}'s writer for X; Y uses c2, so it must not \
+                 wait behind X's connection",
+                y.id,
+                hang.missing,
+                closed.elapsed().as_secs_f64()
             )
         })?;
     let y_ended = Instant::now();
-    if outcomes[a] != Outcome::Ok {
-        return Err(format!(
-            "{}: {a} ended {:?} behind the one-way stall of c1; no fault touched Y",
-            y.id, outcomes[a]
-        ));
+    for node in pair {
+        if outcomes[node] != Outcome::Ok {
+            return Err(format!(
+                "{}: {node} ended {:?} during the one-way stall of c1; no fault touched Y",
+                y.id, outcomes[node]
+            ));
+        }
     }
-    held.check(coord, "when Y ended on a").await?;
-    let on_b = outcome_so_far(coord, &y.id, b).await;
+    let blocked = held.check(coord, "when Y ended on both nodes").await?;
     let pins = pinned_lanes(coord, pair).await;
     steps.step(format!(
-        "Y ended Ok on {a}, {:.2} s after its input closed on {b}, the stall still holding \
-         {a}'s bridge; Y on {b}: {on_b}; lanes pinned by connection: {pins}",
+        "Y ended Ok on {a} and {b}, {:.2} s after its input closed on {b}, the stall still \
+         holding {a}'s writer for X; lanes pinned by connection: {pins}",
         (y_ended - closed).as_secs_f64()
     ));
 
-    // 6. Hold the stall past the handshake timeout, then heal.
-    sleep_until(y_ended + HOLD_AFTER_Y).await;
-    let blocked = held.check(coord, "at the heal").await?;
-    let held_for = y_ended.elapsed();
-    if held_for <= SPAWN_HANDSHAKE_TIMEOUT {
-        return Err(format!(
-            "precondition not reached: the stall held only {held_for:?} after Y ended on {a}, \
-             not longer than the handshake timeout ({SPAWN_HANDSHAKE_TIMEOUT:?})"
-        ));
-    }
-    let on_b = outcome_so_far(coord, &y.id, b).await;
+    // 6. Heal before the silence timeout.
     apply(coord.relay(), SCENARIO, (b, a), &[c1], LinkAction::Heal)?;
     let healed = Instant::now();
     steps.step(format!(
-        "healed c1, {:.2} s after Y ended on {a} and {:.2} s after the stall began, the stall \
-         holding {a}'s bridge to the end ({blocked:?}); Y on {b} at the heal: {on_b}",
-        held_for.as_secs_f64(),
-        stalled.elapsed().as_secs_f64()
+        "healed c1, {:.2} s after the stall began (silence timeout {:?}), the stall holding \
+         {a}'s writer for X to the end ({blocked:?})",
+        stalled.elapsed().as_secs_f64(),
+        silence_timeout()
     ));
 
     // After the heal: Y and X must end Ok and exact on both nodes.
@@ -1417,6 +1423,196 @@ pub async fn failed_connection(
         }
     }
     results.extend(check_all(coord, &others, false).await);
+    results.push(no_crashes(coord));
+    all_ok(results)
+}
+
+/// How [`silent_connection`] makes its connection stop delivering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Silence {
+    /// Nothing crosses either way: each node fails it by its own timer.
+    BothWays,
+    /// Nothing crosses from a (the acceptor) to b: b reads nothing and fails
+    /// it by its timer; a still reads, and sees b close it.
+    FromAcceptor,
+}
+
+/// How long after the silence timeout [`silent_connection`] gives each node
+/// to fail the silent connection's dataflows: the verdict is checked every
+/// probe interval (1 s), then the failure crosses the node's lifecycle.
+pub const VERDICT_SLACK: Duration = Duration::from_secs(10);
+
+/// Scenario 11 (R54–R56 of the connection-liveness design): a connection
+/// that stops delivering without ever failing, with no membership report.
+/// Needs three nodes started with one pooled connection per pair. Two
+/// dataflows run on {a, b}, sharing b's one connection to a; one runs on
+/// {a, c} and one on {b, c}. All are fed with their inputs open; the
+/// connection from b to a stops delivering (`silence`) and is held so,
+/// longer than the silence timeout; then every input closes.
+///
+/// - the others give exact output: they use no connection between a and b;
+/// - neither {a, b} dataflow has an outcome on a or b 2 s before the
+///   silence timeout: nothing ends early;
+/// - each ends on a and on b within the silence timeout plus
+///   [`VERDICT_SLACK`]. A node that reads nothing on the connection can't
+///   get the other's last progress, so it must fail, reporting the silence
+///   ("no bytes read"). A node that still reads (silent one way) may have
+///   everything it needs: it fails, or ends `Ok` with exact output;
+/// - a new {a, b} dataflow then gives exact output: the next registration
+///   replaced the dead connection;
+/// - the stall is healed, and no process crashed.
+pub async fn silent_connection(
+    coord: &mut TestCoordinator,
+    silence: Silence,
+) -> Result<(), String> {
+    const SCENARIO: &str = "silent_connection";
+    let nodes = coord.live_nodes();
+    let nodes: Vec<&str> = nodes.iter().map(String::as_str).collect();
+    let [a, b, c] = nodes[..] else {
+        return Err(format!("{SCENARIO} needs three nodes, not {nodes:?}"));
+    };
+    let between = [
+        spawn_run(
+            coord,
+            &format!("silent-{a}-{b}-1"),
+            &[a, b],
+            WorkloadKind::ExchangeRoundTrip,
+            1,
+        )
+        .await,
+        spawn_run(
+            coord,
+            &format!("silent-{a}-{b}-2"),
+            &[a, b],
+            WorkloadKind::MultiEpochExchange,
+            2,
+        )
+        .await,
+    ];
+    let others = [
+        spawn_run(
+            coord,
+            &format!("silent-{a}-{c}"),
+            &[a, c],
+            WorkloadKind::WordCount,
+            3,
+        )
+        .await,
+        spawn_run(
+            coord,
+            &format!("silent-{b}-{c}"),
+            &[b, c],
+            WorkloadKind::Join,
+            4,
+        )
+        .await,
+    ];
+    for run in between.iter().chain(&others) {
+        coord.feed(&run.id, &run.workload, 0..EPOCHS).await;
+    }
+
+    let connections = coord.relay().connections(b, a);
+    let [silent] = connections[..] else {
+        return Err(format!(
+            "{SCENARIO}: {} connections from {b} to {a}, expected the one both dataflows on \
+             {{{a}, {b}}} share: {connections:?}",
+            connections.len()
+        ));
+    };
+    let action = match silence {
+        Silence::BothWays => LinkAction::Stall,
+        Silence::FromAcceptor => LinkAction::StallOneWay { from_dialer: false },
+    };
+    apply(coord.relay(), SCENARIO, (b, a), &[silent], action)?;
+    let stalled = Instant::now();
+    for run in between.iter().chain(&others) {
+        coord.close_inputs(&run.id, &run.nodes()).await;
+    }
+
+    let mut results = check_all(coord, &others, false).await;
+    let timeout = silence_timeout();
+    sleep_until(stalled + timeout - Duration::from_secs(2)).await;
+    for run in &between {
+        let when = format!(
+            "the connection from {b} to {a} had been silent ({silence:?}) for {:.2} s, under \
+             the silence timeout ({timeout:?})",
+            stalled.elapsed().as_secs_f64()
+        );
+        results.push(still_running(coord, &run.id, &[a, b], &when).await);
+    }
+    let deadline = stalled + timeout + VERDICT_SLACK;
+    // The nodes that read nothing on the silent connection: they can't get
+    // the other node's last progress, so they can't finish, and they fail
+    // the connection by their own timer. A node that still reads (one way)
+    // may have everything it needs and finish its part `Ok`; then its output
+    // must be exact.
+    let deaf: &[&str] = match silence {
+        Silence::BothWays => &[a, b],
+        Silence::FromAcceptor => &[b],
+    };
+    for run in &between {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let outcomes = match coord.wait_for_outcomes(&run.id, &[a, b], left).await {
+            Ok(outcomes) => outcomes,
+            Err(hang) => {
+                results.push(Err(format!(
+                    "{}: no outcome from {:?} within the silence timeout ({timeout:?}) plus \
+                     {VERDICT_SLACK:?} of the connection from {b} to {a} going silent \
+                     ({silence:?})",
+                    run.id, hang.missing
+                )));
+                continue;
+            }
+        };
+        for (node, outcome) in &outcomes {
+            let is_deaf = deaf.contains(&node.as_str());
+            let expected = match outcome {
+                Outcome::Err(error) => !is_deaf || error.contains("no bytes read"),
+                Outcome::Ok => !is_deaf,
+                Outcome::Dead => false,
+            };
+            if !expected {
+                results.push(Err(format!(
+                    "{}: {node} ended {outcome:?} after its connection from {b} to {a} went \
+                     silent ({silence:?}) with inputs open: {deaf:?} must fail with the \
+                     silence (\"no bytes read\"), and no node may end Dead",
+                    run.id
+                )));
+            }
+        }
+        // Exact output wherever it ended `Ok`.
+        results.push(check(coord, run, true).await);
+    }
+    let after = format!(
+        "{} s after the connection from {b} to {a} went silent",
+        stalled.elapsed().as_secs()
+    );
+
+    let next = spawn_run(
+        coord,
+        &format!("silent-{a}-{b}-after"),
+        &[a, b],
+        WorkloadKind::ExchangeRoundTrip,
+        5,
+    )
+    .await;
+    let route = coord.relay().connections(b, a);
+    if !route.iter().any(|&conn| conn != silent) {
+        results.push(Err(format!(
+            "{SCENARIO}: {after}, a new {{{a}, {b}}} dataflow did not get a new connection: \
+             {route:?} from {b} to {a}"
+        )));
+    }
+    coord.feed(&next.id, &next.workload, 0..EPOCHS).await;
+    coord.close_inputs(&next.id, &[a, b]).await;
+    results.extend(check_all(coord, std::slice::from_ref(&next), false).await);
+    results.push(apply(
+        coord.relay(),
+        SCENARIO,
+        (b, a),
+        &[silent],
+        LinkAction::Heal,
+    ));
     results.push(no_crashes(coord));
     all_ok(results)
 }

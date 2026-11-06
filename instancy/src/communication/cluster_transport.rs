@@ -10,7 +10,7 @@
 //!
 //! [`FrameSender`] abstracts over the two send mechanisms:
 //! - **Dedicated**: `tokio::sync::mpsc::Sender<Frame>` (direct to bridge task)
-//! - **Shared**: [`DataframeSender`] (prepends dataflow_id, sequences, routes via pool)
+//! - **Shared**: [`DataframeSender`] (tags the dataflow id, and numbers each frame as it queues it on the dataflow's pooled connection)
 //!
 //! Both support synchronous `try_send()` for use from the worker thread pool.
 
@@ -67,6 +67,93 @@ impl FrameSender {
             Self::Shared(tx) => tx.send(frame).await,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// PeerChannelReceiver — frames from a peer on one channel, either mode
+// ---------------------------------------------------------------------------
+
+/// The frames a peer sends on one channel of a cluster dataflow.
+///
+/// Bounded in Dedicated mode (each dataflow has its own connection). In
+/// Shared mode a pooled connection's reader must never wait for a consumer:
+/// one slow consumer would stop every dataflow on the connection, and the
+/// connection would read nothing and be declared dead (see the
+/// [`shared_transport`](crate::communication::shared_transport) module
+/// documentation), so its channels are unbounded.
+#[cfg(feature = "transport")]
+#[derive(Debug)]
+pub(crate) enum PeerChannelReceiver {
+    Bounded(tokio_mpsc::Receiver<Vec<u8>>),
+    Unbounded(tokio_mpsc::UnboundedReceiver<Vec<u8>>),
+}
+
+#[cfg(feature = "transport")]
+impl PeerChannelReceiver {
+    /// The next frame's payload, or `None` once the channel is closed and
+    /// empty.
+    pub(crate) async fn recv(&mut self) -> Option<Vec<u8>> {
+        match self {
+            Self::Bounded(rx) => rx.recv().await,
+            Self::Unbounded(rx) => rx.recv().await,
+        }
+    }
+
+    /// Poll for the next frame's payload (see [`Self::recv`]).
+    pub(crate) fn poll_recv(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Vec<u8>>> {
+        match self {
+            Self::Bounded(rx) => rx.poll_recv(cx),
+            Self::Unbounded(rx) => rx.poll_recv(cx),
+        }
+    }
+
+    /// The next frame's payload, if one is queued.
+    pub(crate) fn try_recv(&mut self) -> Result<Vec<u8>, tokio_mpsc::error::TryRecvError> {
+        match self {
+            Self::Bounded(rx) => rx.try_recv(),
+            Self::Unbounded(rx) => rx.try_recv(),
+        }
+    }
+}
+
+#[cfg(feature = "transport")]
+impl From<tokio_mpsc::Receiver<Vec<u8>>> for PeerChannelReceiver {
+    fn from(rx: tokio_mpsc::Receiver<Vec<u8>>) -> Self {
+        Self::Bounded(rx)
+    }
+}
+
+#[cfg(feature = "transport")]
+impl From<tokio_mpsc::UnboundedReceiver<Vec<u8>>> for PeerChannelReceiver {
+    fn from(rx: tokio_mpsc::UnboundedReceiver<Vec<u8>>) -> Self {
+        Self::Unbounded(rx)
+    }
+}
+
+/// Every channel receiver of a cluster dataflow, by peer, then channel id.
+#[cfg(feature = "transport")]
+pub(crate) type PeerReceivers = HashMap<String, HashMap<u64, PeerChannelReceiver>>;
+
+/// [`PeerReceivers`] from the receivers of a transport session.
+#[cfg(feature = "transport")]
+pub(crate) fn peer_receivers<R: Into<PeerChannelReceiver>>(
+    receivers: HashMap<String, HashMap<u64, R>>,
+) -> PeerReceivers {
+    receivers
+        .into_iter()
+        .map(|(peer, channels)| {
+            (
+                peer,
+                channels
+                    .into_iter()
+                    .map(|(id, rx)| (id, rx.into()))
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

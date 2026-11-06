@@ -282,18 +282,24 @@ when the link retires before its push returns.
    retired, or once a link that is not retired has ended for good (all its
    channels closed, a corrupt frame or control message, a transport error, our
    goodbye could not be handed to the transport, or the peer's `Cancel`).
-   On a graceful teardown the node first flushes what it queued (bounded by
-   `handshake_timeout`): it waits for its outbox forwarders to hand their
-   lanes to the transport and, in Shared mode, for a flush barrier on each
-   manager's payload queue (`SharedPeerManager::flush`) before
-   unregistering, because the shared bridge drops queued frames of
-   unregistered dataflows. The lanes can still hold frames peers need: our
+   On a graceful teardown the node first hands on what it queued: it waits
+   for its outbox forwarders to hand their lanes to the transport before
+   unregistering. The lanes can still hold frames peers need: our
    goodbye and our acknowledgements of their goodbyes (a peer whose goodbye
    retired our link may still be waiting for our ack), or our final progress
-   for a peer that cancelled and is still draining (`drain_on_cancel`). Once every local worker has finished, teardown also lets the
+   for a peer that cancelled and is still draining (`drain_on_cancel`). In
+   Dedicated mode the wait is bounded by `handshake_timeout`. In Shared mode
+   a frame is numbered into its registration's lane as it is queued on its
+   pinned connection, and a queued frame is written even once the dataflow
+   unregisters, so the wait has no fixed deadline (R58): it waits only on a
+   connection that accepts no frames, which the liveness rule fails within
+   about `silence_timeout` (a dead verdict on either node, or the writer
+   stall rule here), and the rest of the lane is then dropped with the
+   dataflow told. A stall on another connection to the peer never holds it
+   up. Once every local worker has finished, teardown also lets the
    inbound data bridges deliver or report whatever is already queued before
-   they exit (bounded by `handshake_timeout`). A flush barrier only proves
-   that the frames reached a connection's writer queue, so when the dataflow
+   they exit (bounded by `handshake_timeout`). A frame in a connection's
+   queue is not yet written, so when the dataflow
    holds the last reference to its shared managers (per-job `Mode::Shared`),
    teardown then closes them (`SharedPeerManager::close`, bounded by
    `handshake_timeout`), which waits until their writers have written what is
@@ -1082,7 +1088,7 @@ Tests run under nextest's `ci` profile (`docs/testing/nextest.md`): no retries, 
 ### Scenarios
 
 - `shared_cluster`: a healthy cluster, a killed node, a dataflow that leaves out the killed node, a restart, kills during spawn and teardown, and a node killed behind a partition: every connection to and from it stalled, so its death reaches the survivors only through the leave report, which must cancel every dataflow on each survivor, each then failing with "peer node down".
-- `shared_connection_faults`: one connection delayed, throttled or stalled (exact output), stalled for 15 s, longer than the spawn handshake timeout, from before the input or from as the dataflows finish (exact output after the heal), or reset or closed (only the dataflows between its two nodes fail). And R58 of the connection-liveness design: dataflow Y ends on a while a one-way stall of the connection carrying dataflow X from a has blocked a's manager bridge task (its writer queue full behind a full socket), holding Y's goodbye and acknowledgement to b, for longer than the handshake timeout; after the heal Y must end `Ok` and exact on b. Today b's Y never ends (a drops those frames when its bounded teardown flush gives up), so the test is ignored until that fix lands; run it with `--run-ignored only -E 'test(=finished_dataflow_survives_a_one_way_stall_longer_than_handshake)'`.
+- `shared_connection_faults`: one connection delayed, throttled or stalled (exact output), stalled for 15 s, longer than the spawn handshake timeout, from before the input or from as the dataflows finish (exact output after the heal), or reset or closed (only the dataflows between its two nodes fail). R58 of the connection-liveness design: dataflow Y ends while a one-way stall of the connection carrying dataflow X from a holds a's writer for X (its payload queue full behind a full socket); Y uses the other connection, so it must end `Ok` and exact on a and on b while the stall holds, and X after the heal; the stall heals 5 s before the silence timeout at the latest. And the liveness rule itself: the one connection between a and b stops delivering, both ways or one way, with no membership report, and is held past the silence timeout (30 s); nothing between a and b may end before it, and within the timeout plus 10 s every node that reads nothing on it must fail its dataflows between a and b, reporting the silence ("no bytes read"), while a node that still reads fails or ends `Ok` with exact output; the dataflows on other node pairs must be exact, and a new dataflow between a and b must then be exact on a new connection.
 - `shared_graceful_exit`: a node that exits after `Ok` while its peers still run the dataflow.
 - `fault_campaign`: the randomized campaign below.
 - `relay`, `harness_control`: the harness's own parts, including a shutdown that must fail when a node hangs or crashes at exit.

@@ -53,6 +53,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc as tokio_mpsc;
 
 #[cfg(feature = "transport")]
+use crate::communication::cluster_transport::PeerChannelReceiver;
+#[cfg(feature = "transport")]
 use crate::communication::codec::{Codec, CodecError, ExchangeData};
 #[cfg(feature = "transport")]
 use crate::communication::peer_link::{
@@ -716,7 +718,7 @@ pub(crate) fn decode_progress_frame<T: Timestamp + ExchangeData>(
 #[cfg(feature = "transport")]
 #[allow(clippy::too_many_arguments)]
 async fn progress_recv_bridge<T: Timestamp + ExchangeData>(
-    mut rx: tokio_mpsc::Receiver<Vec<u8>>,
+    mut rx: PeerChannelReceiver,
     buffer: Arc<Mutex<SharedBuffer<T>>>,
     wake_handle: WakeHandle,
     cancel: tokio_util::sync::CancellationToken,
@@ -900,7 +902,7 @@ async fn progress_recv_bridge<T: Timestamp + ExchangeData>(
 /// arrive on it; the first other frame is reported as a protocol violation.
 #[cfg(feature = "transport")]
 async fn watch_after_end_of_stream<T: Timestamp + ExchangeData>(
-    rx: &mut tokio_mpsc::Receiver<Vec<u8>>,
+    rx: &mut PeerChannelReceiver,
     cancel: &tokio_util::sync::CancellationToken,
     peer_id: &str,
     channel_id: u64,
@@ -1077,7 +1079,7 @@ impl Drop for NetworkProgressHandles {
 pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
     mut local_channels: Vec<WorkerProgressChannels<T>>,
     outboxes: &HashMap<String, PeerOutbox>,
-    mut receivers: HashMap<String, HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>>,
+    mut receivers: crate::communication::cluster_transport::PeerReceivers,
     dataflow_id: DataflowId,
     local_worker_range: (usize, usize),
     remote_peers: &[(String, usize, usize)],
@@ -1583,7 +1585,7 @@ mod tests {
     ) {
         let (events, events_rx) = tokio_mpsc::unbounded_channel();
         let handle = tokio::spawn(progress_recv_bridge::<u64>(
-            rx,
+            rx.into(),
             Arc::clone(shared),
             WakeHandle::new(),
             cancel.clone(),
@@ -1834,7 +1836,7 @@ mod tests {
         lane_close.cancel();
         let (events, _events_rx) = tokio_mpsc::unbounded_channel();
         let handle = tokio::spawn(progress_recv_bridge::<u64>(
-            rx,
+            rx.into(),
             Arc::clone(&shared),
             WakeHandle::new(),
             cancel.clone(),
@@ -1879,7 +1881,7 @@ mod tests {
         let (events, mut events_rx) = tokio_mpsc::unbounded_channel::<LifecycleEvent>();
 
         let handle = tokio::spawn(progress_recv_bridge::<u64>(
-            rx,
+            rx.into(),
             Arc::clone(&shared),
             wake.clone(),
             cancel.clone(),
@@ -2217,7 +2219,7 @@ mod tests {
         let (a_channels, _handles_a) = create_network_progress_channels::<u64>(
             a_worker_channels,
             &outboxes_a,
-            recv_a,
+            crate::communication::cluster_transport::peer_receivers(recv_a),
             df_id,
             (0, 2),
             &[("node-b".to_string(), 2, 4)],
@@ -2243,7 +2245,7 @@ mod tests {
         let (b_channels, _handles_b) = create_network_progress_channels::<u64>(
             b_worker_channels,
             &outboxes_b,
-            recv_b,
+            crate::communication::cluster_transport::peer_receivers(recv_b),
             df_id,
             (2, 4),
             &[("node-a".to_string(), 0, 2)],
@@ -2331,7 +2333,7 @@ mod tests {
                 "node-b".to_string(),
                 HashMap::from([(progress_channel_id(1, 0, 2).unwrap(), {
                     let (_tx, rx) = tokio_mpsc::channel(1);
-                    rx
+                    rx.into()
                 })]),
             )]),
             DataflowId::new(),

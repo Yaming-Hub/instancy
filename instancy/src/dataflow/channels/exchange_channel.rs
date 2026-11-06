@@ -1328,10 +1328,7 @@ pub(crate) struct NetworkMaterializerParams {
     pub local_node_id: String,
     pub transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
     /// Pre-extracted receivers for this specific exchange edge.
-    pub receivers: std::collections::HashMap<
-        String,
-        std::collections::HashMap<u64, tokio::sync::mpsc::Receiver<Vec<u8>>>,
-    >,
+    pub receivers: crate::communication::cluster_transport::PeerReceivers,
     pub capacity: usize,
     pub num_workers: usize,
     pub edge_index: usize,
@@ -1487,7 +1484,7 @@ where
         params: NetworkMaterializerParams,
     ) -> Result<Vec<super::super::schedulable::ChannelFactory>> {
         let materializer = Arc::new(Mutex::new(
-            super::network::NetworkEdgeMaterializer::<T, D>::new(
+            super::network::NetworkEdgeMaterializer::<T, D>::with_receivers(
                 params.dataflow_id,
                 params.topology,
                 params.local_node_id,
@@ -1574,7 +1571,7 @@ where
         params: NetworkMaterializerParams,
     ) -> Result<Vec<super::super::schedulable::ChannelFactory>> {
         let materializer = Arc::new(Mutex::new(
-            super::network::NetworkEdgeMaterializer::<T, D>::new(
+            super::network::NetworkEdgeMaterializer::<T, D>::with_receivers(
                 params.dataflow_id,
                 params.topology,
                 params.local_node_id,

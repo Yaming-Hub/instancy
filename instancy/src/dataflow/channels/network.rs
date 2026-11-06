@@ -684,7 +684,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Drop for NetworkPush<T, D> {
 /// observe channel closure.
 #[cfg(feature = "transport")]
 async fn data_recv_bridge(
-    mut rx: tokio_mpsc::Receiver<Vec<u8>>,
+    mut rx: crate::communication::cluster_transport::PeerChannelReceiver,
     tx: std::sync::mpsc::Sender<Vec<u8>>,
     wake_handle: WakeHandle,
     monitor: Option<InboundMonitor>,
@@ -1166,9 +1166,12 @@ pub struct NetworkEdgeMaterializer<T: Timestamp + ExchangeData, D: ExchangeData>
     /// Unified transport (dedicated or shared).
     transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
 
-    /// Demuxer channel receivers for remote pull endpoints.
-    /// Key: (source_worker, target_worker) → `tokio::mpsc::Receiver<Vec<u8>>`
-    demux_receivers: std::collections::HashMap<(usize, usize), tokio_mpsc::Receiver<Vec<u8>>>,
+    /// Demuxer channel receivers for remote pull endpoints, by
+    /// (source_worker, target_worker).
+    demux_receivers: std::collections::HashMap<
+        (usize, usize),
+        crate::communication::cluster_transport::PeerChannelReceiver,
+    >,
 
     /// Local channels for same-node pairs: [src][dst]
     local_push: Vec<Vec<Option<BoundedPush<T, D, ()>>>>,
@@ -1220,10 +1223,37 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
         topology: ClusterTopology,
         local_node_id: impl Into<String>,
         transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
-        mut receivers: std::collections::HashMap<
+        receivers: std::collections::HashMap<
             String,
             std::collections::HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>,
         >,
+        capacity: usize,
+        edge_index: usize,
+        wake_handles: Vec<WakeHandle>,
+        runtime_handle: tokio::runtime::Handle,
+    ) -> Result<Self> {
+        Self::with_receivers(
+            dataflow_id,
+            topology,
+            local_node_id,
+            transport,
+            crate::communication::cluster_transport::peer_receivers(receivers),
+            capacity,
+            edge_index,
+            wake_handles,
+            runtime_handle,
+        )
+    }
+
+    /// [`Self::new`] with receivers of either transport mode (bounded in
+    /// Dedicated mode, unbounded in Shared mode).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_receivers(
+        dataflow_id: DataflowId,
+        topology: ClusterTopology,
+        local_node_id: impl Into<String>,
+        transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
+        mut receivers: crate::communication::cluster_transport::PeerReceivers,
         capacity: usize,
         edge_index: usize,
         wake_handles: Vec<WakeHandle>,
@@ -2846,7 +2876,7 @@ mod tests {
                     decode_envelope::<u64, u64, _, _>(&u64::codec(), &u64::codec(), bytes).is_ok()
                 },
             };
-            data_recv_bridge(rx, std_tx, WakeHandle::new(), Some(monitor)).await;
+            data_recv_bridge(rx.into(), std_tx, WakeHandle::new(), Some(monitor)).await;
             let mut seen = Vec::new();
             while let Ok(LifecycleEvent::Link { event, .. }) = events.try_recv() {
                 seen.push(event);

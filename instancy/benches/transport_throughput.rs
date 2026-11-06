@@ -42,7 +42,9 @@ fn make_frame(dataflow_id: DataflowId, payload: &[u8]) -> Frame {
 fn shared_config(num_connections: usize) -> SharedConnectionConfig {
     SharedConnectionConfig {
         connections: num_connections,
-        probe_interval: Duration::from_secs(3600), // disable probing during bench
+        // No probing, and so no liveness rule, during the bench.
+        probe_interval: Duration::from_secs(3600),
+        silence_timeout: None,
         rtt_ema_alpha: 0.2,
         ..SharedConnectionConfig::default()
     }

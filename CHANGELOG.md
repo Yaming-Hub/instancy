@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Connection liveness (Shared mode)
+
+Implements [`docs/design/connection-liveness.md`](docs/design/connection-liveness.md)
+(decisions R54–R59).
+
+- **Fixed: a pooled connection that stops delivering no longer hangs its
+  dataflows.** A partition, a frozen peer, a firewall that dropped the
+  connection's state, or a half-open TCP connection used to leave the
+  dataflows on that connection waiting forever. Each node now sends a small
+  probe on every pooled connection every `probe_interval` (1 s by default),
+  and a connection that delivers no bytes for the new
+  `SharedConnectionConfig::silence_timeout` (30 s by default) fails like a
+  read error, with `TransportError::ConnectionSilent`. A writer that has had
+  bytes waiting and written none for that long fails its connection with
+  `TransportError::WriteStalled`. Exactly the dataflows using the connection
+  fail, on both nodes; no other dataflow is affected, no node is reported
+  leaving, and the next registration replaces the connection. Both rules
+  count bytes, not frames, so a large frame on a slow link is not failed.
+  `silence_timeout: None` turns the rule off; `silence_timeout` must be at
+  least 3 × `probe_interval`.
+- **Fixed: a stuck connection no longer holds up the others.** Each
+  `SharedPeerManager` used one task to number and route every dataflow's
+  frames to the peer, so a connection whose writer was stuck stopped every
+  dataflow to that peer, handshakes and `Cancel`s included. Frames now go
+  straight to their dataflow's connection, numbered as they are queued, and
+  each connection's writer sends control frames first.
+- **Fixed: a dataflow can no longer end `Ok` on one node and hang on the
+  other.** Teardown used to give up handing its last frames (goodbye,
+  acknowledgements) to a stalled transport after the handshake timeout and
+  drop them, so the peer waited forever. A frame queued on its connection is
+  now written even once its dataflow unregisters, and Shared-mode teardown
+  waits for its frames with no fixed deadline; the liveness rule bounds the
+  wait.
+- **Fixed: the documentation of `RuntimeEvent::TransportDegraded`.** It is
+  emitted when one pooled connection fails, which the pool recovers from; it
+  used to advise restarting the runtime, which would fail every running
+  dataflow. It needs no action.
+- **Breaking:** `SharedPeerManager::register_dataflow` and
+  `SharedTransportSession::take_receivers` return unbounded receivers
+  (`tokio::sync::mpsc::UnboundedReceiver`): a connection's reader never waits
+  for a consumer, which would hold up every dataflow on the connection and
+  make it look silent. Their `channel_capacity` arguments must still be at
+  least 1 and are otherwise unused. Memory stays unbounded on the receiving
+  node, as it already was one step later; cross-node backpressure is still
+  to come.
+- **Breaking:** `SharedConnectionConfig` has a new public field,
+  `silence_timeout`, and `TransportError` has new variants,
+  `ConnectionSilent` and `WriteStalled`.
+- **Changed:** a cluster dataflow that fails because its link to a peer
+  ended now names the connection's error (for example "no bytes read from
+  the pooled connection for 30s", or a reset) rather than "connection closed
+  before end of stream". Only the error text changes.
+- **Changed:** `DataframeSender::try_send` returns `Full` when its
+  connection's queue (256 frames) is full, rather than a queue shared by every
+  dataflow to the peer. `SharedPeerManager::unregister_dataflow` no longer
+  drops the dataflow's frames already queued on its connection.
+
 ### SPSC wake
 
 - **Fixed: an SPSC consumer with a wake handle wakes a producer it unblocks.**
