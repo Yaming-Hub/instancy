@@ -65,6 +65,18 @@ Implements [`docs/design/connection-liveness.md`](docs/design/connection-livenes
   connection's queue (256 frames) is full, rather than a queue shared by every
   dataflow to the peer. `SharedPeerManager::unregister_dataflow` no longer
   drops the dataflow's frames already queued on its connection.
+- **Fixed: a frame sent on a failed pooled connection is no longer reported
+  as sent.** `DataframeSender::send` and `try_send` returned `Ok` and dropped
+  the frame; they now return it (`try_send`: `Closed`), as Dedicated mode
+  does. A worker sending records over a failed connection therefore waits
+  for the failure to be handled, and fails, instead of finishing as if its
+  records had reached the peer.
+- **Fixed: a control signal sent over a closed link no longer stops its
+  worker for good.** A watermark or error that an exchange sends to a peer
+  whose connection is gone was refused with `Backpressure` forever, and the
+  exchange retries control signals until they are taken. It is now dropped
+  once the failure is reported (it carries no records); the coordinator
+  decides as for any failed send. Both transport modes.
 
 ### SPSC wake
 

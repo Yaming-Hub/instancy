@@ -689,15 +689,16 @@ enum Enqueued {
     Admitted,
     /// The queue is full (only when not waiting): no number was taken.
     Full(Frame),
-    /// Dropped: the registration ended, or its connection failed and the
-    /// dataflow was told.
+    /// Dropped: the registration ended (a late frame).
     Dropped,
+    /// Refused: the lane's connection failed (the dataflow was told).
+    Failed(Frame),
     /// Never sendable (a reserved channel, or too large): reported to the
     /// dataflow, and no number was taken.
     Rejected,
-    /// The connection's writer is gone, so the connection failed: the frame
-    /// is lost (see [`Lane::writer_gone`]).
-    WriterGone,
+    /// Refused: the connection's writer is gone, so the connection failed
+    /// (see [`Lane::writer_gone`]).
+    WriterGone(Frame),
     /// The manager was released.
     Released(Frame),
 }
@@ -765,7 +766,8 @@ impl Lane {
     fn ended(state: &LaneState, frame: Frame) -> Enqueued {
         match state.end {
             Some(LaneEnd::Released) => Enqueued::Released(frame),
-            _ => Enqueued::Dropped,
+            Some(LaneEnd::Failed) => Enqueued::Failed(frame),
+            Some(LaneEnd::Ended) | None => Enqueued::Dropped,
         }
     }
 
@@ -798,7 +800,7 @@ impl Lane {
                 Enqueued::Admitted
             }
             Err(tokio_mpsc::error::TrySendError::Full(())) => Enqueued::Full(frame),
-            Err(tokio_mpsc::error::TrySendError::Closed(())) => Enqueued::WriterGone,
+            Err(tokio_mpsc::error::TrySendError::Closed(())) => Enqueued::WriterGone(frame),
         }
     }
 
@@ -824,7 +826,7 @@ impl Lane {
         #[cfg(all(test, target_os = "linux", instancy_shuttle))]
         shuttle::thread::yield_now();
         let Ok(permit) = queue.reserve().await else {
-            return Enqueued::WriterGone;
+            return Enqueued::WriterGone(frame);
         };
         let mut state = self.lock();
         if state.queue.is_none() {
@@ -2557,9 +2559,10 @@ impl SharedTransportSession {
 /// [`SharedPeerManager::dataflow_sender`]).
 ///
 /// It queues each frame straight on the registration's pinned connection,
-/// numbering it as it is queued. A frame it sends after the registration
-/// has ended, or after its connection failed (the dataflow is told), is
-/// dropped, never numbered into another registration's lane.
+/// numbering it as it is queued. A frame it sends after its connection
+/// failed (the dataflow is told) is refused, never reported as sent; one it
+/// sends after the registration ended is dropped as late. Neither is
+/// numbered into another registration's lane.
 #[derive(Clone)]
 pub struct DataframeSender {
     lane: Arc<Lane>,
@@ -2575,17 +2578,18 @@ impl DataframeSender {
     ///
     /// # Errors
     ///
-    /// Returns the frame if the manager was released.
+    /// Returns the frame if the dataflow's connection failed, or the manager
+    /// was released: the frame will never be written.
     pub async fn send(&self, mut frame: Frame) -> Result<(), tokio_mpsc::error::SendError<Frame>> {
         frame.dataflow_id = self.lane.dataflow_id;
         match self.lane.enqueue(frame).await {
             // `enqueue` waits for room, so never finds the queue full.
-            Enqueued::Released(frame) | Enqueued::Full(frame) => {
+            Enqueued::Released(frame) | Enqueued::Full(frame) | Enqueued::Failed(frame) => {
                 Err(tokio_mpsc::error::SendError(frame))
             }
-            Enqueued::WriterGone => {
+            Enqueued::WriterGone(frame) => {
                 self.lane.writer_gone();
-                Ok(())
+                Err(tokio_mpsc::error::SendError(frame))
             }
             Enqueued::Admitted | Enqueued::Dropped | Enqueued::Rejected => Ok(()),
         }
@@ -2598,15 +2602,18 @@ impl DataframeSender {
     /// [`TrySendError::Full`](tokio_mpsc::error::TrySendError::Full) if the
     /// connection's queue is full (no sequence number was taken; try again
     /// later), [`TrySendError::Closed`](tokio_mpsc::error::TrySendError::Closed)
-    /// if the manager was released.
+    /// if the dataflow's connection failed or the manager was released (the
+    /// frame will never be written).
     pub fn try_send(&self, mut frame: Frame) -> Result<(), tokio_mpsc::error::TrySendError<Frame>> {
         frame.dataflow_id = self.lane.dataflow_id;
         match self.lane.try_enqueue(frame) {
             Enqueued::Full(frame) => Err(tokio_mpsc::error::TrySendError::Full(frame)),
-            Enqueued::Released(frame) => Err(tokio_mpsc::error::TrySendError::Closed(frame)),
-            Enqueued::WriterGone => {
+            Enqueued::Released(frame) | Enqueued::Failed(frame) => {
+                Err(tokio_mpsc::error::TrySendError::Closed(frame))
+            }
+            Enqueued::WriterGone(frame) => {
                 self.lane.writer_gone();
-                Ok(())
+                Err(tokio_mpsc::error::TrySendError::Closed(frame))
             }
             Enqueued::Admitted | Enqueued::Dropped | Enqueued::Rejected => Ok(()),
         }
@@ -3263,15 +3270,19 @@ mod tests {
         assert_eq!(recv(rb.get_mut(&1).unwrap()).await, None);
         assert_eq!(a.connection_count(), 0);
         // The connection is gone both ways: the next write fails, and is
-        // reported (its frame is lost) ...
-        send(&a, df, 1, b"b".to_vec()).await;
+        // reported (its frame is lost; it may also be refused at once) ...
+        let sender = a.dataflow_sender(&df).unwrap();
+        let _ = sender.send(frame(df, 1, b"b".to_vec())).await;
         assert!(matches!(
             next_event(&mut ea).await,
             PeerIoEvent::WriteFailed(_)
         ));
-        // ... once: frames sent now go nowhere, and the dataflow already
-        // failed.
-        send(&a, df, 1, b"c".to_vec()).await;
+        // ... once, and later frames are refused, never reported as sent.
+        assert!(matches!(
+            sender.try_send(frame(df, 1, b"c".to_vec())),
+            Err(tokio_mpsc::error::TrySendError::Closed(_))
+        ));
+        assert!(sender.send(frame(df, 1, b"d".to_vec())).await.is_err());
         assert!(
             event_within(&mut ea, Duration::from_millis(100))
                 .await
@@ -4102,8 +4113,14 @@ mod tests {
                 "{details:?}"
             );
         }
-        // Frames sent now go nowhere: the dataflow was told its lane failed.
-        send(&a, df, 1, b"lost".to_vec()).await;
+        // Frames sent now are refused, never reported as sent: the dataflow
+        // was told its lane failed.
+        let sender = a.dataflow_sender(&df).unwrap();
+        assert!(matches!(
+            sender.try_send(frame(df, 1, b"lost".to_vec())),
+            Err(tokio_mpsc::error::TrySendError::Closed(_))
+        ));
+        assert!(sender.send(frame(df, 1, b"lost".to_vec())).await.is_err());
         assert!(matches!(
             event_matching(&mut ea, P, |_| true).await,
             None | Some(PeerIoEvent::WriteFailed(_))

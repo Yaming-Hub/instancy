@@ -817,8 +817,11 @@ const Y_ENDS_WITHIN: Duration = Duration::from_secs(5);
 const X_RECORDS_PER_FEED: usize = 4096;
 
 /// How long X may stream through the one-way stall before a's writer for X
-/// must be blocked.
-const BLOCK_DEADLINE: Duration = Duration::from_secs(12);
+/// must be blocked. The stall must heal `SILENCE_MARGIN` before the silence
+/// timeout (30 s), after the block settles (`BLOCK_SETTLE`) and Y ends
+/// (`Y_ENDS_WITHIN`): about 19 s after the stall. Filling the queue takes
+/// about 34 rounds, 4 s on an idle machine and 3 times that under load.
+const BLOCK_DEADLINE: Duration = Duration::from_secs(16);
 
 /// Rounds of X fed after its connection's payload queue on a was first seen
 /// full: X's operators then push against the full queue.

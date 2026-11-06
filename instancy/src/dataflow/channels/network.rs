@@ -458,22 +458,35 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkPush<T, D> {
                 // may have crashed, or a local write failed. The coordinator
                 // finds out which and cancels the dataflow with that reason;
                 // until then the operator waits, as for a full queue.
-                Some(outbox) => {
+                Some(outbox) if is_data => {
                     // Set before reporting: the coordinator decides whether a
                     // drain can still complete from it.
                     outbox.link().note_push_blocked();
-                    if !self
-                        .link_failure_reported
-                        .swap(true, std::sync::atomic::Ordering::Relaxed)
-                    {
-                        outbox.report(crate::communication::peer_link::LinkEvent::OutboundFailed(
-                            crate::communication::peer_link::LinkFailure::SendFailed,
-                        ));
-                    }
+                    self.report_link_failure(outbox);
                     Err(Error::Backpressure)
+                }
+                // A control signal (a watermark, an error) carries no records,
+                // and its sender retries it until it is taken, so waiting would
+                // stop the worker for good. The failure is reported, and the
+                // coordinator decides as above.
+                Some(outbox) => {
+                    self.report_link_failure(outbox);
+                    Ok(())
                 }
                 None => Err(Error::ChannelClosed),
             },
+        }
+    }
+
+    /// Tell the coordinator, once, that a send to the peer failed.
+    fn report_link_failure(&self, outbox: &crate::communication::peer_link::PeerOutbox) {
+        if !self
+            .link_failure_reported
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            outbox.report(crate::communication::peer_link::LinkEvent::OutboundFailed(
+                crate::communication::peer_link::LinkFailure::SendFailed,
+            ));
         }
     }
 
@@ -2596,6 +2609,37 @@ mod tests {
                 Err(Error::Communication(_))
             ));
             push.push(Envelope::watermark(2)).unwrap();
+        }
+
+        /// A control signal to a closed link is dropped once the failure is
+        /// reported: its sender retries until it is taken, so `Backpressure`
+        /// would stop the worker for good. Records still wait, marking the
+        /// push blocked; nothing marks it for a control signal.
+        #[tokio::test]
+        async fn control_signal_to_a_closed_link_is_dropped_after_the_report() {
+            let (outbox, mut events, _sink) = monitored_outbox("node-b");
+            let (tx, rx) = tokio_mpsc::channel(4);
+            drop(rx);
+            let mut push = push_to(&outbox, tx);
+            push.push(Envelope::watermark(1)).unwrap();
+            push.push(Envelope::error("op", "failed")).unwrap();
+            push.push(Envelope::data(2, Vec::new())).unwrap();
+            assert!(!outbox.link().push_blocked());
+            assert!(matches!(
+                events.try_recv(),
+                Ok(LifecycleEvent::Link {
+                    event: LinkEvent::OutboundFailed(
+                        crate::communication::peer_link::LinkFailure::SendFailed
+                    ),
+                    ..
+                })
+            ));
+            assert!(matches!(
+                push.push(Envelope::data(3, vec![3])),
+                Err(Error::Backpressure)
+            ));
+            assert!(outbox.link().push_blocked());
+            assert!(events.try_recv().is_err(), "reported once");
         }
 
         fn materializers_with_monitoring(
