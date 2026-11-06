@@ -295,11 +295,13 @@ when the link retires before its push returns.
    connection that accepts no frames, which the liveness rule fails within
    about `silence_timeout` (a dead verdict on either node, or the writer
    stall rule here), and the rest of the lane is then dropped with the
-   dataflow told. A stall on another connection to the peer never holds it
-   up. Once every local worker has finished, teardown also lets the
-   inbound data bridges deliver or report whatever is already queued before
-   they exit (bounded by `handshake_timeout`). A frame in a connection's
-   queue is not yet written, so when the dataflow
+   dataflow told. With `silence_timeout: None` nothing bounds that wait. A
+   peer reported as left (`report_node_leave`), before or during the wait,
+   needs nothing more and is not waited for. A stall on another connection
+   to the peer never holds it up. Once every local worker has finished,
+   teardown also lets the inbound data bridges deliver or report whatever
+   is already queued before they exit (bounded by `handshake_timeout`). A
+   frame in a connection's queue is not yet written, so when the dataflow
    holds the last reference to its shared managers (per-job `Mode::Shared`),
    teardown then closes them (`SharedPeerManager::close`, bounded by
    `handshake_timeout`), which waits until their writers have written what is

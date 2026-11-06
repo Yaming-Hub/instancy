@@ -38,8 +38,9 @@ Implements [`docs/design/connection-liveness.md`](docs/design/connection-livenes
   acknowledgements) to a stalled transport after the handshake timeout and
   drop them, so the peer waited forever. A frame queued on its connection is
   now written even once its dataflow unregisters, and Shared-mode teardown
-  waits for its frames with no fixed deadline; the liveness rule bounds the
-  wait.
+  waits for its frames with no fixed deadline. The liveness rule bounds the
+  wait (with `silence_timeout: None` nothing does), and a peer reported as
+  left (`report_node_leave`) is not waited for.
 - **Fixed: the documentation of `RuntimeEvent::TransportDegraded`.** It is
   emitted when one pooled connection fails, which the pool recovers from; it
   used to advise restarting the runtime, which would fail every running
@@ -58,7 +59,8 @@ Implements [`docs/design/connection-liveness.md`](docs/design/connection-livenes
 - **Changed:** a cluster dataflow that fails because its link to a peer
   ended now names the connection's error (for example "no bytes read from
   the pooled connection for 30s", or a reset) rather than "connection closed
-  before end of stream". Only the error text changes.
+  before end of stream", when its frames from the peer arrive on that
+  connection. Only the error text changes.
 - **Changed:** `DataframeSender::try_send` returns `Full` when its
   connection's queue (256 frames) is full, rather than a queue shared by every
   dataflow to the peer. `SharedPeerManager::unregister_dataflow` no longer

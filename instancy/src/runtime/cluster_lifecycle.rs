@@ -1431,6 +1431,32 @@ async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
     }
 }
 
+/// Wait until every outbox forwarder has handed its lane to its pooled
+/// connection (Shared mode, graceful teardown), with no fixed deadline. A
+/// peer reported as left (`RuntimeHandle::report_node_leave`), before or
+/// during the wait, needs nothing more from us: its forwarder is aborted
+/// instead of waited for.
+async fn await_forwarders(
+    forwarders: HashMap<String, tokio::task::JoinHandle<()>>,
+    peers: &super::PeerRegistry,
+) {
+    for (peer, mut forwarder) in forwarders {
+        loop {
+            let reported = peers.down_reported();
+            tokio::pin!(reported);
+            reported.as_mut().enable();
+            if peers.is_down(&peer) {
+                forwarder.abort();
+                break;
+            }
+            tokio::select! {
+                _ = &mut forwarder => break,
+                () = &mut reported => {}
+            }
+        }
+    }
+}
+
 /// Reason text sent to peers with `Cancel`; peers classify it (a forwarded
 /// failure is itself a failure, so they never drain into a partial result).
 fn cancel_broadcast_reason(dataflow_cancel: &CancellationToken) -> String {
@@ -1856,12 +1882,11 @@ impl ClusterLifecycle {
             // there is written even once we unregister (R58), so this waits
             // with no fixed deadline: only on a connection that accepts no
             // frames, which the liveness rule fails (a dead verdict on either
-            // node, or the stall rule here) and which then refuses the rest.
-            // Every local worker has finished (graceful), so the forwarders
-            // hold the only outboxes, and the lanes end.
-            for forwarder in forwarders.into_values() {
-                let _ = forwarder.await;
-            }
+            // node, or the stall rule here) and which then refuses the rest,
+            // or until the peer is reported as left. Every local worker has
+            // finished (graceful), so the forwarders hold the only outboxes,
+            // and the lanes end.
+            await_forwarders(forwarders, &self.peer_registry).await;
         } else {
             // Dedicated mode: as above, bounded, one task per peer, all
             // bounded together, so an unreachable peer does not hold up the
@@ -1943,6 +1968,53 @@ impl ClusterLifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Shared teardown waits for every outbox forwarder with no deadline,
+    /// but not for one to a peer reported as left, before or during the
+    /// wait: that peer needs nothing more, and its connection may never
+    /// accept the frames.
+    #[tokio::test(start_paused = true)]
+    async fn teardown_stops_waiting_for_a_peer_reported_as_left() {
+        let stuck = || tokio::spawn(std::future::pending::<()>());
+        for reported_before in [true, false] {
+            let peers = Arc::new(super::super::PeerRegistry::new());
+            if reported_before {
+                peers.report_peer_down("b");
+            }
+            let (finish_c, c_finishes) = tokio::sync::oneshot::channel::<()>();
+            let c = tokio::spawn(async move {
+                let _ = c_finishes.await;
+            });
+            let b = stuck();
+            let b_aborted = b.abort_handle();
+            let forwarders = HashMap::from([("b".to_string(), b), ("c".to_string(), c)]);
+            let waiting = {
+                let peers = Arc::clone(&peers);
+                tokio::spawn(async move { await_forwarders(forwarders, &peers).await })
+            };
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            assert!(
+                !waiting.is_finished(),
+                "returned before c's forwarder finished (reported before: {reported_before})"
+            );
+            finish_c.send(()).unwrap();
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            assert_eq!(
+                waiting.is_finished(),
+                reported_before,
+                "b's forwarder never finishes: only its report may end the wait"
+            );
+            if !reported_before {
+                peers.report_peer_down("b");
+            }
+            tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .expect("the wait did not end once b was reported as left")
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(b_aborted.is_finished(), "b's forwarder was not aborted");
+        }
+    }
 
     fn machine(
         workers: usize,

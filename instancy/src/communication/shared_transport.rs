@@ -456,7 +456,8 @@ impl AsyncRead for TimedReader {
     }
 }
 
-/// A connection's write half that records every write taking bytes.
+/// A connection's write half that records every write taking bytes, and
+/// every completed flush (a buffering stream may move its bytes only then).
 struct TimedWriter {
     inner: DynWriter,
     liveness: Arc<ConnLiveness>,
@@ -476,7 +477,11 @@ impl AsyncWrite for TimedWriter {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let polled = Pin::new(&mut self.inner).poll_flush(cx);
+        if matches!(polled, Poll::Ready(Ok(()))) {
+            self.liveness.wrote();
+        }
+        polled
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -515,7 +520,9 @@ impl AsyncWrite for TimedWriter {
 ///   delivered no bytes for
 ///   [`silence_timeout`](SharedConnectionConfig::silence_timeout), or its
 ///   writer has written nothing for that long while bytes waited, it fails
-///   and exactly the dataflows using it fail. A peer node that leaves is the
+///   and exactly the dataflows using it fail. Progress is observed at the
+///   halves the factory returns: bytes read, bytes a write accepted, and
+///   completed flushes. A peer node that leaves is the
 ///   application's to report
 ///   ([`RuntimeHandle::report_node_leave`](crate::RuntimeHandle::report_node_leave)).
 ///   With `silence_timeout: None`, a stream that silently stops delivering
@@ -1518,16 +1525,24 @@ impl Inner {
     /// The liveness verdicts (see the module documentation), at one probe
     /// tick: a connection whose open reader has read nothing for `timeout`
     /// fails like a read error, and one whose writer has had bytes waiting
-    /// and written none for `timeout` fails like a write error.
-    fn judge_liveness(self: &Arc<Self>, timeout: Duration) {
+    /// and written none for `timeout` fails like a write error. Without a
+    /// timeout (the rule disabled) it only forgets the connections whose
+    /// tasks have ended.
+    fn judge_liveness(self: &Arc<Self>, timeout: Option<Duration>) {
         let watched: Vec<(usize, Arc<ConnLiveness>)> = {
             let mut state = self.state();
             state.liveness.retain(|_, liveness| liveness.tasks_open());
+            if timeout.is_none() {
+                return;
+            }
             state
                 .liveness
                 .iter()
                 .map(|(&id, liveness)| (id, Arc::clone(liveness)))
                 .collect()
+        };
+        let Some(timeout) = timeout else {
+            return;
         };
         for (conn_id, liveness) in watched {
             if liveness.kill.is_cancelled() {
@@ -1878,9 +1893,7 @@ async fn probe_loop(inner: Arc<Inner>) {
             // Best effort: a full queue already has bytes waiting to flow.
             let _ = queue.try_send(Outgoing { seq: None, frame });
         }
-        if let Some(timeout) = inner.config.silence_timeout {
-            inner.judge_liveness(timeout);
-        }
+        inner.judge_liveness(inner.config.silence_timeout);
     }
 }
 
@@ -4212,6 +4225,50 @@ mod tests {
         assert_eq!(a.connection_count(), 0);
     }
 
+    /// R56 also holds out of the pool: a connection the peer closed, whose
+    /// last dataflow left with frames still queued (written even so, R58),
+    /// is killed and reported once its writer has written nothing for T.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_writer_out_of_the_pool_is_still_failed() {
+        let (ours, theirs) = duplex(64 * 1024);
+        let (health, mut watch) = tokio::sync::broadcast::channel(16);
+        let manager = SharedPeerManager::new(
+            "peer".into(),
+            live(1),
+            Pre::factory([ours]),
+            &tokio::runtime::Handle::current(),
+            health,
+        )
+        .unwrap();
+        let df = DataflowId::new();
+        let _registered = manager.register_dataflow(df, &[1], 4).await.unwrap();
+        let sender = manager.dataflow_sender(&df).unwrap();
+        // The peer reads nothing: the writer blocks with frames queued.
+        while sender.try_send(frame(df, 1, vec![0; 4096])).is_ok() {
+            tokio::task::yield_now().await;
+        }
+        drop(sender);
+        let (_peer_read, mut peer_write) = tokio::io::split(theirs);
+        peer_write.shutdown().await.unwrap();
+        tokio::task::yield_now().await;
+        manager.unregister_dataflow(&df).await;
+        let watched = {
+            let state = manager.inner.state();
+            assert!(state.connections.is_empty(), "still in the pool");
+            state.liveness.values().next().cloned().unwrap()
+        };
+        assert!(watched.tasks_open(), "the writer has frames left");
+        tokio::time::sleep(T + 2 * P).await;
+        assert!(!watched.tasks_open(), "the stuck writer was not stopped");
+        let degraded = degraded(&mut watch);
+        assert!(
+            degraded
+                .iter()
+                .any(|d| d.contains("writing failed") && d.contains("nothing written")),
+            "{degraded:?}"
+        );
+    }
+
     /// Two managers with two connections: dataflow X is pinned to the first
     /// on both nodes and Y to the second, and X's queue on a is full behind a
     /// one-way stall of the first connection from a.
@@ -4351,6 +4408,41 @@ mod tests {
         assert!(ea.try_recv().is_err() && eb.try_recv().is_err());
         assert!(degraded(&mut health_a).is_empty() && degraded(&mut health_b).is_empty());
         assert_eq!((a.connection_count(), b.connection_count()), (1, 1));
+    }
+
+    /// With the rule off, the probe tick still forgets the connections that
+    /// ended: a pool whose connections keep failing and being replaced
+    /// watches no more than it holds.
+    #[tokio::test(start_paused = true)]
+    async fn ended_connections_are_forgotten_with_the_rule_off() {
+        const ROUNDS: usize = 8;
+        let ends: Vec<_> = (0..ROUNDS)
+            .map(|_| {
+                // The far end is gone: each connection fails on its first read.
+                let (ours, _theirs) = duplex(4096);
+                ours
+            })
+            .collect();
+        let manager = SharedPeerManager::new(
+            "peer".into(),
+            SharedConnectionConfig {
+                silence_timeout: None,
+                ..live(1)
+            },
+            Pre::factory(ends),
+            &tokio::runtime::Handle::current(),
+            health_tx(),
+        )
+        .unwrap();
+        for round in 0..ROUNDS {
+            let df = DataflowId::new();
+            let _registered = manager.register_dataflow(df, &[1], 4).await.unwrap();
+            tokio::time::sleep(P).await;
+            assert_eq!(manager.connection_count(), 0, "round {round}");
+            manager.unregister_dataflow(&df).await;
+        }
+        tokio::time::sleep(2 * P).await;
+        assert_eq!(manager.inner.state().liveness.len(), 0);
     }
 
     /// An idle pool, with no dataflow registered, stays alive on its probes;

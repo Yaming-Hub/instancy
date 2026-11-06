@@ -897,6 +897,9 @@ pub(crate) struct PeerRegistry {
     next_id: std::sync::atomic::AtomicU64,
     /// Protected state: peer-to-registration map + set of known-down peers.
     state: Mutex<PeerRegistryState>,
+    /// Woken at every report of a node leaving (see
+    /// [`Self::down_reported`]).
+    down_reported: tokio::sync::Notify,
 }
 
 #[cfg(feature = "transport")]
@@ -927,7 +930,24 @@ impl PeerRegistry {
                 down_peers: std::collections::HashSet::new(),
                 down_order: std::collections::VecDeque::new(),
             }),
+            down_reported: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Whether `peer_node_id` was reported as left (and has not rejoined).
+    pub(crate) fn is_down(&self, peer_node_id: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .down_peers
+            .contains(peer_node_id)
+    }
+
+    /// Notified at every later report of a node leaving. Enable the future
+    /// before checking [`Self::is_down`], so a report in between is not
+    /// missed.
+    pub(crate) fn down_reported(&self) -> tokio::sync::futures::Notified<'_> {
+        self.down_reported.notified()
     }
 
     /// Register a cluster dataflow for all its remote peer nodes.
@@ -1053,6 +1073,8 @@ impl PeerRegistry {
         for handle in &to_cancel {
             handle.cancel_with_reason(reason.clone());
         }
+        // A dataflow tearing down stops waiting to hand frames to the node.
+        self.down_reported.notify_waiters();
 
         cancelled_count
     }

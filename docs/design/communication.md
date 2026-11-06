@@ -424,7 +424,9 @@ frame is written even once its dataflow unregisters. So a dataflow that must
 not lose what it has queued (its end-of-stream markers and acknowledgements,
 or final progress for a peer that is still draining) only waits, before
 unregistering, until its outbox forwarders have handed everything to the
-connection; the wait has no fixed deadline, and the liveness rule bounds it.
+connection; the wait has no fixed deadline. The liveness rule bounds it
+(nothing does with `silence_timeout: None`), and a peer reported as left is
+not waited for.
 See
 [cluster.md §5.5.3](./cluster.md#553-cluster-shutdown-protocol-clean-teardown).
 

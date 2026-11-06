@@ -301,10 +301,6 @@ mod tokio_impl {
             // The wire length includes the frame CRC trailer.
             let wire_len = prefix.len() + frame.payload.len() + CRC_SIZE;
             let header = encode_header(frame, wire_len as u32);
-            let mut crc = crc32fast::Hasher::new();
-            crc.update(&header);
-            crc.update(prefix);
-            crc.update(&frame.payload);
 
             self.writer.write_all(&header).await?;
             self.writer
@@ -312,6 +308,10 @@ mod tokio_impl {
                 .await?;
             self.writer.write_all(prefix).await?;
             self.writer.write_all(&frame.payload).await?;
+            let mut crc = crc32fast::Hasher::new();
+            crc.update(&header);
+            crc.update(prefix);
+            crc.update(&frame.payload);
             self.writer.write_all(&crc.finalize().to_le_bytes()).await?;
             Ok(())
         }
