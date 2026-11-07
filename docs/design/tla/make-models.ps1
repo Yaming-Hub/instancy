@@ -189,6 +189,7 @@ $ctBase = [ordered]@{
     SendOutcome = '"atomic"'; LateAttempt = 'FALSE'
     Detect = '"none"'; StallAbort = 'FALSE'; SharedBridge = 'FALSE'; WQCap = '99'; StuckCap = '1'
     SilenceNodes = '{"a", "b"}'; SilenceConns = '{1, 2}'
+    Notices = '"sync"'; FinishCheck = 'FALSE'
 }
 $ctSafety = @('TypeOK', 'NoLossOk', 'NoCrossRun', 'NoCorruptAccepted', 'NoNeedlessDrop', 'NoSpuriousFail')
 $allFaults = '{"reset", "writeerr", "corrupt"}'
@@ -248,6 +249,11 @@ $ctScenarios = @(
     @{ n = 'ct_silence_sharedbridge'; e = 'deadlock'; flags = '-simulate num=2000000 -depth 150'; d = 'Today''s shared bridge, with bounded writer queues and no writer stall rule, managers kept; b''s input on connection 1 goes silent. a''s bridge holds a frame for its stuck writer on connection 1, and the dataflow on the healthy connection 2 never ends. Found by simulation.'; o = (With $silence @{ Conns = '{1, 2}'; Runs = '{1, 2}'; Concurrent = 'TRUE'; PerJob = 'FALSE'; MaxFaults = '1'; StallAbort = 'FALSE'; SharedBridge = 'TRUE'; WQCap = '1'; SilenceNodes = '{"b"}'; SilenceConns = '{1}' }); inv = $ctSafety + 'NoCollateralFail' }
     @{ n = 'ct_silence_sharedbridge_stall'; e = 'deadlock'; flags = '-simulate num=2000000 -depth 150'; d = 'Today''s shared bridge even with the writer stall rule: the dataflow on the healthy connection finishes while the bridge is stuck, its flush times out, and the bridge later drops its last frames (ack, goodbye) as late. Its peer waits forever. Any bridge stall longer than the flush deadline does this today. Found by simulation.'; o = (With $silence @{ Conns = '{1, 2}'; Runs = '{1, 2}'; Concurrent = 'TRUE'; PerJob = 'FALSE'; MaxFaults = '1'; SharedBridge = 'TRUE'; WQCap = '1'; SilenceNodes = '{"b"}'; SilenceConns = '{1}' }); inv = $ctSafety + 'NoCollateralFail' }
     @{ n = 'ct_silence_wq1'; e = 'pass'; d = 'The proposal with writer queues of one frame: a full queue on the stuck connection holds up only its own lanes, and a flush gives up only when its own connection is stuck.'; o = (With $silence @{ Conns = '{1, 2}'; Runs = '{1, 2}'; Concurrent = 'TRUE'; PerJob = 'FALSE'; MaxFaults = '1'; WQCap = '1' }); inv = $ctSafety + 'NoCollateralFail' }
+
+    # ---- Transport events delivered later, as the code does ----
+    @{ n = 'ct_notice_late'; e = 'violated:NoOkAfterFailedSend'; d = 'Before the coordinator checks the transport: b''s record waits in b''s writer queue, b''s writer fails and loses it, and b''s workers succeed before the failure reaches b''s coordinator, which reads it as a failure after completion: b ends Ok while a fails without b''s record.'; o = @{ Notices = '"async"'; Faults = '{"writeerr"}'; MaxFaults = '1' }; inv = @('TypeOK', 'NoLossOk', 'NoOkAfterFailedSend') }
+    @{ n = 'ct_notice_checked'; e = 'pass'; d = 'Events delivered later, and the coordinator checking the lane as the workers succeed: with one fault of any kind and a requested stop, never Ok over a send the transport knew had failed, nor with lost, crossed or corrupted data.'; o = @{ Notices = '"async"'; FinishCheck = 'TRUE'; Faults = $allFaults; MaxFaults = '1'; MaxStops = '1' }; inv = $ctSafety + 'NoOkAfterFailedSend' }
+    @{ n = 'live_ct_notice'; e = 'pass'; sym = $false; spec = 'LiveSpec'; prop = @('Termination'); d = 'The same, liveness: with events delivered later, every run ends and every connection closes on both nodes.'; o = @{ Notices = '"async"'; FinishCheck = 'TRUE'; Faults = $allFaults; MaxFaults = '1'; MaxStops = '1' } }
 )
 foreach ($s in $ctScenarios) {
     $c = [ordered]@{}; foreach ($k in $ctBase.Keys) { $c[$k] = $ctBase[$k] }

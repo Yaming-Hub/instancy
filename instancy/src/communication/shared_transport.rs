@@ -2618,6 +2618,18 @@ impl DataframeSender {
             Enqueued::Admitted | Enqueued::Dropped | Enqueued::Rejected => Ok(()),
         }
     }
+
+    /// Whether the dataflow's connection failed: frames sent now are
+    /// refused, and frames still queued on it are lost. The transport knows
+    /// at once; the dataflow's connection event follows.
+    pub(crate) fn has_failed(&self) -> bool {
+        let state = self.lane.lock();
+        state.end == Some(LaneEnd::Failed)
+            || state
+                .queue
+                .as_ref()
+                .is_some_and(tokio_mpsc::Sender::is_closed)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3256,6 +3268,7 @@ mod tests {
         send(&b, df, 1, b"z".to_vec()).await;
         assert_eq!(recv(rb.get_mut(&1).unwrap()).await.unwrap(), b"a");
         assert_eq!(recv(ra.get_mut(&1).unwrap()).await.unwrap(), b"z");
+        assert!(!a.dataflow_sender(&df).unwrap().has_failed());
 
         relays[0].abort();
         // Both sides: the inbound side ended.
@@ -3277,6 +3290,7 @@ mod tests {
             next_event(&mut ea).await,
             PeerIoEvent::WriteFailed(_)
         ));
+        assert!(sender.has_failed(), "the transport knows");
         // ... once, and later frames are refused, never reported as sent.
         assert!(matches!(
             sender.try_send(frame(df, 1, b"c".to_vec())),

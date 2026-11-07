@@ -288,6 +288,7 @@ This model opens the lane up.
 | `Termination` | Every run ends and unregisters, and per job every connection closes, on both nodes: no failure leaves a node waiting forever. |
 | `RetryEventuallyOk` | The retry eventually succeeds on both nodes. |
 | `ReuseEventuallyRejected` | A retry that reuses the id is eventually refused on both nodes. |
+| `NoOkAfterFailedSend` | A run whose lane had failed when its workers succeeded does not end `Ok` once its peer ended without its record, unless the peer retired or cancelled (`settle_unsent`'s rule). See [Late transport notices](#late-transport-notices-notices--async). |
 
 ### Switches
 
@@ -392,6 +393,52 @@ scenarios were not rerun for this extension. Existing result rows above retain
 their earlier provenance. No Rust execution, payload-capacity scheduling,
 three-worker behavior or memory-model ordering is proved by these small models.
 
+### Late transport notices (`Notices = "async"`)
+
+Until this extension the model told a run about a transport failure in the
+same step as the failure. The code cannot: the transport marks the lane failed
+at once, but the event reaches the lifecycle coordinator later, through a
+channel and a task. A worker can succeed in between. The coordinator then
+reads the failure as one after completion, and the run ends `Ok` though a send
+failed while its workers ran, which `settle_unsent` is meant to report. The
+synchronous abstraction ruled this interleaving out, so neither the model nor
+the reviews that checked the code against it could see it. A later review
+found one instance (a record sent on a failed pooled connection was accepted
+and dropped); the model, extended, found the general case.
+
+Two switches, both off in every earlier scenario, whose results and state
+counts are unchanged:
+
+| Switch | Values |
+|---|---|
+| `Notices` | `"sync"`: an event reaches the run in the step that causes it (the earlier abstraction); `"async"`: it is queued for the run and a later `Notice` step applies it. |
+| `FinishCheck` | `TRUE`: as the workers succeed, the coordinator asks the transport whether the lane has failed, and if so treats it as a send that failed while they ran. |
+
+`NoOkAfterFailedSend` checks the rule. It covers only a failure the transport
+knew of before the workers succeeded: a lane that fails afterwards is the
+peer's to report, as before.
+
+The model does not tell a record sent on a lane that already failed from one
+queued just before the failure: both are in the outbox when the lane fails,
+and both are dropped. So refusing such sends (ae1729e) changes nothing here;
+`FinishCheck` is what keeps the rule.
+
+Bounds: two nodes, one connection, one run, at most one fault (`ct_notice_late`:
+a write error; the others: any kind, with a requested stop). TLC 2.19
+(rev 5a47802), 6 workers.
+
+| Scenario | Expected | Result |
+|---|---|---|
+| `ct_notice_late` | `NoOkAfterFailedSend` | **Fails as expected** (without the check, on ae1729e and before). b's record waits in b's writer queue; b's writer fails and loses it; b's workers succeed before the failure reaches b's coordinator, which reads it as a failure after completion. b ends `Ok`, and a fails without b's record. |
+| `ct_notice_checked` | pass | **Pass**, 2,011,246 states: with late notices and the coordinator's check, never `Ok` over a send the transport knew had failed, nor with lost, crossed or corrupted data. |
+| `live_ct_notice` | pass | **Pass**, 2,011,246 states: every run ends and every connection closes. |
+
+Every quick `ClusterTransport` scenario was rerun on the extended spec with its
+expected result and, for the passing ones, the same state count. The
+multi-hour scenarios (concurrent, crosswise and silence) were not rerun: the
+switches are off there, and with `Notices = "sync"` the new ghost never
+changes a state.
+
 ### What it shows, and what it does not
 
 **It shows,** for two nodes and these bounds:
@@ -403,7 +450,7 @@ three-worker behavior or memory-model ordering is proved by these small models.
 **It does not show:**
 - **That a failed connection fails *every* run using it.** `NoCollateralFail` is one-way; a run on a failed connection may still succeed when it no longer needed the lost frames, and `NoLossOk` covers the case where it did.
 - **More than two nodes**, or link retirement through a third node (R47's three-node shapes).
-- **The lifecycle machine's soft failures.** A send failure the code settles later (`settle_unsent`) is decided at once here.
+- **The lifecycle machine's soft failures.** A send failure the code settles later (`settle_unsent`) is decided at once here; only the delay in delivering it is modelled (`Notices = "async"`).
 - **Timing.** Linger has no deadline, where the code caps it at 10 s, and the handshake and ready barrier are one step whose timeout fires only when the peer's run already ended.
 - **Bounded id memory.** The model remembers every finished id; PR9 keeps the last 16,384.
 - **Data-channel close sentinels and real progress.** Completion is the abstract "record and progress received"; the progress models cover the rest.

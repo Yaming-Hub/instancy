@@ -77,6 +77,14 @@ Implements [`docs/design/connection-liveness.md`](docs/design/connection-livenes
   exchange retries control signals until they are taken. It is now dropped
   once the failure is reported (it carries no records); the coordinator
   decides as for any failed send. Both transport modes.
+- **Fixed: a send that failed while the workers ran is reported even when
+  its notice arrives late.** The transport knows at once that sending to a
+  peer failed, but the event reaches the dataflow's coordinator later; a
+  worker succeeding in between made the failure look like one after
+  completion, and the node ended `Ok` although a record it had sent was
+  lost (with the writer queue). The coordinator now asks the transport as
+  each worker finishes (decision R60), in both transport modes. Found by
+  extending `ClusterTransport.tla` to deliver transport events late.
 
 ### SPSC wake
 

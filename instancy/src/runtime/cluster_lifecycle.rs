@@ -26,7 +26,7 @@
 //! The decision logic lives in [`LifecycleMachine`], a pure state machine;
 //! [`ClusterLifecycle::run`] executes its actions.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
@@ -1536,6 +1536,9 @@ pub(crate) struct ClusterLifecycle {
     pub(crate) unfinished_announced: bool,
     /// The first local worker error other than a cancellation.
     pub(crate) worker_failure: Option<String>,
+    /// Peers whose failed send was noted before a worker's result (see
+    /// [`Self::note_failed_sends`]).
+    pub(crate) noted_send_failures: HashSet<String>,
     /// The flight recorder: the data loss the machine accepted was dumped
     /// (see [`dump_accepted_loss`]).
     #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
@@ -1659,13 +1662,47 @@ impl ClusterLifecycle {
                 if let Some(failure) = failure {
                     self.worker_failure.get_or_insert(failure);
                 }
-                self.machine.on_event(LifecycleEvent::WorkerFinished {
+                // A send the transport has already failed failed while the
+                // workers ran, though its notice may still be on its way:
+                // the machine learns of it before this result, so a worker
+                // finishing first cannot make it look like a failure after
+                // completion (ClusterTransport.tla, FinishCheck).
+                let mut actions = self.note_failed_sends();
+                actions.extend(self.machine.on_event(LifecycleEvent::WorkerFinished {
                     success,
                     failure: None,
-                })
+                }));
+                actions
             }
             event => self.machine.on_event(event),
         }
+    }
+
+    /// Tell the machine, once per peer and while workers still run, that
+    /// sending to that peer has failed, if the transport says so (see
+    /// [`ClusterTransport::outbound_failed`]). The notice that follows
+    /// repeats it, which the machine absorbs.
+    fn note_failed_sends(&mut self) -> Vec<Action> {
+        if self.machine.workers_done() {
+            return Vec::new();
+        }
+        let failed: Vec<String> = self
+            .outboxes
+            .keys()
+            .filter(|peer| {
+                !self.noted_send_failures.contains(*peer) && self.transport.outbound_failed(peer)
+            })
+            .cloned()
+            .collect();
+        let mut actions = Vec::new();
+        for peer in failed {
+            self.noted_send_failures.insert(peer.clone());
+            actions.extend(self.machine.on_event(LifecycleEvent::Link {
+                peer,
+                event: LinkEvent::OutboundFailed(LinkFailure::SendFailed),
+            }));
+        }
+        actions
     }
 
     /// The flight recorder: dump the data loss the machine accepted, once
@@ -3580,6 +3617,7 @@ mod tests {
             failure_announced: false,
             unfinished_announced: false,
             worker_failure: None,
+            noted_send_failures: HashSet::new(),
             loss_dumped: false,
             _teardown: notifier,
         };
@@ -3634,6 +3672,44 @@ mod tests {
             )
         );
         drop(rings);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A send the transport failed before the last worker finished failed
+    /// while the workers ran, even when its notice reaches the coordinator
+    /// only after the worker's result: the completion reports the loss, not
+    /// Ok (ClusterTransport.tla: ct_notice_refuse, ct_notice_checked).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[tokio::test]
+    async fn a_send_failed_before_the_workers_finished_is_a_loss_though_its_notice_is_late() {
+        let id = DataflowId::new();
+        let dir = std::env::temp_dir().join(format!("instancy-trace-late-{}", id.as_uuid()));
+        let ring = crate::progress::trace::recorder_for_test(id, "node-a", None, "node-b", 2, &dir);
+        let (m, _) = machine(1, &[("node-b", 1)]);
+        let late = link_event("node-b", LinkEvent::OutboundFailed(LinkFailure::SendFailed));
+        let (a, node_b, waiter) = coordinator(id, m, "node-b", vec![done(true), late], &ring);
+        // The peer's end is gone: the next write fails, and the transport
+        // knows before any notice is delivered.
+        drop(node_b);
+        let frame = Frame {
+            dataflow_id: id,
+            channel_id: 7,
+            payload: vec![1],
+        };
+        let _ = a.transport.data_sender("node-b").unwrap().send(frame).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !a.transport.outbound_failed("node-b") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the write failed");
+        tokio::time::timeout(Duration::from_secs(10), a.run())
+            .await
+            .unwrap();
+        let loss = waiter.data_loss().expect("the completion reports the loss");
+        assert_eq!(loss.peer, "node-b");
+        drop(ring);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
