@@ -891,6 +891,11 @@ impl LifecycleMachine {
             LinkEvent::ProgressEndOfStream => {
                 peer.end_of_stream += 1;
                 peer.progress_channels_ended += 1;
+                // This marker may end the last channel, after the control
+                // channel closed (they come from different tasks): the link
+                // has then closed fully, which settles a send still owed, as
+                // `ControlClosed` would. After the retirement below.
+                let closes_owed_send = peer.unsent() && peer.fully_closed();
                 if peer.end_of_stream == peer.expected_end_of_stream && !peer.goodbye_received {
                     peer.goodbye_received = true;
                     peer.link.retire();
@@ -901,8 +906,11 @@ impl LifecycleMachine {
                     // goodbye was complete (the events come from different
                     // bridge tasks, in either order).
                     if peer.unclean_data_channel {
-                        actions.extend(self.missing_close_marker(peer_id));
+                        actions.extend(self.missing_close_marker(peer_id.clone()));
                     }
+                }
+                if closes_owed_send {
+                    actions.extend(self.on_link_failure(peer_id, LinkFailure::ChannelClosed, true));
                 }
             }
             LinkEvent::AckReceived => {
@@ -1011,8 +1019,18 @@ impl LifecycleMachine {
                 // the peer queued before closing is applied first. The frames
                 // it dropped stay owed until then (`settle_unsent`). Encoding
                 // failures are always hard.
-                let hard = !(phase == Phase::Running && matches!(failure, LinkFailure::SendFailed));
-                actions.extend(self.on_link_failure(peer_id, failure, hard));
+                //
+                // A send failure already owed is reported again (the
+                // coordinator's check as the workers finished, the transport's
+                // own notice, the forwarder's report of the frames behind it):
+                // the same failure, in any phase. It keeps waiting, so a
+                // Cancel or goodbye queued before the link closed still
+                // settles it.
+                if !(matches!(failure, LinkFailure::SendFailed) && peer.unsent()) {
+                    let hard =
+                        !(phase == Phase::Running && matches!(failure, LinkFailure::SendFailed));
+                    actions.extend(self.on_link_failure(peer_id, failure, hard));
+                }
             }
 
             LinkEvent::InboundDataLost(_) => unreachable!("handled above"),
@@ -1345,13 +1363,18 @@ impl LifecycleMachine {
     }
 
     /// Wait for the rest of a softly failed link to close, but only for a
-    /// grace period (see [`Action::ArmSoftFailureTimer`]).
+    /// grace period (see [`Action::ArmSoftFailureTimer`]). A failed send
+    /// replaces an inbound end already waiting: its frames are owed, which
+    /// the inbound end alone does not settle (`settle_unsent`).
     fn defer_soft_failure(
         peer: &mut PeerState,
         peer_id: String,
         failure: LinkFailure,
     ) -> Vec<Action> {
         if peer.soft_failure.is_some() {
+            if matches!(failure, LinkFailure::SendFailed) {
+                peer.soft_failure = Some(failure);
+            }
             return Vec::new();
         }
         peer.soft_failure = Some(failure);
@@ -1681,7 +1704,7 @@ impl ClusterLifecycle {
     /// Tell the machine, once per peer and while workers still run, that
     /// sending to that peer has failed, if the transport says so (see
     /// [`ClusterTransport::outbound_failed`]). The notice that follows
-    /// repeats it, which the machine absorbs.
+    /// repeats it; the machine keeps a repeat waiting like the first.
     fn note_failed_sends(&mut self) -> Vec<Action> {
         if self.machine.workers_done() {
             return Vec::new();
@@ -2585,6 +2608,102 @@ mod tests {
             ),
             "{actions:?}"
         );
+        assert!(m.data_loss().is_none());
+    }
+
+    /// A send failure owed when the last worker finished is reported again
+    /// once the machine drains (the coordinator reports it as the workers
+    /// finish, then the transport's own notice and the forwarder's report
+    /// follow). The repeat is the same failure: the peer's Cancel, or its
+    /// goodbye and the link's close, still settle it without loss.
+    #[test]
+    fn a_repeated_failed_send_still_waits_for_the_peers_cancel_or_goodbye() {
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        assert!(matches!(
+            m.on_event(send_failed("b")).as_slice(),
+            [Action::ArmSoftFailureTimer(_)]
+        ));
+        assert!(matches!(
+            m.on_event(done(true)).as_slice(),
+            [Action::SendGoodbye]
+        ));
+        assert!(m.on_event(send_failed("b")).is_empty(), "absorbed");
+        let actions = m.on_event(link_event("b", LinkEvent::CancelReceived));
+        assert!(is_teardown(&actions, true), "{actions:?}");
+        assert!(m.data_loss().is_none());
+
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        m.on_event(send_failed("b"));
+        m.on_event(done(true));
+        assert!(m.on_event(send_failed("b")).is_empty(), "absorbed");
+        assert!(matches!(
+            m.on_event(link_event("b", LinkEvent::ProgressEndOfStream))
+                .as_slice(),
+            [Action::SendAck(_)]
+        ));
+        let actions = m.on_event(link_event("b", LinkEvent::ControlClosed));
+        assert!(is_teardown(&actions, true), "{actions:?}");
+        assert!(m.data_loss().is_none());
+
+        // Unexcused, it is still a loss once the link has closed.
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        m.on_event(send_failed("b"));
+        m.on_event(done(true));
+        m.on_event(send_failed("b"));
+        m.on_event(link_event(
+            "b",
+            LinkEvent::ProgressChannelEnded(LinkFailure::ChannelClosed),
+        ));
+        m.on_event(link_event("b", LinkEvent::ControlClosed));
+        assert!(m.data_loss().is_some());
+
+        // The goodbye's marker may end the last channel after the control
+        // channel closed: it settles the owed send (retired, closed).
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        m.on_event(send_failed("b"));
+        m.on_event(done(true));
+        m.on_event(send_failed("b"));
+        assert!(
+            m.on_event(link_event("b", LinkEvent::ControlClosed))
+                .is_empty()
+        );
+        let actions = m.on_event(link_event("b", LinkEvent::ProgressEndOfStream));
+        assert!(is_teardown(&actions, true), "{actions:?}");
+        assert!(m.data_loss().is_none());
+    }
+
+    /// A send that failed while the workers ran is owed even when an inbound
+    /// end of the same link was deferred first (one soft failure per peer):
+    /// once the workers succeed and the link closes, it is a loss, not Ok.
+    #[test]
+    fn a_failed_send_after_a_deferred_inbound_end_is_still_owed() {
+        let reset = || {
+            link_event(
+                "b",
+                LinkEvent::ConnectionFailed(TransportError::ConnectionClosed),
+            )
+        };
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        assert!(matches!(
+            m.on_event(reset()).as_slice(),
+            [Action::ArmSoftFailureTimer(_)]
+        ));
+        assert!(m.on_event(send_failed("b")).is_empty());
+        assert!(matches!(
+            m.on_event(done(true)).as_slice(),
+            [Action::SendGoodbye]
+        ));
+        m.on_event(eof("b"));
+        m.on_event(link_event("b", LinkEvent::ControlClosed));
+        assert!(m.data_loss().is_some(), "Ok over a send that failed");
+
+        // Excused like any owed send: the peer cancelled.
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        m.on_event(reset());
+        m.on_event(send_failed("b"));
+        m.on_event(done(true));
+        let actions = m.on_event(link_event("b", LinkEvent::CancelReceived));
+        assert!(is_teardown(&actions, true), "{actions:?}");
         assert!(m.data_loss().is_none());
     }
 
@@ -3687,7 +3806,18 @@ mod tests {
         let ring = crate::progress::trace::recorder_for_test(id, "node-a", None, "node-b", 2, &dir);
         let (m, _) = machine(1, &[("node-b", 1)]);
         let late = link_event("node-b", LinkEvent::OutboundFailed(LinkFailure::SendFailed));
-        let (a, node_b, waiter) = coordinator(id, m, "node-b", vec![done(true), late], &ring);
+        // The notice arrives after the worker's result, then the peer's
+        // channels close, which settles the failed send.
+        let events = vec![
+            done(true),
+            late,
+            link_event(
+                "node-b",
+                LinkEvent::ProgressChannelEnded(LinkFailure::ChannelClosed),
+            ),
+            link_event("node-b", LinkEvent::ControlClosed),
+        ];
+        let (a, node_b, waiter) = coordinator(id, m, "node-b", events, &ring);
         // The peer's end is gone: the next write fails, and the transport
         // knows before any notice is delivered.
         drop(node_b);
@@ -3709,6 +3839,64 @@ mod tests {
             .unwrap();
         let loss = waiter.data_loss().expect("the completion reports the loss");
         assert_eq!(loss.peer, "node-b");
+        drop(ring);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dedicated mode: a connection that failed on its read side (a reset,
+    /// say) may have lost frames already written, though the idle writer has
+    /// not failed. As the workers succeed the check reports a failed send,
+    /// as Shared mode's failed lane does, so the run reports the loss when
+    /// the peer's channels close, not Ok once the goodbye's write fails.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[tokio::test]
+    async fn a_read_failure_before_the_workers_finished_is_a_failed_send() {
+        use tokio::io::AsyncWriteExt;
+        let id = DataflowId::new();
+        let dir = std::env::temp_dir().join(format!("instancy-trace-readfail-{}", id.as_uuid()));
+        let ring = crate::progress::trace::recorder_for_test(id, "node-a", None, "node-b", 2, &dir);
+        let (m, _) = machine(1, &[("node-b", 1)]);
+        let read_failed = TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "connection closed mid-frame",
+        ));
+        // The read failure's notice arrives after the worker's result, then
+        // the peer's channels close.
+        let events = vec![
+            done(true),
+            link_event("node-b", LinkEvent::ConnectionFailed(read_failed)),
+            link_event(
+                "node-b",
+                LinkEvent::ProgressChannelEnded(LinkFailure::ChannelClosed),
+            ),
+            link_event("node-b", LinkEvent::ControlClosed),
+        ];
+        let (a, node_b, waiter) = coordinator(id, m, "node-b", events, &ring);
+        // Half a frame, then the end of the stream: our reader fails, while
+        // our writer still works (the peer's end stays open).
+        let mut peer = node_b.into_inner();
+        peer.write_all(&[1, 2, 3]).await.unwrap();
+        peer.shutdown().await.unwrap();
+        let ClusterTransport::Dedicated(session) = &*a.transport else {
+            panic!("the test transport is Dedicated");
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !session.read_failed("node-b") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the read failed");
+        assert!(
+            !session.data_sender("node-b").unwrap().is_closed(),
+            "the writer has not failed"
+        );
+        tokio::time::timeout(Duration::from_secs(10), a.run())
+            .await
+            .unwrap();
+        let loss = waiter.data_loss().expect("the completion reports the loss");
+        assert_eq!(loss.peer, "node-b");
+        drop(peer);
         drop(ring);
         let _ = std::fs::remove_dir_all(&dir);
     }

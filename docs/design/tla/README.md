@@ -288,7 +288,7 @@ This model opens the lane up.
 | `Termination` | Every run ends and unregisters, and per job every connection closes, on both nodes: no failure leaves a node waiting forever. |
 | `RetryEventuallyOk` | The retry eventually succeeds on both nodes. |
 | `ReuseEventuallyRejected` | A retry that reuses the id is eventually refused on both nodes. |
-| `NoOkAfterFailedSend` | A run whose lane had failed when its workers succeeded does not end `Ok` once its peer ended without its record, unless the peer retired or cancelled (`settle_unsent`'s rule). See [Late transport notices](#late-transport-notices-notices--async). |
+| `NoOkAfterFailedSend`, `NoFalseSettle` | With link events delivered late: a run whose lane had failed when its workers succeeded ends `Ok` only if the peer retired or cancelled, and a failed send is never settled as a failure when the peer needed nothing more (`settle_unsent`'s rule). See [Late link events](#late-link-events-notices--async-r60). |
 
 ### Switches
 
@@ -393,52 +393,119 @@ scenarios were not rerun for this extension. Existing result rows above retain
 their earlier provenance. No Rust execution, payload-capacity scheduling,
 three-worker behavior or memory-model ordering is proved by these small models.
 
-### Late transport notices (`Notices = "async"`)
+### Late link events (`Notices = "async"`, R60)
 
-Until this extension the model told a run about a transport failure in the
-same step as the failure. The code cannot: the transport marks the lane failed
-at once, but the event reaches the lifecycle coordinator later, through a
-channel and a task. A worker can succeed in between. The coordinator then
-reads the failure as one after completion, and the run ends `Ok` though a send
-failed while its workers ran, which `settle_unsent` is meant to report. The
-synchronous abstraction ruled this interleaving out, so neither the model nor
-the reviews that checked the code against it could see it. A later review
-found one instance (a record sent on a failed pooled connection was accepted
-and dropped); the model, extended, found the general case.
+Until this extension the model told a run about every link event in the step
+that caused it. The code cannot. A run's coordinator learns of link events
+through channels and tasks:
+- transport notices (a failed send, a failed or closed inbound link,
+  corruption) through the io forwarder;
+- the peer's `Cancel`, then the control channel's close, through the control
+  dispatcher;
+- the peer's goodbye and ack, then the progress channel's close, through the
+  progress bridge.
 
-Two switches, both off in every earlier scenario, whose results and state
-counts are unchanged:
+The transport marks a lane failed at once, but a worker can succeed before the
+coordinator hears of it. It then read the failure as one after completion, and
+the run ended `Ok` though a send failed while its workers ran, which
+`settle_unsent` is meant to report. The synchronous abstraction ruled this
+interleaving out. A later review found one instance in the code (a record sent
+on a failed pooled connection was accepted and dropped); the model, extended,
+found the broader race: a record lost with the writer queue before the failure.
+
+With `Notices = "async"` the model queues the link events of the code for the
+run's coordinator, in three FIFO queues that interleave freely: the transport
+notices, the dispatcher's events and the bridge's. A channel's close is handed
+on only after the transport notices queued before it (the code keeps the
+channels open until the notice is taken). A failed connection reports its
+failed send and its inbound end in the code's order: a write error reports the
+failed send first; a read error reports both at once, in either order (the
+inbound end is handed on by a task of its own).
+
+The coordinator keeps one deferred failure per run, as the lifecycle machine
+does (its `soft_failure` slot):
+- a failed send while the workers run is owed;
+- a failed or closed inbound link waits for the link's full close, so a
+  `Cancel` or goodbye read before it is applied first;
+- a failed send replaces a waiting inbound end;
+- the peer's `Cancel` clears it (the peer needs nothing more);
+- the link's full close settles it: an owed send is excused if the peer
+  retired the link, and is a failure otherwise; an inbound end is decided as
+  before;
+- the grace period settles an owed send as a failure (an inbound end's grace
+  period is not modelled: the link's close is queued with it and, under the
+  timing assumption below, arrives first);
+- corruption fails the run and clears it; corruption still queued is applied
+  before teardown.
+
+**The grace period rests on a timing assumption.** The code arms it for
+`handshake_timeout` and assumes that whatever the peer already sent reaches
+the coordinator within it. The model fires it only when nothing is on its way:
+no queued event and no excuse (`Cancel`, goodbye or ack) on the wire. A peer
+whose excuse takes longer than the grace period makes the code report a
+failure that the model would excuse; never the reverse.
+
+Five switches; with their defaults, every earlier scenario's result and state
+count is unchanged:
 
 | Switch | Values |
 |---|---|
-| `Notices` | `"sync"`: an event reaches the run in the step that causes it (the earlier abstraction); `"async"`: it is queued for the run and a later `Notice` step applies it. |
-| `FinishCheck` | `TRUE`: as the workers succeed, the coordinator asks the transport whether the lane has failed, and if so treats it as a send that failed while they ran. |
+| `Notices` | `"sync"` (default): the earlier abstraction; `"async"`: as above. |
+| `FinishCheck` | `TRUE`: as the workers succeed, the coordinator asks the transport whether the lane has failed and reports a failed send if so (R60, `note_failed_sends`). Default `FALSE`. |
+| `Repeat` | `"absorb"` (default): a failed send reported again while one is owed keeps waiting; `"hard"`: once the workers succeeded, the repeat settles it at once (6ece576). |
+| `Upgrade` | `TRUE` (default): a failed send replaces a waiting inbound end; `FALSE`: it is dropped (6ece576). |
+| `EosSettle` | `TRUE` (default): the peer's goodbye that closes the link's last channel settles an owed send; `FALSE`: only a channel's close does (6ece576). |
 
-`NoOkAfterFailedSend` checks the rule. It covers only a failure the transport
-knew of before the workers succeeded: a lane that fails afterwards is the
-peer's to report, as before.
+The rules checked:
+
+| Property | Meaning |
+|---|---|
+| `NoOkAfterFailedSend` | A run whose lane had failed when its workers succeeded ends `Ok` only if the peer retired the link (it finished with what it needed) or cancelled (it needs nothing more). A lane that fails only after the workers succeeded is the peer's to report, as before. |
+| `NoFalseSettle` | A failed send is never settled as a failure when the peer needed nothing more: not while its `Cancel`, goodbye or ack is on its way (read and not yet applied, or still on the wire), and not after its goodbye came and the link closed fully. |
+| `NeverOkAfterFailedLane` | Witness, deliberately violated: some run does end `Ok` with its lane failed when its workers succeeded, so `NoOkAfterFailedSend` is not vacuous. |
 
 The model does not tell a record sent on a lane that already failed from one
-queued just before the failure: both are in the outbox when the lane fails,
-and both are dropped. So refusing such sends (ae1729e) changes nothing here;
-`FinishCheck` is what keeps the rule.
+queued just before the failure: both are in the outbox when the lane fails, and
+both are dropped. So refusing such sends (ae1729e) changes nothing here; the
+coordinator's check is what keeps the rule.
 
-Bounds: two nodes, one connection, one run, at most one fault (`ct_notice_late`:
-a write error; the others: any kind, with a requested stop). TLC 2.19
-(rev 5a47802), 6 workers.
+Bounds: two nodes, one connection, one run; at most one reset, write error or
+corruption (not silence); at most one requested stop and one worker failure
+(`ct_notice_late`: one write error and neither; `ct_notice_repeat`: one write
+error and one worker failure; `ct_notice_inbound_first`: no stop or worker
+failure; `ct_notice_eos_last`: no worker failure). TLC 2.19 (rev 5a47802),
+8 workers.
 
 | Scenario | Expected | Result |
 |---|---|---|
-| `ct_notice_late` | `NoOkAfterFailedSend` | **Fails as expected** (without the check, on ae1729e and before). b's record waits in b's writer queue; b's writer fails and loses it; b's workers succeed before the failure reaches b's coordinator, which reads it as a failure after completion. b ends `Ok`, and a fails without b's record. |
-| `ct_notice_checked` | pass | **Pass**, 2,011,246 states: with late notices and the coordinator's check, never `Ok` over a send the transport knew had failed, nor with lost, crossed or corrupted data. |
-| `live_ct_notice` | pass | **Pass**, 2,011,246 states: every run ends and every connection closes. |
+| `ct_notice_late` | `NoOkAfterFailedSend` | **Fails as expected** (no check: ae1729e and before). b's record waits in b's writer queue; b's writer fails and loses it; b's workers succeed before the failure reaches b's coordinator, which reads it as a failure after completion. b ends `Ok` over a send that failed while its workers ran. |
+| `ct_notice_repeat` | `NoFalseSettle` | **Fails as expected** (6ece576). a's worker fails and a sends its `Cancel`; b reads it; b's writer fails; b's check reports the failed send and b's workers succeed; the transport's own notice then settles the send at once as a failure, ahead of a's `Cancel`, which would have excused it. |
+| `ct_notice_inbound_first` | `NoOkAfterFailedSend` | **Fails as expected** (6ece576). The connection is reset; b's read error reports the inbound end first, which b's coordinator defers; the failed send (b's check, then the notice) finds the slot taken and is dropped. b's workers succeed and b ends `Ok`; a still waits for the record b lost. |
+| `ct_notice_eos_last` | `NoFalseSettle` | **Fails as expected** (6ece576). a's writer fails while a runs, so a's send is owed; a's control channel closes, then b's goodbye ends the link's last channel. Nothing settles the send but the grace period, which fails a although b said goodbye and closed. |
+| `ct_notice_checked` | pass | **Pass**, 64,713,130 states (24 minutes): with the check and the three settlement fixes, never `Ok` over a send the transport knew had failed, never a failure settled when the peer needed nothing more, and no run done or `Ok` without its record, none taking another run's frames, none accepting a corrupted one. |
+| `ct_notice_reach` | `NeverOkAfterFailedLane` | **Violated as expected**, at 28,786,231 states: a requests a stop and sends its `Cancel`; b reads it, b's writer fails, b's workers succeed, and b ends `Ok` with its lane failed, correctly, since a needs nothing more. |
+| `live_ct_notice` | pass | **Pass**, 64,713,130 states (2 h 50 min): with link events delivered later, every run ends and every connection closes on both nodes; an owed send or a waiting inbound end is always settled, and teardown always goes ahead. |
 
-Every quick `ClusterTransport` scenario was rerun on the extended spec with its
-expected result and, for the passing ones, the same state count. The
+Each scenario's counterexample was checked against its description. Four model
+errors were found and fixed along the way:
+- by TLC: the full close first dropped the inbound end it defers (a deadlock),
+  and then the inbound close overtook the peer's `Cancel` and goodbye (a false
+  `NoSpuriousFail`);
+- by review: the first version kept the owed send apart from the deferred
+  inbound end, while the code has one slot, so it hid the dropped failed send;
+  and it always reported a failed send before the inbound end, so it could not
+  reach that bug even with one slot. `ct_notice_inbound_first` needs a reset
+  for the same reason: with only a write error, the failed send comes first.
+
+What these runs do not cover: more than one run or connection with late
+events (the concurrent and crosswise scenarios still run with
+`Notices = "sync"`), several local workers finishing separately, and silence.
+A read error reports its two events in the same order for every run it
+affects. Every quick `ClusterTransport` scenario was rerun on the extended spec
+with its expected result and, for the passing ones, the same state count. The
 multi-hour scenarios (concurrent, crosswise and silence) were not rerun: the
-switches are off there, and with `Notices = "sync"` the new ghost never
-changes a state.
-
+switches are off there, and with `Notices = "sync"` the new fields never
+change.
 ### What it shows, and what it does not
 
 **It shows,** for two nodes and these bounds:
@@ -450,7 +517,7 @@ changes a state.
 **It does not show:**
 - **That a failed connection fails *every* run using it.** `NoCollateralFail` is one-way; a run on a failed connection may still succeed when it no longer needed the lost frames, and `NoLossOk` covers the case where it did.
 - **More than two nodes**, or link retirement through a third node (R47's three-node shapes).
-- **The lifecycle machine's soft failures.** A send failure the code settles later (`settle_unsent`) is decided at once here; only the delay in delivering it is modelled (`Notices = "async"`).
+- **The lifecycle machine's soft failures.** A send failure the code settles later (`settle_unsent`) is decided at once here, except with `Notices = "async"`, where the run's one deferred failure is kept and settled as the machine does, with the grace period under its timing assumption.
 - **Timing.** Linger has no deadline, where the code caps it at 10 s, and the handshake and ready barrier are one step whose timeout fires only when the peer's run already ended.
 - **Bounded id memory.** The model remembers every finished id; PR9 keeps the last 16,384.
 - **Data-channel close sentinels and real progress.** Completion is the abstract "record and progress received"; the progress models cover the rest.

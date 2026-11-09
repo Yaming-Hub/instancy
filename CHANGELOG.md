@@ -82,9 +82,18 @@ Implements [`docs/design/connection-liveness.md`](docs/design/connection-livenes
   peer failed, but the event reaches the dataflow's coordinator later; a
   worker succeeding in between made the failure look like one after
   completion, and the node ended `Ok` although a record it had sent was
-  lost (with the writer queue). The coordinator now asks the transport as
-  each worker finishes (decision R60), in both transport modes. Found by
-  extending `ClusterTransport.tla` to deliver transport events late.
+  lost (with the writer queue, or in Dedicated mode with a reset the
+  reader saw first). The coordinator now asks the transport as
+  each worker finishes (decision R60), in both transport modes. A failed
+  send reported again while one is still owed (the transport's own notice,
+  the forwarder's report) keeps waiting, so a peer's `Cancel` or goodbye
+  already received still excuses it rather than being overtaken. A failed
+  send also replaces an inbound end that is still waiting (after a read
+  error the inbound end is reported first, and the failed send was
+  dropped), and a peer's goodbye that ends its link's last channel settles
+  the send (only the grace period did, failing a run whose peer had
+  finished). Found by extending `ClusterTransport.tla` to deliver link
+  events late, and by review.
 
 ### SPSC wake
 

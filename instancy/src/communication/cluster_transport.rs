@@ -220,13 +220,20 @@ impl ClusterTransport {
     }
 
     /// Whether sending to a peer has failed: its writer failed, so frames
-    /// queued for it are lost and later ones are refused. The transport
-    /// knows at once, before the connection event reaches the dataflow.
+    /// queued for it are lost and later ones are refused; or its connection
+    /// failed on the read side (a reset, say), so frames already written may
+    /// be lost with it. In Shared mode a read error fails the lane too; in
+    /// Dedicated mode the writer keeps going until a write fails, which may
+    /// be only the goodbye. The transport knows at once, before the
+    /// connection event reaches the dataflow.
     pub(crate) fn outbound_failed(&self, peer_node_id: &str) -> bool {
         match self {
-            Self::Dedicated(session) => session
-                .data_sender(peer_node_id)
-                .is_some_and(tokio_mpsc::Sender::is_closed),
+            Self::Dedicated(session) => {
+                session
+                    .data_sender(peer_node_id)
+                    .is_some_and(tokio_mpsc::Sender::is_closed)
+                    || session.read_failed(peer_node_id)
+            }
             Self::Shared { session } => session
                 .data_sender(peer_node_id)
                 .is_some_and(|sender| sender.has_failed()),
