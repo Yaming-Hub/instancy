@@ -36,8 +36,8 @@ use instancy::communication::ClusterSpawnTransport;
 use instancy::dataflow::channel_operators::InputSender;
 use instancy::runtime::ClusterSpawnedDataflow;
 use instancy::{
-    CancellationReason, ClusterTopology, DataflowBuilder, DataflowId, Error, NodeConfig, Result,
-    RuntimeHandle, SpawnOptions,
+    CancellationReason, ClusterTopology, DataflowBuilder, DataflowId, Error, NodeConfig,
+    ProbeHandle, Result, RuntimeHandle, SpawnOptions,
 };
 use support::{
     Managers, collect, drop_runtimes, fmt_join, join_with_timeout, spawn_node_with_options,
@@ -61,7 +61,7 @@ const BATCHES: u64 = 100;
 
 /// input -> slow (fails once `fail` is set) -> exchange (all to node-b) ->
 /// output: node-b's drain needs node-a's close sentinel.
-fn pipeline(builder: &mut DataflowBuilder<u64>, fail: &Arc<AtomicBool>) -> Result<()> {
+fn pipeline(builder: &mut DataflowBuilder<u64>, fail: &Arc<AtomicBool>, _: &Probes) -> Result<()> {
     let fail = Arc::clone(fail);
     builder
         .input::<u64>("data")?
@@ -89,11 +89,15 @@ fn pipeline(builder: &mut DataflowBuilder<u64>, fail: &Arc<AtomicBool>) -> Resul
 /// input -> exchange (all to node-a) -> slow -> output: node-a's drain needs
 /// nothing from node-b once node-b's input is closed (node-b then closes its
 /// exchange output at once), and node-a's own pushes to node-b close as soon
-/// as its input does.
-fn local_pipeline(builder: &mut DataflowBuilder<u64>, _fail: &Arc<AtomicBool>) -> Result<()> {
-    builder
-        .input::<u64>("data")?
-        .exchange_by_hash("to_a", |_x: &u64| 0)
+/// as its input does. The input is probed (see `inputs_released`).
+fn local_pipeline(
+    builder: &mut DataflowBuilder<u64>,
+    _fail: &Arc<AtomicBool>,
+    inputs: &Probes,
+) -> Result<()> {
+    let (data, probe) = builder.input::<u64>("data")?.probe();
+    inputs.lock().unwrap().push(probe);
+    data.exchange_by_hash("to_a", |_x: &u64| 0)
         .unary("slow", move |input, output| {
             if let Some((time, data)) = input.next() {
                 std::thread::sleep(Duration::from_millis(20));
@@ -107,22 +111,23 @@ fn local_pipeline(builder: &mut DataflowBuilder<u64>, _fail: &Arc<AtomicBool>) -
 
 /// input -> slow -> exchange (all to node-a) -> output: like
 /// `local_pipeline`, but node-a's push to node-b stays open for the whole
-/// drain, although it never carries a record.
+/// drain, although it never carries a record. The input is probed.
 fn late_exchange_pipeline(
     builder: &mut DataflowBuilder<u64>,
     _fail: &Arc<AtomicBool>,
+    inputs: &Probes,
 ) -> Result<()> {
-    builder
-        .input::<u64>("data")?
-        .unary("slow", move |input, output| {
-            if let Some((time, data)) = input.next() {
-                std::thread::sleep(Duration::from_millis(20));
-                output.push_vec(time, data);
-            }
-            Ok(())
-        })
-        .exchange_by_hash("to_a", |_x: &u64| 0)
-        .output("out")?;
+    let (data, probe) = builder.input::<u64>("data")?.probe();
+    inputs.lock().unwrap().push(probe);
+    data.unary("slow", move |input, output| {
+        if let Some((time, data)) = input.next() {
+            std::thread::sleep(Duration::from_millis(20));
+            output.push_vec(time, data);
+        }
+        Ok(())
+    })
+    .exchange_by_hash("to_a", |_x: &u64| 0)
+    .output("out")?;
     Ok(())
 }
 
@@ -131,7 +136,11 @@ static SLOW_RECORDS: AtomicUsize = AtomicUsize::new(0);
 
 /// `pipeline` without the failure switch, counting the records `slow`
 /// emits.
-fn counted_pipeline(builder: &mut DataflowBuilder<u64>, _fail: &Arc<AtomicBool>) -> Result<()> {
+fn counted_pipeline(
+    builder: &mut DataflowBuilder<u64>,
+    _fail: &Arc<AtomicBool>,
+    _: &Probes,
+) -> Result<()> {
     builder
         .input::<u64>("data")?
         .unary("slow", move |input, output| {
@@ -148,7 +157,10 @@ fn counted_pipeline(builder: &mut DataflowBuilder<u64>, _fail: &Arc<AtomicBool>)
     Ok(())
 }
 
-type Build = fn(&mut DataflowBuilder<u64>, &Arc<AtomicBool>) -> Result<()>;
+/// Probes on the input of every node's dataflow (pipelines that need them).
+type Probes = Arc<std::sync::Mutex<Vec<ProbeHandle<u64>>>>;
+
+type Build = fn(&mut DataflowBuilder<u64>, &Arc<AtomicBool>, &Probes) -> Result<()>;
 
 struct Setup {
     build: Build,
@@ -160,6 +172,8 @@ struct Setup {
     a_input_open: bool,
     /// Batches node-a's input gets.
     a_batches: u64,
+    /// The time of node-a's batches.
+    a_time: u64,
 }
 
 impl Default for Setup {
@@ -170,6 +184,7 @@ impl Default for Setup {
             b_input_open: true,
             a_input_open: false,
             a_batches: BATCHES,
+            a_time: 0,
         }
     }
 }
@@ -179,6 +194,8 @@ struct Node {
     df: Option<ClusterSpawnedDataflow<u64>>,
     _managers: Option<Managers>,
     _input: Option<InputSender<u64, u64>>,
+    /// The input probes of every node (shared).
+    inputs: Probes,
 }
 
 impl Node {
@@ -204,13 +221,15 @@ async fn start(
     let topo = ClusterTopology::multi_node(names.iter().map(|n| NodeConfig::new(*n, 1)).collect())
         .unwrap();
     let id = DataflowId::new();
+    let inputs = Probes::default();
     let mut managers = Vec::new();
     let handles: Vec<_> = names
         .iter()
         .map(|n| {
             let fail = Arc::clone(fail);
+            let inputs = Arc::clone(&inputs);
             let pipeline = setup.build;
-            let build = move |b: &mut DataflowBuilder<u64>| pipeline(b, &fail);
+            let build = move |b: &mut DataflowBuilder<u64>| pipeline(b, &fail, &inputs);
             let drains = setup.drains[usize::from(*n == "node-b")];
             let options = if drains {
                 SpawnOptions::new().drain_on_cancel(DRAIN)
@@ -240,6 +259,7 @@ async fn start(
             df: Some(df.unwrap_or_else(|e| panic!("{mode:?}: {name} failed to spawn: {e}"))),
             _managers: managers,
             _input: None,
+            inputs: Arc::clone(&inputs),
         });
     }
     let oa = collect(nodes[0].df().take_output::<u64>(0, "out").unwrap());
@@ -252,7 +272,7 @@ async fn start(
     }
     let sa = nodes[0].df().take_input::<u64>(0, "data").unwrap();
     for i in 0..setup.a_batches {
-        sa.send(0, vec![i]).unwrap();
+        sa.send(setup.a_time, vec![i]).unwrap();
     }
     if setup.a_input_open {
         nodes[0]._input = Some(sa);
@@ -269,6 +289,29 @@ async fn shutdown(nodes: Vec<Node>) {
         rts.extend(node.rt.take());
     }
     drop_runtimes(rts).await;
+}
+
+/// Wait until `nodes` input probes exist and none of them still holds time 0:
+/// every node's view has every time-0 input capability released (later
+/// records still pending are at a later time). Panics, naming the
+/// precondition, if that takes longer than `PROMPT`.
+async fn inputs_released(inputs: &Probes, nodes: usize, what: &str) {
+    let deadline = tokio::time::Instant::now() + PROMPT;
+    loop {
+        let released = {
+            let probes = inputs.lock().unwrap();
+            probes.len() == nodes && probes.iter().all(|probe| !probe.frontier().less_equal(&0))
+        };
+        if released {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{what}: precondition not reached: the inputs at time 0 were not released in \
+             every node's view within {PROMPT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 /// node-b stopped (its drain, or its run) because node-a stopped without
@@ -474,6 +517,12 @@ async fn completed_drain_succeeds_without_a_forwarded_failure() {
 /// none of that may stop node-a's drain, which completes with every record,
 /// in both transport modes. (That a failed send of progress alone does not
 /// count is pinned by the lifecycle machine's unit tests.)
+///
+/// node-a's stop request waits until every node's view holds node-b's input
+/// released (`inputs_released`). A node-b stopped before its worker saw its
+/// input closed never released it, and node-a's drain then does need node-b
+/// (R48 stops it, correctly): a fixed delay before the stop raced with that
+/// under load.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn drain_that_needs_nothing_from_a_stopped_peer_still_succeeds() {
     let pipelines: [(&str, Build); 2] = [
@@ -490,10 +539,13 @@ async fn drain_that_needs_nothing_from_a_stopped_peer_still_succeeds() {
             build,
             drains: [true, false],
             b_input_open: false,
+            // Later than node-b's input capability, so a probe on the input
+            // shows when that is released (node-a's own input closes).
+            a_time: 1,
             ..Setup::default()
         };
         let (mut nodes, [oa, _ob]) = start(&mut mesh, mode, &fail, setup).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        inputs_released(&nodes[0].inputs, 2, &format!("{mode:?} {shape}")).await;
         nodes[0].df().cancel();
 
         let ja = nodes[0].join(PROMPT);
