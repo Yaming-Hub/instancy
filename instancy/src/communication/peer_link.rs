@@ -256,9 +256,10 @@ impl PeerLinkState {
         self.push_blocked.load(Ordering::SeqCst)
     }
 
-    /// A data push to the peer found its queue closed.
-    pub(crate) fn note_push_blocked(&self) {
-        self.push_blocked.store(true, Ordering::SeqCst);
+    /// A data push to the peer found its queue closed. Returns whether it is
+    /// the first.
+    pub(crate) fn note_push_blocked(&self) -> bool {
+        !self.push_blocked.swap(true, Ordering::SeqCst)
     }
 }
 

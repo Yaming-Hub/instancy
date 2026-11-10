@@ -460,9 +460,18 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkPush<T, D> {
                 // until then the operator waits, as for a full queue.
                 Some(outbox) if is_data => {
                     // Set before reporting: the coordinator decides whether a
-                    // drain can still complete from it.
-                    outbox.link().note_push_blocked();
-                    self.report_link_failure(outbox);
+                    // drain can still complete from it. The first record push
+                    // the link blocks is reported even after a control signal
+                    // reported the failure, so the coordinator checks again.
+                    if outbox.link().note_push_blocked() {
+                        self.link_failure_reported
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        outbox.report(crate::communication::peer_link::LinkEvent::OutboundFailed(
+                            crate::communication::peer_link::LinkFailure::SendFailed,
+                        ));
+                    } else {
+                        self.report_link_failure(outbox);
+                    }
                     Err(Error::Backpressure)
                 }
                 // A control signal (a watermark, an error) carries no records,
@@ -2644,7 +2653,9 @@ mod tests {
         /// A control signal to a closed link is dropped once the failure is
         /// reported: its sender retries until it is taken, so `Backpressure`
         /// would stop the worker for good. Records still wait, marking the
-        /// push blocked; nothing marks it for a control signal.
+        /// push blocked; nothing marks it for a control signal. The first
+        /// blocked record push is reported too, so the coordinator checks
+        /// again whether a drain can complete.
         #[tokio::test]
         async fn control_signal_to_a_closed_link_is_dropped_after_the_report() {
             let (outbox, mut events, _sink) = monitored_outbox("node-b");
@@ -2669,7 +2680,23 @@ mod tests {
                 Err(Error::Backpressure)
             ));
             assert!(outbox.link().push_blocked());
-            assert!(events.try_recv().is_err(), "reported once");
+            assert!(
+                matches!(
+                    events.try_recv(),
+                    Ok(LifecycleEvent::Link {
+                        event: LinkEvent::OutboundFailed(
+                            crate::communication::peer_link::LinkFailure::SendFailed
+                        ),
+                        ..
+                    })
+                ),
+                "the first blocked record push is reported"
+            );
+            assert!(matches!(
+                push.push(Envelope::data(4, vec![4])),
+                Err(Error::Backpressure)
+            ));
+            assert!(events.try_recv().is_err(), "and only the first");
         }
 
         fn materializers_with_monitoring(
