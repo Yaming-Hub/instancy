@@ -1258,6 +1258,36 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
         )
     }
 
+    /// [`Self::new`] with the unbounded receivers of a Shared session
+    /// ([`SharedTransportSession::take_receivers`](crate::communication::shared_transport::SharedTransportSession::take_receivers)).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_unbounded(
+        dataflow_id: DataflowId,
+        topology: ClusterTopology,
+        local_node_id: impl Into<String>,
+        transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
+        receivers: std::collections::HashMap<
+            String,
+            std::collections::HashMap<u64, tokio_mpsc::UnboundedReceiver<Vec<u8>>>,
+        >,
+        capacity: usize,
+        edge_index: usize,
+        wake_handles: Vec<WakeHandle>,
+        runtime_handle: tokio::runtime::Handle,
+    ) -> Result<Self> {
+        Self::with_receivers(
+            dataflow_id,
+            topology,
+            local_node_id,
+            transport,
+            crate::communication::cluster_transport::peer_receivers(receivers),
+            capacity,
+            edge_index,
+            wake_handles,
+            runtime_handle,
+        )
+    }
+
     /// [`Self::new`] with receivers of either transport mode (bounded in
     /// Dedicated mode, unbounded in Shared mode).
     #[allow(clippy::too_many_arguments)]

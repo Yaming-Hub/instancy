@@ -56,6 +56,11 @@ Implements [`docs/design/connection-liveness.md`](docs/design/connection-livenes
   backpressure is still to come.
 - **Breaking:** the new `SharedConnectionConfig::silence_timeout` field and
   `TransportError::ConnectionSilent` and `WriteStalled` variants.
+  `silence_timeout` defaults to 30 s and must be at least 3 ×
+  `probe_interval`, so a config that only raises `probe_interval` above
+  10 s is now refused by `SharedPeerManager::new`; set `silence_timeout`
+  too (or `None`). `NetworkEdgeMaterializer::new_unbounded` takes the
+  receivers of a Shared session.
 ### SPSC wake
 
 - **Fixed: an SPSC consumer with a wake handle wakes a producer it unblocks.**

@@ -1533,7 +1533,21 @@ impl Inner {
                 .is_some_and(|silent| silent >= timeout)
             {
                 // The reader ends with this error (see `reader_task`), and
-                // the writer is aborted.
+                // the writer is aborted, dropping what is queued. The lanes
+                // pinned here fail now, as a write error fails them, so a
+                // worker that finishes before the reader runs still sees
+                // the failed send (`DataframeSender::has_failed`), and the
+                // connection leaves the pool, so no new lane is pinned to
+                // it; the reader reports it (`fail_inbound`).
+                {
+                    let mut state = self.state();
+                    state.connections.remove(&conn_id);
+                    for reg in state.registered.values() {
+                        if reg.conn == conn_id && !reg.outbound_failed {
+                            reg.lane.close(LaneEnd::Failed);
+                        }
+                    }
+                }
                 liveness.kill(TransportError::ConnectionSilent { timeout });
             } else if liveness
                 .stalled_for(now)
@@ -4118,6 +4132,33 @@ mod tests {
         ));
     }
 
+    /// The silence verdict fails the lanes pinned to the connection at once:
+    /// its writer drops what is queued as soon as it sees the kill, and a
+    /// worker finishing before the reader reports the failure must still see
+    /// a failed send (R60). The reader then reports it.
+    #[tokio::test(start_paused = true)]
+    async fn the_silence_verdict_fails_the_lanes_at_once() {
+        let (a_end, b_end, _a_to_b, _b_to_a) = valved(None);
+        let (a, b, _health_a, _health_b) = live_pair(vec![(a_end, b_end)], live(1), live(1));
+        let df = DataflowId::new();
+        let (_ra, mut ea, _rb, _eb) = bound(&a, &b, df).await;
+        tokio::time::sleep(2 * T).await;
+        let sender = a.dataflow_sender(&df).unwrap();
+        let liveness: Vec<Arc<ConnLiveness>> = a.inner.state().liveness.values().cloned().collect();
+        for liveness in &liveness {
+            liveness.last_read.store(0, Ordering::Relaxed);
+        }
+        // No await between the verdict and the check: no task runs.
+        a.inner.judge_liveness(Some(T));
+        assert!(liveness.iter().all(|l| l.kill.is_cancelled()));
+        assert!(sender.has_failed(), "the lane is failed with the verdict");
+        assert_eq!(a.connection_count(), 0, "no new lane is pinned to it");
+        assert!(
+            event_matching(&mut ea, P, silent).await.is_some(),
+            "the reader reports the silence"
+        );
+    }
+
     /// CL1: a connection that stops delivering one way is failed by the node
     /// that reads nothing, by its timer; the other node sees it end.
     #[tokio::test(start_paused = true)]
@@ -4544,10 +4585,35 @@ mod tests {
         assert!(session.data_sender("nonexistent").is_none());
         assert_eq!(session.peer_node_ids().collect::<Vec<_>>(), vec!["b"]);
         assert_eq!(session.dataflow_id(), df);
-        assert!(session.take_receivers().is_some());
+        let receivers = session.take_receivers().unwrap();
         assert!(session.take_receivers().is_none());
         assert!(session.take_io_events().is_some());
         assert!(session.take_io_events().is_none());
+        // The receivers build an exchange edge through the public API.
+        let topology = crate::execute::ClusterTopology::multi_node(vec![
+            crate::execute::NodeConfig::new("a", 1),
+            crate::execute::NodeConfig::new("b", 1),
+        ])
+        .unwrap();
+        let transport = Arc::new(
+            crate::communication::cluster_transport::ClusterTransport::Shared {
+                session: Arc::new(session),
+            },
+        );
+        crate::dataflow::channels::network::NetworkEdgeMaterializer::<u64, u64>::new_unbounded(
+            df,
+            topology,
+            "a",
+            transport,
+            receivers,
+            16,
+            0,
+            (0..2)
+                .map(|_| crate::dataflow::channels::wake::WakeHandle::new())
+                .collect(),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
     }
 
     /// A lane tags each frame with its dataflow and numbers what it queues;

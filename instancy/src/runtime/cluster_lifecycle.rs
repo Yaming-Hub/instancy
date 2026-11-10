@@ -1613,19 +1613,21 @@ async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
 
 /// Wait until every outbox forwarder has handed its lane to its pooled
 /// connection (Shared mode, graceful teardown), with no fixed deadline. A
-/// peer reported as left (`RuntimeHandle::report_node_leave`), before or
-/// during the wait, needs nothing more from us: its forwarder is aborted
+/// peer reported as left (`RuntimeHandle::report_node_leave`) after `mark`
+/// (when the run started), before or during the wait and even if it has
+/// rejoined since, needs nothing more from us: its forwarder is aborted
 /// instead of waited for.
 async fn await_forwarders(
     forwarders: HashMap<String, tokio::task::JoinHandle<()>>,
     peers: &super::PeerRegistry,
+    mark: u64,
 ) {
     for (peer, mut forwarder) in forwarders {
         loop {
             let reported = peers.down_reported();
             tokio::pin!(reported);
             reported.as_mut().enable();
-            if peers.is_down(&peer) {
+            if peers.left_since(&peer, mark) {
                 forwarder.abort();
                 break;
             }
@@ -1706,6 +1708,9 @@ pub(crate) struct ClusterLifecycle {
     pub(crate) dispatcher: Option<tokio::task::JoinHandle<()>>,
     pub(crate) peer_registry: Arc<super::PeerRegistry>,
     pub(crate) peer_registration: Option<u64>,
+    /// The peer registry's leave reports when the run started (see
+    /// [`super::PeerRegistry::left_since`]).
+    pub(crate) departure_mark: u64,
     pub(crate) shared_managers: Option<Arc<HashMap<String, SharedPeerManager>>>,
     /// The token of this dataflow's registrations with `shared_managers`.
     pub(crate) shared_registration: Option<u64>,
@@ -2091,7 +2096,7 @@ impl ClusterLifecycle {
             // or until the peer is reported as left. Every local worker has
             // finished (graceful), so the forwarders hold the only outboxes,
             // and the lanes end.
-            await_forwarders(forwarders, &self.peer_registry).await;
+            await_forwarders(forwarders, &self.peer_registry, self.departure_mark).await;
         } else {
             // Dedicated mode: as above, bounded, one task per peer, all
             // bounded together, so an unreachable peer does not hold up the
@@ -2189,6 +2194,7 @@ mod tests {
         let stuck = || tokio::spawn(std::future::pending::<()>());
         for reported_before in [true, false] {
             let peers = Arc::new(super::super::PeerRegistry::new());
+            let mark = peers.departure_mark();
             if reported_before {
                 peers.report_peer_down("b");
             }
@@ -2201,7 +2207,7 @@ mod tests {
             let forwarders = HashMap::from([("b".to_string(), b), ("c".to_string(), c)]);
             let waiting = {
                 let peers = Arc::clone(&peers);
-                tokio::spawn(async move { await_forwarders(forwarders, &peers).await })
+                tokio::spawn(async move { await_forwarders(forwarders, &peers, mark).await })
             };
             tokio::time::sleep(Duration::from_secs(3600)).await;
             assert!(
@@ -2221,6 +2227,44 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), waiting)
                 .await
                 .expect("the wait did not end once b was reported as left")
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(b_aborted.is_finished(), "b's forwarder was not aborted");
+        }
+    }
+
+    /// A peer reported leaving and then rejoining, before the wait or while
+    /// the waiter has not run yet, is still not waited for: the run started
+    /// before the report.
+    #[tokio::test(start_paused = true)]
+    async fn teardown_stops_waiting_for_a_peer_that_left_and_rejoined() {
+        for during in [false, true] {
+            let peers = Arc::new(super::super::PeerRegistry::new());
+            // A leave reported before the run started does not count.
+            peers.report_peer_down("b");
+            peers.report_peer_recovered("b");
+            let mark = peers.departure_mark();
+            if !during {
+                peers.report_peer_down("b");
+                peers.report_peer_recovered("b");
+            }
+            let b = tokio::spawn(std::future::pending::<()>());
+            let b_aborted = b.abort_handle();
+            let forwarders = HashMap::from([("b".to_string(), b)]);
+            let waiting = {
+                let peers = Arc::clone(&peers);
+                tokio::spawn(async move { await_forwarders(forwarders, &peers, mark).await })
+            };
+            if during {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                assert!(!waiting.is_finished(), "b never left during this run yet");
+                // Both reports before the waiter runs again.
+                peers.report_peer_down("b");
+                peers.report_peer_recovered("b");
+            }
+            tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .unwrap_or_else(|_| panic!("still waiting for b (during: {during})"))
                 .unwrap();
             tokio::time::sleep(Duration::from_secs(1)).await;
             assert!(b_aborted.is_finished(), "b's forwarder was not aborted");
@@ -3928,6 +3972,7 @@ mod tests {
             dispatcher: None,
             peer_registry: Arc::new(super::super::PeerRegistry::new()),
             peer_registration: None,
+            departure_mark: 0,
             shared_managers: None,
             shared_registration: None,
             transport: Arc::new(ClusterTransport::Dedicated(Arc::new(session))),

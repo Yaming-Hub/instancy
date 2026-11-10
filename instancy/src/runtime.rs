@@ -912,6 +912,12 @@ struct PeerRegistryState {
     down_peers: std::collections::HashSet<String>,
     /// `down_peers` in the order they were reported.
     down_order: std::collections::VecDeque<String>,
+    /// How many leave reports there have been.
+    leaves: u64,
+    /// The number (in `leaves`) of each node's last leave report, kept
+    /// after it rejoins (see [`PeerRegistry::left_since`]). Bounded like
+    /// `down_peers`: the oldest are forgotten first.
+    left_at: std::collections::HashMap<String, u64>,
 }
 
 /// How many departed nodes a [`PeerRegistry`] remembers. A dataflow spawned
@@ -929,18 +935,26 @@ impl PeerRegistry {
                 entries: std::collections::HashMap::new(),
                 down_peers: std::collections::HashSet::new(),
                 down_order: std::collections::VecDeque::new(),
+                leaves: 0,
+                left_at: std::collections::HashMap::new(),
             }),
             down_reported: tokio::sync::Notify::new(),
         }
     }
 
-    /// Whether `peer_node_id` was reported as left (and has not rejoined).
-    pub(crate) fn is_down(&self, peer_node_id: &str) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .down_peers
-            .contains(peer_node_id)
+    /// A mark of the leave reports so far (see [`Self::left_since`]).
+    pub(crate) fn departure_mark(&self) -> u64 {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).leaves
+    }
+
+    /// Whether `peer_node_id` is reported as left, or was reported leaving
+    /// after `mark` (from [`Self::departure_mark`]) even if it has rejoined
+    /// since: a run that started before the report needs nothing more from
+    /// it.
+    pub(crate) fn left_since(&self, peer_node_id: &str, mark: u64) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.down_peers.contains(peer_node_id)
+            || state.left_at.get(peer_node_id).is_some_and(|&at| at > mark)
     }
 
     /// Notified at every later report of a node leaving. Enable the future
@@ -1025,6 +1039,20 @@ impl PeerRegistry {
 
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+
+            state.leaves += 1;
+            let at = state.leaves;
+            state.left_at.insert(peer_node_id.to_string(), at);
+            if state.left_at.len() > MAX_DOWN_PEERS {
+                let oldest = state
+                    .left_at
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(peer, _)| peer.clone());
+                if let Some(oldest) = oldest {
+                    state.left_at.remove(&oldest);
+                }
+            }
 
             // Mark peer as down so future registrations are rejected.
             if state.down_peers.insert(peer_node_id.to_string()) {
@@ -3440,6 +3468,9 @@ impl RuntimeHandle {
             .map(|n| n.node_id.clone())
             .filter(|id| id != local_node_id)
             .collect();
+        // Leave reports from now on concern this run, even if the node
+        // rejoins before its teardown.
+        let departure_mark = self.peer_registry.departure_mark();
         let peer_reg_id = if !remote_peer_ids.is_empty() {
             let worker_tokens: Vec<CancellationToken> =
                 workers.iter().map(|w| w.cancel.clone()).collect();
@@ -3500,6 +3531,7 @@ impl RuntimeHandle {
                 dispatcher: Some(dispatcher),
                 peer_registry: Arc::clone(&self.peer_registry),
                 peer_registration: peer_reg_id,
+                departure_mark,
                 shared_managers: shared_managers_arc,
                 shared_registration,
                 transport,

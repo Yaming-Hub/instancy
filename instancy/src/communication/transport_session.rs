@@ -595,8 +595,10 @@ impl TransportSession {
                 Err(e) => {
                     #[cfg(feature = "tracing")]
                     tracing::error!("Bridge write error for peer {}: {e}", _peer_id);
-                    let _ = events.try_send(PeerIoNotice::new(PeerIoEvent::WriteFailed(e)));
+                    // Refuse frames first: once the failure is reported,
+                    // `outbound_failed` must already see it.
                     drop((control_rx, payload_rx));
+                    let _ = events.try_send(PeerIoNotice::new(PeerIoEvent::WriteFailed(e)));
                     session_closed.cancelled().await;
                     break;
                 }
