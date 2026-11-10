@@ -2251,18 +2251,22 @@ impl SharedPeerManager {
     }
 
     /// Unregister a dataflow, removing its channels and pending control
-    /// frames. Its payload frames already queued on its connection are still
-    /// written; frames sent after this are dropped. The id is remembered
-    /// (boundedly) as finished: it cannot be registered again, and the late
-    /// frames of this run are dropped.
+    /// frames. Control frames already queued on [`Self::control_sender`]
+    /// (its `Cancel`, say) are first put on its connection, and its payload
+    /// frames already queued there are still written; frames sent after this
+    /// are dropped. The id is remembered (boundedly) as finished: it cannot
+    /// be registered again, and the late frames of this run are dropped.
     pub async fn unregister_dataflow(&self, dataflow_id: &DataflowId) {
+        self.route_queued_control().await;
         self.inner.unregister(dataflow_id, None);
     }
 
     /// Unregister `dataflow_id` only if it is still the registration made
     /// with `token`: a cleanup must not remove another registration of the
-    /// same id.
+    /// same id. Queued control frames go first, as in
+    /// [`Self::unregister_dataflow`].
     pub(crate) async fn unregister_registration(&self, dataflow_id: &DataflowId, token: u64) {
+        self.route_queued_control().await;
         self.inner.unregister(dataflow_id, Some(token));
     }
 
@@ -2982,6 +2986,37 @@ mod tests {
 
     /// Dataflows spread over the pool, one connection each: every frame of a
     /// dataflow travels on its connection.
+    /// A control frame queued before unregistering (a teardown's `Cancel`)
+    /// is put on the dataflow's own connection while it is still
+    /// registered, not routed later as one for an unregistered dataflow
+    /// (any pooled connection). Single-threaded: the router runs only when
+    /// unregistering waits for it.
+    #[tokio::test]
+    async fn queued_control_is_routed_before_unregistering() {
+        let (a, _b, _relays) = managers(2);
+        let (other, df) = (DataflowId::new(), DataflowId::new());
+        let _r_other = a.register_dataflow(other, &[1], 16).await.unwrap();
+        let _r_df = a.register_dataflow(df, &[1], 16).await.unwrap();
+        assert_eq!(a.inner.state().registered[&df].conn, 1);
+        let full = a.control_tx.max_capacity();
+        // Let the router settle anything queued by the registrations.
+        a.route_queued_control().await;
+        a.control_tx
+            .try_send(Frame {
+                dataflow_id: df,
+                channel_id: CONTROL_CHANNEL_ID,
+                payload: b"cancel".to_vec(),
+            })
+            .unwrap();
+        assert_eq!(a.control_tx.capacity(), full - 1, "queued, not routed yet");
+        a.unregister_dataflow(&df).await;
+        assert_eq!(
+            a.control_tx.capacity(),
+            full,
+            "routed before the registration ended"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn each_dataflow_lane_is_pinned_to_one_connection() {
         let (a, _b, _relays) = managers(2);
