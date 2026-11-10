@@ -110,7 +110,7 @@ GoAway would only let the peer notice sooner, with a precise reason. It remains 
 
    Today the flush gives up after `handshake_timeout` and unregisters, and the bridge then drops the run's remaining frames. With kept managers, a peer waiting for that run's goodbye or ack waits forever. This happens whenever the shared bridge stalls for longer than the flush's deadline, behind a silent connection or just a very slow one (`ct_silence_sharedbridge_stall`). The multi-process harness reproduces it on real processes (`finished_dataflow_survives_a_one_way_stall_longer_than_handshake` in `instancy-integration/tests/shared_connection_faults.rs`, scenario `one_way_stall_schedule`; it passes with this design): a one-way stall that stops reading a→b on one connection blocks a's bridge, and a dataflow on the other connection ends `Ok` on a at the flush deadline while its peer never finishes. With this design, that dataflow's frames go straight to its own, healthy connection, so it ends promptly on both nodes.
 
-The public API doesn't change; the work is inside `shared_transport.rs`.
+The work is inside `shared_transport.rs`. The public API changes only where the rule needs it: the `silence_timeout` setting, two `TransportError` variants, and unbounded Shared receivers (R59).
 
 **Ordering obligations.** A lane has several producers: worker threads pushing records under the admission lock, and the async outbox forwarder carrying progress, close sentinels, goodbyes and acks. Numbering at enqueue must keep today's per-lane FIFO:
 - a number is taken only by a successful enqueue (a full queue consumes none);

@@ -15,7 +15,8 @@
 //! - `NoFalseSettle`: a send owed is never settled as a failure (a link
 //!   failure, or a loss recorded or held) while the peer's `Cancel`, goodbye
 //!   or ack is on its way to the coordinator, nor by the grace period once
-//!   the peer said goodbye and the link closed fully;
+//!   the peer said goodbye and the link closed fully (a teardown from outside
+//!   settles at once, and is not checked);
 //! - `NoLossWithoutFailedSend`: a run reports a data loss only if a send to
 //!   the peer failed (nothing else here can lose records);
 //! - termination: once the peer has gone, the machine always finishes.
@@ -36,14 +37,18 @@
 //!   Shared mode also runs with the lane and the peer's frames on different
 //!   connections (`split`), where a failure of one leaves the other;
 //! - our side: workers that succeed or fail (on their own, or after a
-//!   cancellation), and a local cancellation (a requested stop, or a
-//!   failure) at any time;
+//!   cancellation), a local cancellation (a requested stop, or a failure)
+//!   and the bridges cancelled from outside (a participant reported
+//!   leaving; here with the token cancelled or not) at any time;
+//!   workers may still finish after a
+//!   teardown, and the run's result is judged as the completion makes it;
 //! - the peer, which may say goodbye (only once it has our records, which it
 //!   needs), ack our goodbye, cancel (a requested stop or a failure), close,
 //!   and go away;
 //! - at most one fault: a local write error, or a reset;
 //! - the coordinator's glue (`ClusterLifecycle::run`): its biased select
-//!   (the token, then events, then the grace timer), the token branch
+//!   (the token, then the bridges' cancellation, then events, then the grace
+//!   timer), the token branch
 //!   applying what is queued first, and how actions are taken.
 //!
 //! Termination is checked as the absence of dead ends: a state where nothing
@@ -269,11 +274,16 @@ struct World {
     queue: Fifo<Ev, 16>,
     token: Option<Kind>,
     cancel_seen: bool,
+    /// The bridges were cancelled from outside (`report_node_leave` of a
+    /// participant).
+    aborted: bool,
     timer: bool,
     /// Torn down: `Some(graceful)`.
     finished: Option<bool>,
     // Our workers.
     workers_left: u8,
+    /// A worker failed (or was cancelled).
+    workers_failed: bool,
     // Our side of the connection.
     io: Fifo<Ev, 4>,
     lane: Fifo<Out, 4>,
@@ -324,9 +334,11 @@ impl World {
             queue: Fifo::EMPTY,
             token: None,
             cancel_seen: false,
+            aborted: false,
             timer: false,
             finished: None,
             workers_left: cfg.workers,
+            workers_failed: false,
             io: Fifo::EMPTY,
             lane: {
                 let mut lane = Fifo::EMPTY;
@@ -432,11 +444,13 @@ impl World {
 enum Step {
     // The coordinator.
     TokenSeen,
+    AbortSeen,
     Apply,
     GraceEnds,
     // Our side.
     Finish(bool),
     LocalCancel(Kind),
+    ExternalAbort,
     // Our transport.
     Deliver,
     WriteFails,
@@ -467,12 +481,20 @@ enum Step {
 
 fn steps(w: &World, cfg: Config) -> Vec<Step> {
     if w.finished.is_some() {
-        return Vec::new();
+        // Torn down; workers torn down from outside may still finish (their
+        // results no longer reach the coordinator).
+        return if w.workers_left > 0 {
+            vec![Step::Finish(true), Step::Finish(false)]
+        } else {
+            Vec::new()
+        };
     }
     let mut steps = Vec::new();
     // The coordinator's biased select.
     if w.token.is_some() && !w.cancel_seen {
         steps.push(Step::TokenSeen);
+    } else if w.aborted {
+        steps.push(Step::AbortSeen);
     } else if !w.queue.is_empty() {
         steps.push(Step::Apply);
     } else if w.timer && !w.busy() {
@@ -486,6 +508,9 @@ fn steps(w: &World, cfg: Config) -> Vec<Step> {
     }
     if w.token.is_none() {
         steps.push(Step::LocalCancel(Kind::Stop));
+    }
+    if !w.aborted {
+        steps.push(Step::ExternalAbort);
     }
     if w.token != Some(Kind::Fail) {
         steps.push(Step::LocalCancel(Kind::Fail));
@@ -678,6 +703,19 @@ fn take_coordinator(
             actions.extend(m.on_dataflow_cancelled(w.token == Some(Kind::Fail)));
             perform(w, actions);
         }
+        Step::AbortSeen => {
+            // Apply what is already queued, then the abort. Not checked
+            // against NoFalseSettle: a teardown from outside settles an owed
+            // send at once, though the peer's Cancel may be on its way.
+            w.aborted = false;
+            let mut actions = Vec::new();
+            while let Some(ev) = w.queue.pop_front() {
+                actions.extend(apply_event(w, m, ev, cfg, stats)?);
+            }
+            let failed = w.outbound_failed(cfg);
+            actions.extend(m.on_external_abort(|_| failed));
+            perform(w, actions);
+        }
         Step::Apply => {
             let ev = w.queue.pop_front().expect("queued");
             let actions = apply_event(w, m, ev, cfg, stats)?;
@@ -712,17 +750,27 @@ fn take_coordinator(
         }
         _ => unreachable!("not the coordinator's: {step:?}"),
     }
-    if w.finished.is_some() && m.data_loss().is_some() {
+    Ok(())
+}
+
+/// The run's result once nothing more can happen, as the completion makes it
+/// (`merge_data_loss`): the workers' result, failed by a data loss, or by a
+/// loss held for workers that finished after teardown if they all succeeded.
+fn judge(w: &World, m: &LifecycleMachine, cfg: Config, stats: &mut Stats) -> Result<(), String> {
+    let workers_ok = !w.workers_failed;
+    let loss = m
+        .data_loss()
+        .or(m.loss_if_workers_succeed().filter(|_| workers_ok));
+    if let Some(loss) = loss {
         stats.data_loss += 1;
         if !w.outbound_failed(cfg) && !w.writer_dead {
             return Err(format!(
-                "NoLossWithoutFailedSend: a data loss ({:?}) although no send to the \
-                 peer failed",
-                m.data_loss()
+                "NoLossWithoutFailedSend: a data loss ({loss:?}) although no send to the \
+                 peer failed"
             ));
         }
     }
-    if w.finished == Some(true) && m.data_loss().is_none() {
+    if workers_ok && loss.is_none() {
         stats.ok += 1;
         let p = peer(m);
         let excused = p.retired() || p.cancel_received;
@@ -752,14 +800,22 @@ fn take_coordinator(
 /// Any other step: the machine is only read.
 fn take_other(w: &mut World, m: &LifecycleMachine, step: Step, cfg: Config) {
     match step {
-        Step::TokenSeen | Step::Apply | Step::GraceEnds => {
+        Step::TokenSeen | Step::AbortSeen | Step::Apply | Step::GraceEnds => {
             unreachable!("the coordinator's: {step:?}")
         }
         Step::Finish(success) => {
             w.workers_left -= 1;
-            w.queue.push_back(Ev::Done(success));
+            w.workers_failed |= !success;
+            if w.finished.is_none() {
+                w.queue.push_back(Ev::Done(success));
+            } else if w.workers_left == 0 && !w.workers_failed {
+                // The last worker succeeded after teardown.
+                w.failed_at_finish = w.outbound_failed(cfg);
+                w.lost_at_finish = !w.records_delivered && (w.writer_dead || w.read_failed);
+            }
         }
         Step::LocalCancel(kind) => w.cancel(kind),
+        Step::ExternalAbort => w.aborted = true,
         Step::Deliver => match w.lane.pop_front().expect("queued") {
             Out::Records => w.records_delivered = true,
             Out::Goodbye => w.goodbye_delivered = true,
@@ -1093,11 +1149,20 @@ fn explore(cfg: Config) -> Result<Stats, String> {
                     path(&trail, at)
                 ));
             }
+            if let Err(violation) = judge(&w, &m, cfg, &mut stats) {
+                return Err(format!(
+                    "{cfg:?}: {violation}\nsteps: {:?}\nworld: {w:?}\nmachine: {m:?}",
+                    path(&trail, at)
+                ));
+            }
             continue;
         }
         for step in next {
             let mut w2 = w;
-            let (m2, m2_key) = if matches!(step, Step::TokenSeen | Step::Apply | Step::GraceEnds) {
+            let (m2, m2_key) = if matches!(
+                step,
+                Step::TokenSeen | Step::AbortSeen | Step::Apply | Step::GraceEnds
+            ) {
                 let mut m2 = fork(&m);
                 if let Err(violation) = take_coordinator(&mut w2, &mut m2, step, cfg, &mut stats) {
                     let mut steps = path(&trail, at);
@@ -1168,7 +1233,7 @@ fn shared_two_workers_one_channel() {
 }
 
 #[test]
-#[ignore = "a minute or more in a debug build: CI runs it in release (conformance job)"]
+#[ignore = "over 100 million states and 8 GB: run by hand, in release"]
 fn shared_two_workers_two_channels() {
     check(Mode::Shared, false, 2, 2);
 }
@@ -1210,7 +1275,7 @@ fn dedicated_two_workers_one_channel() {
 }
 
 #[test]
-#[ignore = "a minute or more in a debug build: CI runs it in release (conformance job)"]
+#[ignore = "over 100 million states and 8 GB: run by hand, in release"]
 fn dedicated_two_workers_two_channels() {
     check(Mode::Dedicated, false, 2, 2);
 }

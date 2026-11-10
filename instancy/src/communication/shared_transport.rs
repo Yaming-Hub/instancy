@@ -52,38 +52,18 @@
 //!
 //! # Connection liveness
 //!
-//! A connection can stop delivering without ever failing: a partition, a
-//! frozen peer, a firewall that dropped its state, a half-open TCP
-//! connection after a crash. With
-//! [`SharedConnectionConfig::silence_timeout`] set (T, 30 s by default):
-//!
-//! - every [`probe_interval`](SharedConnectionConfig::probe_interval) (P)
-//!   each node queues a small probe on each pooled connection (skipped when
-//!   its payload queue is full: frames are already waiting to flow), so a
-//!   healthy connection always has bytes arriving;
-//! - a connection whose reader has read no bytes for T is dead. It fails
-//!   like a read error ([`TransportError::ConnectionSilent`]): its reader
-//!   stops, its writer is aborted at once (dropping what is queued), and the
-//!   dataflows using it fail as below;
-//! - a writer that has had bytes waiting and written none for T fails its
-//!   connection like a write error ([`TransportError::WriteStalled`]), in
-//!   the pool or out of it. This is the rule of TCP's `TCP_USER_TIMEOUT`,
-//!   applied by instancy so that it covers every stream a factory returns.
-//!
-//! Both rules count bytes, not frames: a large frame that takes longer than
-//! T on a slow link keeps its connection alive while its bytes move. A
-//! reader never waits for a consumer (its channels are unbounded), so a slow
-//! consumer can't make a healthy connection look silent. The rules judge one
-//! connection, never a node: they fail only that connection's dataflows, and
-//! a node leaving stays the application's to report
+//! With [`SharedConnectionConfig::silence_timeout`] set (T, 30 s by
+//! default), each node probes every pooled connection every
+//! [`probe_interval`](SharedConnectionConfig::probe_interval), so a healthy
+//! connection always has bytes arriving. A connection whose reader has read
+//! no bytes for T fails like a read error
+//! ([`TransportError::ConnectionSilent`]); one whose writer has had bytes
+//! waiting and written none for T fails like a write error
+//! ([`TransportError::WriteStalled`]). Both rules count bytes, not frames,
+//! and judge one connection, never a node: a node leaving stays the
+//! application's to report
 //! ([`RuntimeHandle::report_node_leave`](crate::RuntimeHandle::report_node_leave)).
-//!
-//! T must exceed P + D + 2S, where D is the longest a healthy connection
-//! takes to deliver a byte and S the longest either node's network tasks
-//! can be paused. A connection that stops delivering is then failed within
-//! T + P + S on each node: by that node's own timer, or by seeing the
-//! connection end. A dataflow that has received no frame from the peer yet
-//! is not bound to a connection: its handshake times out instead.
+//! The design, with the timing condition, is `docs/design/connection-liveness.md`.
 //!
 //! # Connection failures (fail-stop)
 //!
@@ -133,17 +113,14 @@
 //!
 //! # Transport contract
 //!
-//! The application provides the connections and the node membership: it
-//! tells instancy when a peer node has left
-//! ([`RuntimeHandle::report_node_leave`](crate::RuntimeHandle::report_node_leave)).
-//! instancy detects a connection that stops delivering (see "Connection
-//! liveness") and owns safety: it never reports success with lost,
-//! duplicated, reordered or corrupted data (every frame is checksummed, and
-//! every lane is sequenced), and it fails the affected dataflows promptly
-//! when a connection fails, falls silent, or the application reports a node
-//! leaving. With `silence_timeout: None` a connection that silently stops
-//! delivering makes its dataflows wait forever; they are never reported as
-//! successful.
+//! The application provides the connections and the node membership. instancy
+//! detects a connection that stops delivering (see "Connection liveness") and
+//! owns safety: it never reports success with lost, duplicated, reordered or
+//! corrupted data (every frame is checksummed, and every lane is sequenced),
+//! and it fails the affected dataflows promptly when a connection fails,
+//! falls silent, or the application reports a node leaving. With
+//! `silence_timeout: None` a connection that silently stops delivering makes
+//! its dataflows wait; they are never reported as successful.
 //!
 //! # Probe Protocol
 //!

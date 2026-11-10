@@ -76,6 +76,9 @@ struct TeardownState {
     done: bool,
     waker: Option<Waker>,
     data_loss: Option<DataLoss>,
+    /// A loss that counts only if every local worker succeeds: the
+    /// coordinator tore down before their results.
+    loss_if_ok: Option<DataLoss>,
 }
 
 /// Completes the teardown signal when dropped (including when the
@@ -99,6 +102,7 @@ pub(crate) fn teardown_signal(
             done: false,
             waker: None,
             data_loss: None,
+            loss_if_ok: None,
         }),
         condvar: Condvar::new(),
         runtime,
@@ -178,6 +182,11 @@ impl TeardownNotifier {
         lock_state(&self.shared).data_loss = Some(loss);
     }
 
+    /// Record a loss that counts only if every local worker succeeds.
+    pub(crate) fn set_loss_if_ok(&self, loss: DataLoss) {
+        lock_state(&self.shared).loss_if_ok = Some(loss);
+    }
+
     /// Remember the current thread as one of the transport runtime's (the
     /// coordinator runs there).
     pub(crate) fn note_runtime_thread(&self) {
@@ -223,6 +232,12 @@ impl TeardownWaiter {
     /// Data loss recorded by the coordinator, once teardown is done.
     pub(crate) fn data_loss(&self) -> Option<DataLoss> {
         lock_state(&self.shared).data_loss.clone()
+    }
+
+    /// A loss that counts only if every local worker succeeds (see
+    /// [`TeardownNotifier::set_loss_if_ok`]).
+    pub(crate) fn loss_if_ok(&self) -> Option<DataLoss> {
+        lock_state(&self.shared).loss_if_ok.clone()
     }
 
     /// Remember `name` as the name of a multi-thread runtime's threads (see
@@ -654,6 +669,16 @@ impl LifecycleMachine {
         self.data_loss.as_ref()
     }
 
+    /// A loss held for the workers' results that the machine will not see
+    /// (it finished first, torn down from outside): it counts if every
+    /// worker still succeeds.
+    pub(crate) fn loss_if_workers_succeed(&self) -> Option<&DataLoss> {
+        if self.workers_done() || !self.all_workers_ok {
+            return None;
+        }
+        self.pending_loss.as_ref().or(self.deferred_loss.as_ref())
+    }
+
     /// A recorded data loss that no `Cancel` has announced to the peers yet
     /// (it was recorded after the machine finished: queued behind the event
     /// that finished it). Marks it announced: the caller broadcasts `Cancel`.
@@ -792,18 +817,29 @@ impl LifecycleMachine {
         }
     }
 
-    /// Bridges were cancelled from outside (e.g. `report_node_leave`, runtime
-    /// shutdown).
+    /// Bridges were cancelled from outside: `report_node_leave` of a
+    /// participant, which first cancels the dataflow as failed.
     ///
     /// While the local workers run, the dataflow is broken: tell the peers
     /// (Cancel) and abort. Once they have succeeded, our goodbye and
     /// acknowledgements may still sit in the lanes; tear down gracefully so
     /// the bounded flush delivers them to the reachable peers instead of
-    /// leaving those peers waiting for us.
-    pub(crate) fn on_external_abort(&mut self) -> Vec<Action> {
+    /// leaving those peers waiting for us. Either way a send still owed is
+    /// settled as its grace period would (R61). While the workers run, their
+    /// results will not reach the machine, so a send the transport has
+    /// failed (`outbound_failed`, as in [`Self::note_failed_sends`]) is
+    /// noted first, and the loss is held for their results.
+    pub(crate) fn on_external_abort(
+        &mut self,
+        outbound_failed: impl Fn(&str) -> bool,
+    ) -> Vec<Action> {
         match self.phase {
             Phase::Finished => Vec::new(),
             Phase::Draining => {
+                let actions = self.settle_owed_sends();
+                if self.phase == Phase::Finished {
+                    return actions;
+                }
                 for peer in self.peers.values_mut() {
                     if !peer.retired() {
                         peer.lost = true;
@@ -813,8 +849,11 @@ impl LifecycleMachine {
                 vec![Action::Teardown { graceful: true }]
             }
             Phase::Running => {
+                // A send still owed is held as a loss, which counts if the
+                // workers still succeed (`loss_if_workers_succeed`).
+                let mut actions = self.note_failed_sends(outbound_failed);
+                actions.extend(self.settle_owed_sends());
                 self.phase = Phase::Finished;
-                let mut actions = Vec::new();
                 if !self.cancel_broadcast {
                     self.cancel_broadcast = true;
                     actions.push(Action::BroadcastCancel);
@@ -825,8 +864,32 @@ impl LifecycleMachine {
         }
     }
 
+    /// Settle every send still owed as its grace period would: nothing more
+    /// will come to settle it (we are tearing down). A run whose workers
+    /// succeeded then reports the loss, whatever came first (R61).
+    fn settle_owed_sends(&mut self) -> Vec<Action> {
+        let owed: Vec<String> = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| peer.unsent())
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut actions = Vec::new();
+        for peer in owed {
+            actions.extend(self.settle_unsent(peer, None));
+        }
+        actions.extend(self.finish_if_resolved());
+        actions
+    }
+
     /// Every event source is gone; nothing further can arrive.
     pub(crate) fn on_events_closed(&mut self) -> Vec<Action> {
+        if self.phase == Phase::Draining {
+            let actions = self.settle_owed_sends();
+            if self.phase == Phase::Finished {
+                return actions;
+            }
+        }
         if self.phase == Phase::Finished {
             return Vec::new();
         }
@@ -1695,7 +1758,21 @@ impl ClusterLifecycle {
                     actions.extend(self.machine.on_dataflow_cancelled(failure));
                     actions
                 }
-                _ = self.bridge_cancel.cancelled() => self.machine.on_external_abort(),
+                _ = self.bridge_cancel.cancelled() => {
+                    // Apply what is already queued first, as for a
+                    // cancellation: a worker's result or a link event already
+                    // reported must count.
+                    let mut actions = Vec::new();
+                    while let Ok(event) = self.events.try_recv() {
+                        actions.extend(self.apply(event));
+                    }
+                    let transport = Arc::clone(&self.transport);
+                    actions.extend(
+                        self.machine
+                            .on_external_abort(|peer| transport.outbound_failed(peer)),
+                    );
+                    actions
+                }
                 event = self.events.recv() => match event {
                     Some(event) => self.apply(event),
                     None => self.machine.on_events_closed(),
@@ -2089,6 +2166,9 @@ impl ClusterLifecycle {
         self.dispatcher = None;
         if let Some(loss) = self.machine.data_loss() {
             self._teardown.set_data_loss(loss.clone());
+        }
+        if let Some(loss) = self.machine.loss_if_workers_succeed() {
+            self._teardown.set_loss_if_ok(loss.clone());
         }
     }
 }
@@ -2749,6 +2829,45 @@ mod tests {
         let actions = m.on_event(link_event("b", LinkEvent::ProgressEndOfStream));
         assert!(is_teardown(&actions, true), "{actions:?}");
         assert!(m.data_loss().is_none());
+    }
+
+    /// A send still owed when the run is torn down from outside (a
+    /// participant reported leaving) is settled as its grace period
+    /// would: a loss, not Ok, whichever came first. While the workers run,
+    /// it is held for their results, which the machine no longer sees.
+    #[test]
+    fn a_failed_send_still_owed_at_an_external_abort_is_a_loss() {
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        m.on_event(send_failed("b"));
+        let actions = m.on_external_abort(|_| false);
+        assert!(is_teardown(&actions, false), "{actions:?}");
+        assert!(m.data_loss().is_none(), "the workers may still fail");
+        assert_eq!(
+            m.loss_if_workers_succeed().map(|loss| loss.peer.as_str()),
+            Some("b")
+        );
+        // The transport failed the lane; its notice is still on its way.
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        let actions = m.on_external_abort(|peer| peer == "b");
+        assert!(is_teardown(&actions, false), "{actions:?}");
+        assert!(m.loss_if_workers_succeed().is_some());
+        for closed in [false, true] {
+            let (mut m, _) = machine(1, &[("b", 1)]);
+            m.on_event(send_failed("b"));
+            m.on_event(done(true));
+            assert_eq!(m.phase(), Phase::Draining);
+            let actions = if closed {
+                m.on_events_closed()
+            } else {
+                m.on_external_abort(|_| false)
+            };
+            assert!(is_teardown(&actions, true), "{actions:?}");
+            assert_eq!(
+                m.data_loss().map(|loss| loss.peer.as_str()),
+                Some("b"),
+                "closed: {closed}"
+            );
+        }
     }
 
     /// A send that failed while the workers ran is owed even when an inbound
@@ -3980,6 +4099,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A run torn down from outside (a participant reported leaving) with a
+    /// send still owed: a worker's success already queued
+    /// is applied first, and the run reports the loss; otherwise the loss is
+    /// held for the workers' results, which come after teardown, and fails
+    /// the completion only if they succeed.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[tokio::test]
+    async fn an_external_abort_keeps_an_owed_send_for_the_workers_results() {
+        for queued_success in [false, true] {
+            let id = DataflowId::new();
+            let dir = std::env::temp_dir().join(format!("instancy-trace-abort-{}", id.as_uuid()));
+            let ring =
+                crate::progress::trace::recorder_for_test(id, "node-a", None, "node-b", 2, &dir);
+            let (mut m, _) = machine(1, &[("node-b", 1)]);
+            m.on_event(send_failed("node-b"));
+            let events = if queued_success {
+                vec![done(true)]
+            } else {
+                Vec::new()
+            };
+            let (a, _node_b, waiter) = coordinator(id, m, "node-b", events, &ring);
+            a.bridge_cancel.cancel();
+            tokio::time::timeout(Duration::from_secs(10), a.run())
+                .await
+                .unwrap();
+            let held = if queued_success {
+                waiter.data_loss()
+            } else {
+                assert!(waiter.data_loss().is_none(), "the workers may still fail");
+                waiter.loss_if_ok()
+            };
+            assert_eq!(
+                held.map(|loss| loss.peer),
+                Some("node-b".to_string()),
+                "queued success: {queued_success}"
+            );
+            assert!(
+                super::super::merge_data_loss(Ok(()), &waiter).is_err(),
+                "a success reports the loss"
+            );
+            if !queued_success {
+                assert!(matches!(
+                    super::super::merge_data_loss(Err(Error::Cancelled { reason: None }), &waiter),
+                    Err(Error::Cancelled { .. })
+                ));
+            }
+            drop(ring);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     /// The checkpoint after teardown: records reported behind the
     /// acknowledgement that finished the machine are a loss only teardown
     /// records. It is dumped, published to the completion, and announced to
@@ -4086,13 +4256,13 @@ mod tests {
         // While the workers run, an external abort tells the peers.
         let (mut m, _) = machine(1, &[("b", 1)]);
         assert!(matches!(
-            m.on_external_abort().as_slice(),
+            m.on_external_abort(|_| false).as_slice(),
             [
                 Action::BroadcastCancel,
                 Action::Teardown { graceful: false }
             ]
         ));
-        assert!(m.on_external_abort().is_empty());
+        assert!(m.on_external_abort(|_| false).is_empty());
         assert!(m.on_event(done(true)).is_empty());
 
         // After local success it tears down gracefully: the flush delivers
@@ -4101,7 +4271,7 @@ mod tests {
         m.on_event(done(true));
         assert_eq!(m.phase(), Phase::Draining);
         assert!(matches!(
-            m.on_external_abort().as_slice(),
+            m.on_external_abort(|_| false).as_slice(),
             [Action::Teardown { graceful: true }]
         ));
         assert!(!links[0].is_retired());
@@ -4109,7 +4279,7 @@ mod tests {
         let (mut m, _) = machine(1, &[("b", 1)]);
         m.on_dataflow_cancelled(false);
         assert!(matches!(
-            m.on_external_abort().as_slice(),
+            m.on_external_abort(|_| false).as_slice(),
             [Action::Teardown { graceful: false }]
         ));
 

@@ -10,101 +10,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Connection liveness (Shared mode)
 
 Implements [`docs/design/connection-liveness.md`](docs/design/connection-liveness.md)
-(decisions R54–R59).
+(decisions R54–R61 in the progress-accounting decision log).
 
 - **Fixed: a pooled connection that stops delivering no longer hangs its
-  dataflows.** A partition, a frozen peer, a firewall that dropped the
-  connection's state, or a half-open TCP connection used to leave the
-  dataflows on that connection waiting forever. Each node now sends a small
-  probe on every pooled connection every `probe_interval` (1 s by default),
-  and a connection that delivers no bytes for the new
-  `SharedConnectionConfig::silence_timeout` (30 s by default) fails like a
-  read error, with `TransportError::ConnectionSilent`. A writer that has had
-  bytes waiting and written none for that long fails its connection with
-  `TransportError::WriteStalled`. Exactly the dataflows using the connection
-  fail, on both nodes; no other dataflow is affected, no node is reported
-  leaving, and the next registration replaces the connection. Both rules
-  count bytes, not frames, so a large frame on a slow link is not failed.
-  `silence_timeout: None` turns the rule off; `silence_timeout` must be at
-  least 3 × `probe_interval`.
-- **Fixed: a stuck connection no longer holds up the others.** Each
-  `SharedPeerManager` used one task to number and route every dataflow's
-  frames to the peer, so a connection whose writer was stuck stopped every
-  dataflow to that peer, handshakes and `Cancel`s included. Frames now go
-  straight to their dataflow's connection, numbered as they are queued, and
-  each connection's writer sends control frames first.
+  dataflows** (a partition, a frozen peer, a half-open TCP connection).
+  Each node probes every pooled connection every `probe_interval` (1 s). A
+  connection that delivers no bytes for the new
+  `SharedConnectionConfig::silence_timeout` (30 s; `None` turns the rule
+  off; at least 3 × `probe_interval`) fails with
+  `TransportError::ConnectionSilent`, and a writer with bytes waiting that
+  writes none for that long fails it with `TransportError::WriteStalled`.
+  Only the dataflows using the connection fail, on both nodes; no node is
+  reported leaving, and the next registration replaces the connection.
+- **Fixed: a stuck connection no longer holds up the others.** Frames go
+  straight to their dataflow's connection instead of through one task per
+  peer, and each connection sends control frames first.
 - **Fixed: a dataflow can no longer end `Ok` on one node and hang on the
-  other.** Teardown used to give up handing its last frames (goodbye,
-  acknowledgements) to a stalled transport after the handshake timeout and
-  drop them, so the peer waited forever. A frame queued on its connection is
-  now written even once its dataflow unregisters, and Shared-mode teardown
-  waits for its frames with no fixed deadline. The liveness rule bounds the
-  wait (with `silence_timeout: None` nothing does), and a peer reported as
-  left (`report_node_leave`) is not waited for.
-- **Fixed: the documentation of `RuntimeEvent::TransportDegraded`.** It is
-  emitted when one pooled connection fails, which the pool recovers from; it
-  used to advise restarting the runtime, which would fail every running
-  dataflow. It needs no action.
+  other.** Teardown used to give up on its last frames (goodbye, acks) after
+  `handshake_timeout`. A frame queued on its connection is now written even
+  once its dataflow unregisters, and Shared-mode teardown waits for its
+  frames; the liveness rule bounds the wait (with `silence_timeout: None`
+  nothing does).
+- **Fixed: a frame sent on a failed pooled connection is refused**
+  (`try_send`: `Closed`), as in Dedicated mode, instead of being reported as
+  sent and dropped. A refused watermark or error signal is dropped once the
+  failure is reported, so it no longer stops its worker for good.
+- **Fixed: a send that failed while the workers ran is reported, whatever
+  the order of events.** A run used to end `Ok` when the failure reached its
+  coordinator after a worker's success, after the peer was already given up
+  on, during a cancellation, or before the run was torn down from outside.
+  It now returns `CommunicationError::DataLoss` unless the peer finished
+  (its goodbye or ack) or cancelled. Both transport modes; in Dedicated mode
+  a failed read counts, since a reset can lose frames already written.
+- **Fixed: `RuntimeEvent::TransportDegraded` documentation.** It means one
+  pooled connection failed and needs no action; it used to advise
+  restarting the runtime, which fails every running dataflow.
+- **Changed:** a dataflow failed by its link names the connection's error
+  (for example "no bytes read ... for 30s") rather than "connection closed
+  before end of stream". `DataframeSender::try_send` returns `Full` when its
+  connection's queue (256 frames) is full.
 - **Breaking:** `SharedPeerManager::register_dataflow` and
-  `SharedTransportSession::take_receivers` return unbounded receivers
-  (`tokio::sync::mpsc::UnboundedReceiver`): a connection's reader never waits
-  for a consumer, which would hold up every dataflow on the connection and
-  make it look silent. Their `channel_capacity` arguments must still be at
-  least 1 and are otherwise unused. Memory stays unbounded on the receiving
-  node, as it already was one step later; cross-node backpressure is still
-  to come.
-- **Breaking:** `SharedConnectionConfig` has a new public field,
-  `silence_timeout`, and `TransportError` has new variants,
-  `ConnectionSilent` and `WriteStalled`.
-- **Changed:** a cluster dataflow that fails because its link to a peer
-  ended now names the connection's error (for example "no bytes read from
-  the pooled connection for 30s", or a reset) rather than "connection closed
-  before end of stream", when its frames from the peer arrive on that
-  connection. Only the error text changes.
-- **Changed:** `DataframeSender::try_send` returns `Full` when its
-  connection's queue (256 frames) is full, rather than a queue shared by every
-  dataflow to the peer. `SharedPeerManager::unregister_dataflow` no longer
-  drops the dataflow's frames already queued on its connection.
-- **Fixed: a frame sent on a failed pooled connection is no longer reported
-  as sent.** `DataframeSender::send` and `try_send` returned `Ok` and dropped
-  the frame; they now return it (`try_send`: `Closed`), as Dedicated mode
-  does. A worker sending records over a failed connection therefore waits
-  for the failure to be handled, and fails, instead of finishing as if its
-  records had reached the peer.
-- **Fixed: a control signal sent over a closed link no longer stops its
-  worker for good.** A watermark or error that an exchange sends to a peer
-  whose connection is gone was refused with `Backpressure` forever, and the
-  exchange retries control signals until they are taken. It is now dropped
-  once the failure is reported (it carries no records); the coordinator
-  decides as for any failed send. Both transport modes.
-- **Fixed: a send that failed while the workers ran is reported even when
-  its notice arrives late.** The transport knows at once that sending to a
-  peer failed, but the event reaches the dataflow's coordinator later; a
-  worker succeeding in between made the failure look like one after
-  completion, and the node ended `Ok` although a record it had sent was
-  lost (with the writer queue, or in Dedicated mode with a reset the
-  reader saw first). The coordinator now asks the transport as
-  each worker finishes (decision R60), in both transport modes. A failed
-  send reported again while one is still owed (the transport's own notice,
-  the forwarder's report) keeps waiting, so a peer's `Cancel` or goodbye
-  already received still excuses it rather than being overtaken. A failed
-  send also replaces an inbound end that is still waiting (after a read
-  error the inbound end is reported first, and the failed send was
-  dropped), and a peer's goodbye that ends its link's last channel settles
-  the send (only the grace period did, failing a run whose peer had
-  finished). Found by extending `ClusterTransport.tla` to deliver link
-  events late, and by review.
-- **Fixed: a send that failed while the workers ran is a loss even when the
-  peer was already given up on.** When the coordinator gave up on a peer
-  (its link failed, or during a cancellation) before a send to it was known
-  to have failed, the failure was ignored, and a worker's success already on
-  its way, or a drain after a requested stop, ended `Ok` though the peer
-  never got our records. Depending on the order of the events, the same
-  failure ended `Ok` or `DataLoss`. It is now always owed, and reported as
-  `CommunicationError::DataLoss` unless the peer retired the link or
-  cancelled (decision R61). Found by a new test that runs the lifecycle
-  machine through every order of its events, and by its review.
-
+  `SharedTransportSession::take_receivers` return unbounded receivers, so a
+  connection's reader never waits for a consumer. Their `channel_capacity`
+  arguments must still be at least 1 and are otherwise unused. Cross-node
+  backpressure is still to come.
+- **Breaking:** the new `SharedConnectionConfig::silence_timeout` field and
+  `TransportError::ConnectionSilent` and `WriteStalled` variants.
 ### SPSC wake
 
 - **Fixed: an SPSC consumer with a wake handle wakes a producer it unblocks.**

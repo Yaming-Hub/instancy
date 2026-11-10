@@ -25,8 +25,9 @@ keep their own `cargo test` commands.
   runs three fault variants and gets 180 s. The exhaustive lifecycle tests
   (`runtime::cluster_lifecycle::exhaustive`) take a minute or more each in
   a debug build, so they are ignored here and run in release in the
-  conformance job (about 3 minutes in all):
-  `cargo test -p instancy --release --all-features --lib -- --include-ignored cluster_lifecycle::exhaustive::`.
+  conformance job, except the two largest (8 GB), which are run by hand:
+  `cargo test -p instancy --release --all-features --lib -- --include-ignored --test-threads 2 cluster_lifecycle::exhaustive:: --skip two_workers_two_channels`
+  (drop `--skip ...` to run all of them).
   A test that needs more time gets its own exact-test override, never a
   larger global limit.
 - **Four tests at a time**, and at most two that open TCP connections (the

@@ -340,7 +340,7 @@ A `DataflowId` identifies one run of a dataflow, as an execution-attempt id does
 
 - each manager remembers the ids of the dataflows that unregistered (the most recent 16,384), and refuses to register one again, or one that is registered already (`TransportError::InvalidRegistration`). A spawn claims its id with every peer manager before anything else can fail; a spawn refused because another run holds the id (registered, claimed by another spawn, or already ran) drops only its own claims and sends nothing under the id, since a `Cancel` would reach the run that owns it. A peer that did register the id freshly fails at its handshake timeout. A spawn that held its claims and then fails tells its peers, and retires the id;
 - the late frames of a remembered id are dropped instead of being buffered for a registration;
-- the payload frames a dataflow queued before it unregistered carry its registration token, and the bridge drops them, so they are never numbered into another registration's lane; and a cleanup removes only its own registration.
+- a payload frame is numbered into its own registration's lane when it is queued, so one queued before the dataflow unregistered is written but never numbered into another registration's lane; and a cleanup removes only its own registration.
 
 An id reused after it has left the window (16,384 later dataflows on that peer manager) is not detected: that is a contract violation. Dedicated mode opens fresh connections per run, so nothing crosses between runs there. Linking the runs that are retries of one logical computation (a stable logical id and an attempt number) is planned as a separate feature.
 

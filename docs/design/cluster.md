@@ -490,8 +490,8 @@ no longer happen, the drain stops at once instead of at its deadline:
 The stopped workers then fail, and the node announces that in turn.
 A local cancellation or runtime shutdown that happens after the goodbye was
 committed is not broadcast and does not cut the handshake short. The same
-holds for an external abort of the network bridges (`report_node_leave`,
-runtime shutdown): after local success the node still tears down gracefully,
+holds for an external abort of the network bridges (`report_node_leave` of a
+participant): after local success the node still tears down gracefully,
 so the bounded flush delivers its queued goodbye and acknowledgements to the
 reachable peers; while its workers still run, it broadcasts `Cancel` first.
 
@@ -578,18 +578,14 @@ confirmed. If a node's transport is *aborted* (its tokio runtime dropped) at
 the instant its peer also finishes, that peer may miss both the goodbye and
 the ack. It then detects the link loss (EOF on its connection) and still
 reports its own local result.
-Frames still waiting in a shared manager's bridge queue (not yet on a
-connection's writer queue) are lost when an application drops the last
-reference to that manager outside a dataflow's teardown. (A failed
-`spawn_cluster` holds the managers until its `Cancel` has passed their
-bridges, bounded by its handshake timeout and as long as its tokio runtime
-runs, so releasing per-job managers there does not lose the `Cancel`.) A peer that is
-partitioned but whose connection never fails is not detected: the dataflow
-waits until the connection fails or the application reports the node down
-(`report_node_leave`). If a `Cancel` broadcast times out (its control queue
-stayed full for `handshake_timeout`) and the local workers then still succeed,
-a Shared-mode peer that never received the `Cancel` may miss the goodbye too,
-because the goodbye is dropped when the dataflow unregisters. A frame that
+Control frames still waiting for a shared manager's control router (not yet
+on a connection) are lost when an application drops the last reference to
+that manager outside a dataflow's teardown. (A failed `spawn_cluster` holds
+the managers until its `Cancel` is on their connections, bounded by its
+handshake timeout.) In Dedicated mode, and in Shared mode with
+`silence_timeout: None`, a peer that is partitioned but whose connection
+never fails is not detected: the dataflow waits until the connection fails
+or the application reports the node down (`report_node_leave`). A frame that
 arrives while the node tears down (after its last link resolved) may not be
 read at all; corruption in it is then not seen. Detection of protocol
 violations assumes a peer running this protocol: a peer that sends data on a
@@ -1096,7 +1092,7 @@ Tests run under nextest's `ci` profile (`docs/testing/nextest.md`): no retries, 
 ### Scenarios
 
 - `shared_cluster`: a healthy cluster, a killed node, a dataflow that leaves out the killed node, a restart, kills during spawn and teardown, and a node killed behind a partition: every connection to and from it stalled, so its death reaches the survivors only through the leave report, which must cancel every dataflow on each survivor, each then failing with "peer node down".
-- `shared_connection_faults`: one connection delayed, throttled or stalled (exact output), stalled for 15 s, longer than the spawn handshake timeout, from before the input or from as the dataflows finish (exact output after the heal), or reset or closed (only the dataflows between its two nodes fail). R58 of the connection-liveness design: dataflow Y ends while a one-way stall of the connection carrying dataflow X from a holds a's writer for X (its payload queue full behind a full socket); Y uses the other connection, so it must end `Ok` and exact on a and on b while the stall holds, and X after the heal; the stall heals 5 s before the silence timeout at the latest. And the liveness rule itself: the one connection between a and b stops delivering, both ways or one way, with no membership report, and is held past the silence timeout (30 s); nothing between a and b may end before it, and within the timeout plus 10 s every node that reads nothing on it must fail its dataflows between a and b, reporting the silence ("no bytes read"), while a node that still reads fails or ends `Ok` with exact output; the dataflows on other node pairs must be exact, and a new dataflow between a and b must then be exact on a new connection.
+- `shared_connection_faults`: one connection delayed, throttled or stalled (exact output), stalled for 15 s, longer than the spawn handshake timeout, from before the input or from as the dataflows finish (exact output after the heal), or reset or closed (only the dataflows between its two nodes fail). Connection liveness: a dataflow on a healthy connection ends `Ok` and exact on both nodes while another connection is stalled one way (R58); and a connection that stops delivering, one way or both, past the silence timeout fails only the dataflows between its two nodes, reporting the silence, while the others stay exact and a new dataflow gets a new connection.
 - `shared_graceful_exit`: a node that exits after `Ok` while its peers still run the dataflow.
 - `fault_campaign`: the randomized campaign below.
 - `relay`, `harness_control`: the harness's own parts, including a shutdown that must fail when a node hangs or crashes at exit.

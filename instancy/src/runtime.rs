@@ -5518,17 +5518,21 @@ impl<T: Timestamp> ClusterCompletion<T> {
                     .wait(),
             };
             teardown.wait();
-            merge_data_loss(result, teardown.data_loss())
+            merge_data_loss(result, teardown)
         })?
     }
 }
 
 /// Records lost on the way to this node fail an otherwise successful run;
-/// they also explain a cancellation they caused.
+/// they also explain a cancellation they caused. A loss held for workers
+/// whose results came after teardown fails only a successful run.
 #[cfg(feature = "transport")]
-fn merge_data_loss(result: Result<()>, loss: Option<cluster_lifecycle::DataLoss>) -> Result<()> {
-    match (result, loss) {
+fn merge_data_loss(result: Result<()>, teardown: &cluster_lifecycle::TeardownWaiter) -> Result<()> {
+    match (result, teardown.data_loss()) {
         (Ok(()), Some(loss)) | (Err(Error::Cancelled { .. }), Some(loss)) => Err(loss.into_error()),
+        (Ok(()), None) => teardown
+            .loss_if_ok()
+            .map_or(Ok(()), |loss| Err(loss.into_error())),
         (result, _) => result,
     }
 }
@@ -5558,7 +5562,7 @@ impl<T: Timestamp> Future for ClusterCompletion<T> {
         }
         match this.teardown.poll_done(cx) {
             Poll::Ready(()) => match this.result.take() {
-                Some(result) => Poll::Ready(merge_data_loss(result, this.teardown.data_loss())),
+                Some(result) => Poll::Ready(merge_data_loss(result, &this.teardown)),
                 None => Poll::Ready(Err(Error::Runtime(RuntimeError::AlreadyConsumed {
                     resource: "cluster completion".into(),
                 }))),
