@@ -125,6 +125,13 @@ Implements [`docs/design/connection-liveness.md`](docs/design/connection-livenes
 
 ### Test suite, docs and small fixes
 
+- **Fixed: `progress::check::oracles_since` no longer misses an oracle
+  being dropped.** An oracle whose last reference was dropped on a worker
+  thread while the call ran was in neither the live nor the finished list,
+  so a test could intermittently see no oracle for a dataflow that was
+  checked (`progress_conformance`'s
+  `staged_and_simple_workers_have_one_global_view_each`). The call now
+  waits for such an oracle to finish.
 - **Fixed: a `unary_async` operator whose Tokio runtime shuts down fails its
   dataflow.** The operator runs its tasks on the Tokio runtime that is
   current when `unary_async` is called. If that runtime shut down before or
