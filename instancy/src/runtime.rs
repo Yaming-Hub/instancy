@@ -3506,7 +3506,6 @@ impl RuntimeHandle {
                 failure_announced: false,
                 unfinished_announced: false,
                 worker_failure: None,
-                noted_send_failures: std::collections::HashSet::new(),
                 #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
                 loss_dumped: false,
                 _teardown: teardown_notifier,

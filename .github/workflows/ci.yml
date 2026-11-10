@@ -185,6 +185,10 @@ jobs:
       # the other jobs.
       - name: Progress conformance matrix (full)
         run: cargo test -p instancy --all-features --test progress_conformance -- --ignored --exact --test-threads=1 full_conformance_matrix
+      # Every order of the lifecycle machine's events, in every configuration
+      # (tens of millions of states): in release, where it takes minutes.
+      - name: Lifecycle machine, every order of events (all configurations)
+        run: cargo test -p instancy --release --all-features --lib -- --include-ignored cluster_lifecycle::exhaustive::
       - name: Upload progress traces
         if: always()
         uses: actions/upload-artifact@v4

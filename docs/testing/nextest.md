@@ -22,8 +22,13 @@ keep their own `cargo test` commands.
   failing test.
 - **Timeouts.** A test still running after 120 s is terminated, which fails
   it. `cluster_teardown_adversarial::writer_only_failure_never_hangs_or_passes_silently`
-  runs three fault variants and gets 180 s. A test that needs more time gets
-  its own exact-test override, never a larger global limit.
+  runs three fault variants and gets 180 s. The exhaustive lifecycle tests
+  (`runtime::cluster_lifecycle::exhaustive`) take a minute or more each in
+  a debug build, so they are ignored here and run in release in the
+  conformance job (about 3 minutes in all):
+  `cargo test -p instancy --release --all-features --lib -- --include-ignored cluster_lifecycle::exhaustive::`.
+  A test that needs more time gets its own exact-test override, never a
+  larger global limit.
 - **Four tests at a time**, and at most two that open TCP connections (the
   `tcp-cluster` group). The group's filter names whole binaries where TCP
   tests are mixed with local ones, and the library's transport tests. The

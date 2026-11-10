@@ -409,13 +409,19 @@ still succeed (the cancellation raced with completion) queues its goodbye and
 tears down without waiting for acknowledgements. Otherwise two nodes that
 both finish successfully after a crossing cancellation could each wait for a
 goodbye or ack from a peer that had already torn down; in Shared mode nothing
-else could resolve that wait.
+else could resolve that wait. A failed send is different (below): a success
+that raced with it still fails.
 A link that is not retired and fails while the local workers still run (EOF,
 a corrupt frame or control message, a send or encode failure, a poisoned
 lock, a shared-transport error) is fatal: the coordinator cancels the local
 dataflow (`CancellationReason::NetworkError`, or `InternalError` for a
 poisoned lock), broadcasts `Cancel` to every reachable peer and tears down
-once the local workers have stopped. An EOF, or a send failure (usually the
+once the local workers have stopped. Frames we sent the peer while the
+workers ran and lost (a failed send, or a frame dropped outright) stay a loss
+if every local worker still succeeds anyway (a success already on its way,
+or a drain after a requested stop), unless the peer retired the link or
+cancelled: the completion returns `CommunicationError::DataLoss` (R61). A
+link that failed only on its inbound side lost none of our frames. An EOF, or a send failure (usually the
 peer's side of the connection is gone), counts only once every channel
 from the peer has closed; the control channel closes last, after any
 `Cancel` queued on it has been applied, so a cancelling peer is reported as

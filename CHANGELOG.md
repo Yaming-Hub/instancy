@@ -94,6 +94,16 @@ Implements [`docs/design/connection-liveness.md`](docs/design/connection-livenes
   the send (only the grace period did, failing a run whose peer had
   finished). Found by extending `ClusterTransport.tla` to deliver link
   events late, and by review.
+- **Fixed: a send that failed while the workers ran is a loss even when the
+  peer was already given up on.** When the coordinator gave up on a peer
+  (its link failed, or during a cancellation) before a send to it was known
+  to have failed, the failure was ignored, and a worker's success already on
+  its way, or a drain after a requested stop, ended `Ok` though the peer
+  never got our records. Depending on the order of the events, the same
+  failure ended `Ok` or `DataLoss`. It is now always owed, and reported as
+  `CommunicationError::DataLoss` unless the peer retired the link or
+  cancelled (decision R61). Found by a new test that runs the lifecycle
+  machine through every order of its events, and by its review.
 
 ### SPSC wake
 

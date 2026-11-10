@@ -506,6 +506,58 @@ with its expected result and, for the passing ones, the same state count. The
 multi-hour scenarios (concurrent, crosswise and silence) were not rerun: the
 switches are off there, and with `Notices = "sync"` the new fields never
 change.
+
+### Checking the code itself
+
+The model is a hand-written copy of the lifecycle machine. Each gap in the
+copy hid a bug, and the model was extended only after each was found.
+`instancy/src/runtime/cluster_lifecycle/exhaustive.rs` runs the real
+`LifecycleMachine` through every order in which its events can reach it:
+- for one peer, in Shared mode (lane and inbound side on one connection, or
+  on two) and Dedicated mode, with one or two local workers and progress
+  channels, at most one write error or reset, and a local cancellation (a
+  requested stop or a failure) at any time;
+- against the same rules (`NoOkAfterFailedSend`, `NoFalseSettle`,
+  termination once the peer has gone), plus `NoOkOverKnownLoss` (no `Ok`
+  over records that never reached the peer once our side had seen the
+  connection fail) and `NoLossWithoutFailedSend` (no data loss reported
+  unless a send failed: a false failure).
+
+Only the environment is written by hand: the event producers and their
+orders (the dispatcher escalates the token and reports the `Cancel` in two
+steps, as the code does), each transport, our workers, the peer, the
+coordinator's glue, and the grace period under the same timing assumption.
+
+| Workers, channels | Shared | Shared, split | Dedicated |
+|---|---|---|---|
+| 1, 1 | pass, 2,122,218 states | pass, 1,451,821 | pass, 1,840,468 |
+| 1, 2 | pass, 10,530,873 | pass, 5,587,234 | pass, 7,702,514 |
+| 2, 1 | pass, 13,278,193 | pass, 9,223,144 | pass, 11,538,575 |
+| 2, 2 | pass, 65,789,972 | not run | pass, 45,828,472 |
+
+CI explores all of them in release, in the conformance job (about 3
+minutes). Removing any fix above brings its bug back within seconds on the
+smallest configuration:
+- the finish-time check (6ece576);
+- the absorbed repeat;
+- the failed send replacing an inbound end;
+- the goodbye settling;
+- the Dedicated read case.
+
+It also found bugs the model could not reach, fixed by R61. The workers'
+result is an event like the others, queued behind link events, and a
+cancellation can come from our side at any time:
+- A link failure applied first gave up on the peer. The finish-time check's
+  failed send then hit a peer already given up on and was ignored, and a
+  success already on its way ended `Ok`, though our records never reached
+  the peer. In the model the workers' success is applied in the step it
+  happens, so a failed run never succeeds.
+- During a cancellation, a failed send was not owed. A drain, or a success
+  on its way, ended `Ok` or `DataLoss` depending on the order of the events.
+- The first fix for these (a loss for any link failure) failed a run whose
+  lane was healthy when only the peer's inbound connection failed. Found by
+  review, then by the split configuration.
+- The second fix owed a send again after it had been settled (two workers).
 ### What it shows, and what it does not
 
 **It shows,** for two nodes and these bounds:
@@ -518,6 +570,7 @@ change.
 - **That a failed connection fails *every* run using it.** `NoCollateralFail` is one-way; a run on a failed connection may still succeed when it no longer needed the lost frames, and `NoLossOk` covers the case where it did.
 - **More than two nodes**, or link retirement through a third node (R47's three-node shapes).
 - **The lifecycle machine's soft failures.** A send failure the code settles later (`settle_unsent`) is decided at once here, except with `Notices = "async"`, where the run's one deferred failure is kept and settled as the machine does, with the grace period under its timing assumption.
+- **Worker results in flight.** The workers' success is applied in the step it happens; the code queues it behind link events. The exhaustive check of the code covers this (R61).
 - **Timing.** Linger has no deadline, where the code caps it at 10 s, and the handshake and ready barrier are one step whose timeout fires only when the peer's run already ended.
 - **Bounded id memory.** The model remembers every finished id; PR9 keeps the last 16,384.
 - **Data-channel close sentinels and real progress.** Completion is the abstract "record and progress received"; the progress models cover the rest.

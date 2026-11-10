@@ -15,6 +15,12 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 # Caps how many TCP-using test processes run at once.
 tcp-cluster = { max-threads = 2 }
 
+# The lifecycle machine explored exhaustively opens no connection. Listed
+# before the TCP group below, which its name would otherwise match.
+[[profile.ci.overrides]]
+filter = 'kind(lib) & test(/cluster_lifecycle::exhaustive::/)'
+test-group = '@global'
+
 # Runs three fault variants and can take over 60 s: terminated after 180 s.
 [[profile.ci.overrides]]
 filter = 'binary(=cluster_teardown_adversarial) & test(=writer_only_failure_never_hangs_or_passes_silently)'
