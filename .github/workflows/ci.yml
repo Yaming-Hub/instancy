@@ -189,7 +189,10 @@ jobs:
       # states a configuration), in release, where it takes minutes. The two
       # largest configurations need 8 GB and are run by hand.
       - name: Lifecycle machine, every order of events
-        run: cargo test -p instancy --release --all-features --lib -- --include-ignored --test-threads 2 cluster_lifecycle::exhaustive:: --skip two_workers_two_channels
+        run: |
+          cargo test -p instancy --release --all-features --lib -- \
+            --include-ignored --test-threads 2 \
+            cluster_lifecycle::exhaustive:: --skip two_workers_two_channels
       - name: Upload progress traces
         if: always()
         uses: actions/upload-artifact@v4
