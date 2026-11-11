@@ -60,7 +60,10 @@ pub struct SharedConnectionConfig {
     /// stays with
     /// [`RuntimeHandle::report_node_leave`](crate::RuntimeHandle::report_node_leave).
     ///
-    /// It must exceed P + D + 2S, where D is the longest a healthy connection
+    /// It must exceed P + D + 2S, where P is the larger of this node's and
+    /// the peer's probe interval (while this node writes a large frame, its
+    /// own probes wait behind it, and the bytes it reads are the peer's
+    /// probes), D is the longest a healthy connection
     /// takes to deliver a byte, and S the longest this node's or the peer's
     /// network tasks can be paused (a busy Tokio runtime, a stop-the-world
     /// pause): a shorter one can fail a healthy connection. Values under

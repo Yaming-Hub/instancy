@@ -194,6 +194,9 @@ const MAX_COMPLETED_DATAFLOWS: usize = 16_384;
 /// backpressure) and takes no sequence number.
 const WRITER_QUEUE: usize = 256;
 
+/// Capacity of a manager's control queue, which the control router drains.
+const CONTROL_QUEUE: usize = 256;
+
 /// A frame for a connection's writer: a payload frame with the sequence
 /// number its lane gave it as it was queued (written in front of its
 /// payload), or a probe.
@@ -499,7 +502,9 @@ impl AsyncWrite for TimedWriter {
 ///   writer has written nothing for that long while bytes waited, it fails
 ///   and exactly the dataflows using it fail. Progress is observed at the
 ///   halves the factory returns: bytes read, bytes a write accepted, and
-///   completed flushes. A peer node that leaves is the
+///   completed flushes. A writer that buffers hides the progress below it
+///   while its buffer drains, so keep any buffer small enough to drain well
+///   within `silence_timeout` on the slowest link. A peer node that leaves is the
 ///   application's to report
 ///   ([`RuntimeHandle::report_node_leave`](crate::RuntimeHandle::report_node_leave)).
 ///   With `silence_timeout: None`, a stream that silently stops delivering
@@ -1835,7 +1840,9 @@ async fn reader_task(
 /// Control router: puts each control frame on its connection's control
 /// queue, without ever waiting, so a stuck connection holds up no other
 /// dataflow's control frames. A message on `barriers` asks it to route
-/// everything queued so far first (see [`SharedPeerManager::close`]).
+/// everything queued so far first (see [`SharedPeerManager::close`]). It is
+/// served first, and waits only for the frames ahead of it (at most
+/// [`CONTROL_QUEUE`]), so later control frames can never hold it up.
 async fn control_router(
     inner: Arc<Inner>,
     mut control_rx: tokio_mpsc::Receiver<Frame>,
@@ -1844,16 +1851,17 @@ async fn control_router(
     loop {
         tokio::select! {
             biased;
-            frame = control_rx.recv() => match frame {
-                Some(frame) => inner.route_control(frame),
-                None => return,
-            },
             Some(routed) = barriers.recv() => {
-                while let Ok(frame) = control_rx.try_recv() {
+                for _ in 0..CONTROL_QUEUE {
+                    let Ok(frame) = control_rx.try_recv() else { break };
                     inner.route_control(frame);
                 }
                 let _ = routed.send(());
             }
+            frame = control_rx.recv() => match frame {
+                Some(frame) => inner.route_control(frame),
+                None => return,
+            },
         }
     }
 }
@@ -1973,7 +1981,7 @@ impl SharedPeerManager {
             epoch,
         });
 
-        let (control_tx, control_rx) = tokio_mpsc::channel::<Frame>(256);
+        let (control_tx, control_rx) = tokio_mpsc::channel::<Frame>(CONTROL_QUEUE);
         let (router_barrier, barriers) = tokio_mpsc::unbounded_channel();
         let router = runtime_handle.spawn(control_router(Arc::clone(&inner), control_rx, barriers));
         push_task_handle(&inner.task_handles.tasks, router);
@@ -2984,8 +2992,6 @@ mod tests {
         );
     }
 
-    /// Dataflows spread over the pool, one connection each: every frame of a
-    /// dataflow travels on its connection.
     /// A control frame queued before unregistering (a teardown's `Cancel`)
     /// is put on the dataflow's own connection while it is still
     /// registered, not routed later as one for an unregistered dataflow
@@ -3017,6 +3023,32 @@ mod tests {
         );
     }
 
+    /// Unregistering waits only for the control frames queued before it:
+    /// another dataflow's control frames arriving all the while don't hold it
+    /// up. Single-threaded, with the queue full when unregistering starts and
+    /// refilled as fast as the router takes frames, so it is never empty.
+    #[tokio::test]
+    async fn unregistering_is_not_held_up_by_later_control_frames() {
+        let (a, _b, _relays) = managers(1);
+        let df = DataflowId::new();
+        let _registered = a.register_dataflow(df, &[1], 16).await.unwrap();
+        a.route_queued_control().await;
+        let frame = Frame {
+            dataflow_id: DataflowId::new(),
+            channel_id: CONTROL_CHANNEL_ID,
+            payload: Vec::new(),
+        };
+        while a.control_tx.try_send(frame.clone()).is_ok() {}
+        let control = a.control_tx.clone();
+        let flood = tokio::spawn(async move { while control.send(frame.clone()).await.is_ok() {} });
+        let unregistered =
+            tokio::time::timeout(Duration::from_secs(2), a.unregister_dataflow(&df)).await;
+        flood.abort();
+        assert!(unregistered.is_ok(), "unregistering waited on later frames");
+    }
+
+    /// Dataflows spread over the pool, one connection each: every frame of a
+    /// dataflow travels on its connection.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn each_dataflow_lane_is_pinned_to_one_connection() {
         let (a, _b, _relays) = managers(2);
