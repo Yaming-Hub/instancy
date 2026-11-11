@@ -121,6 +121,7 @@ impl ConnectionFactory for Echo {
 async fn payload_on_control_channel_does_not_break_sequenced_lane() {
     let cfg = SharedConnectionConfig {
         probe_interval: Duration::from_secs(3600),
+        silence_timeout: None,
         ..SharedConnectionConfig::default()
     };
     let f: Arc<dyn DynConnectionFactory> = Arc::new(Echo);

@@ -854,7 +854,6 @@ mod tests {
 
         let handle = tokio::runtime::Handle::current();
         let config = SharedConnectionConfig {
-            probe_interval: Duration::from_secs(3600),
             ..Default::default()
         };
         let manager = |peer: &str, stream| {

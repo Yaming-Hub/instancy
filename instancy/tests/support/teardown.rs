@@ -689,11 +689,10 @@ where
     }
 }
 
-/// Fixed-size pool without probing or scaling.
+/// Fixed-size pool.
 pub fn shared_config(conns: usize) -> SharedConnectionConfig {
     SharedConnectionConfig {
         connections: conns,
-        probe_interval: Duration::from_secs(3600),
         rtt_ema_alpha: 0.2,
         ..SharedConnectionConfig::default()
     }

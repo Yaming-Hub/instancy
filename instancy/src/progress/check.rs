@@ -658,26 +658,50 @@ fn finished_stats() -> MutexGuard<'static, std::collections::VecDeque<OracleStat
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// Oracles created and not yet in [`finished_stats`]: an oracle being
+/// dropped (on a worker thread, say) can no longer be upgraded from the
+/// registry, and is not finished until its drop has drained it.
+fn unfinished() -> MutexGuard<'static, std::collections::BTreeSet<u64>> {
+    static UNFINISHED: OnceLock<Mutex<std::collections::BTreeSet<u64>>> = OnceLock::new();
+    UNFINISHED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Statistics of every oracle created at or after `mark`, live or finished.
+/// An oracle being dropped meanwhile is waited for.
 pub fn oracles_since(mark: u64) -> Vec<OracleStats> {
-    let _settled = settle();
-    let mut stats: Vec<OracleStats> = finished_stats()
-        .iter()
-        .filter(|s| s.seq >= mark)
-        .cloned()
-        .collect();
-    let live: Vec<Arc<dyn Sink>> = registry()
-        .values()
-        .filter_map(|w| w.sink.upgrade())
-        .collect();
-    for sink in live {
-        let s = sink.stats();
-        if s.seq >= mark && !stats.iter().any(|f| f.seq == s.seq) {
-            stats.push(s);
+    loop {
+        // Read before the finished list: an oracle leaves this set only
+        // after it is in that list.
+        let unfinished: Vec<u64> = unfinished().range(mark..).copied().collect();
+        let settled = settle();
+        let mut stats: Vec<OracleStats> = finished_stats()
+            .iter()
+            .filter(|s| s.seq >= mark)
+            .cloned()
+            .collect();
+        // Every oracle is watched, including one kept apart from the
+        // registry (same id, different shape).
+        let live: Vec<Arc<dyn Sink>> = live().iter().filter_map(|(_, w)| w.upgrade()).collect();
+        for sink in live {
+            let s = sink.stats();
+            if s.seq >= mark && !stats.iter().any(|f| f.seq == s.seq) {
+                stats.push(s);
+            }
         }
+        if unfinished
+            .iter()
+            .all(|seq| stats.iter().any(|s| s.seq == *seq))
+        {
+            stats.sort_by_key(|s| s.seq);
+            return stats;
+        }
+        // Being dropped: let its drop finish (it may need the pass).
+        drop(settled);
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    stats.sort_by_key(|s| s.seq);
-    stats
 }
 
 // ---------------------------------------------------------------------------
@@ -1438,6 +1462,7 @@ impl<T: Timestamp> Oracle<T> {
             total_workers,
             ..OracleStats::default()
         };
+        unfinished().insert(stats.seq);
         Self {
             id,
             total_workers,
@@ -2270,11 +2295,15 @@ impl<T: Timestamp> Drop for Oracle<T> {
             self.drain();
         }
         let stats = self.lock().stats.clone();
-        let mut finished = finished_stats();
-        if finished.len() >= LOG_CAPACITY {
-            finished.pop_front();
+        let seq = stats.seq;
+        {
+            let mut finished = finished_stats();
+            if finished.len() >= LOG_CAPACITY {
+                finished.pop_front();
+            }
+            finished.push_back(stats);
         }
-        finished.push_back(stats);
+        unfinished().remove(&seq);
     }
 }
 

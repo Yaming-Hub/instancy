@@ -47,6 +47,8 @@
 #[cfg(feature = "transport")]
 use crate::cancellation::{CancellationReason, CancellationToken};
 #[cfg(feature = "transport")]
+use crate::communication::cluster_transport::PeerChannelReceiver;
+#[cfg(feature = "transport")]
 use crate::dataflow::id::DataflowId;
 #[cfg(feature = "transport")]
 use crate::wire;
@@ -523,7 +525,7 @@ pub(crate) fn graph_fingerprint<T: crate::progress::timestamp::Timestamp>(
 /// messages stay queued for the next phase.
 #[cfg(feature = "transport")]
 async fn receive_from_each_peer(
-    control_receivers: &mut std::collections::HashMap<String, tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    control_receivers: &mut std::collections::HashMap<String, PeerChannelReceiver>,
     deadline: tokio::time::Instant,
     watch_answered: bool,
     mut check: impl FnMut(&str, &[u8]) -> Result<(), HandshakeError>,
@@ -722,7 +724,7 @@ fn validate_peer_ready(peer_id: &str, data: &[u8]) -> Result<(), HandshakeError>
 #[cfg(feature = "transport")]
 pub async fn perform_handshake(
     session: &super::TransportSession,
-    control_receivers: &mut std::collections::HashMap<String, tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    control_receivers: &mut std::collections::HashMap<String, PeerChannelReceiver>,
     local_node_id: &str,
     local_fingerprint: u64,
     dataflow_id: DataflowId,
@@ -776,7 +778,7 @@ pub async fn perform_handshake(
 #[cfg(feature = "transport")]
 pub async fn perform_ready_barrier(
     session: &super::TransportSession,
-    control_receivers: &mut std::collections::HashMap<String, tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    control_receivers: &mut std::collections::HashMap<String, PeerChannelReceiver>,
     local_node_id: &str,
     dataflow_id: DataflowId,
     timeout: std::time::Duration,
@@ -821,7 +823,7 @@ pub async fn perform_ready_barrier(
 #[cfg(feature = "transport")]
 pub async fn perform_handshake_with_transport(
     transport: &super::cluster_transport::ClusterTransport,
-    control_receivers: &mut std::collections::HashMap<String, tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    control_receivers: &mut std::collections::HashMap<String, PeerChannelReceiver>,
     local_node_id: &str,
     local_fingerprint: u64,
     dataflow_id: DataflowId,
@@ -872,7 +874,7 @@ pub async fn perform_handshake_with_transport(
 #[cfg(feature = "transport")]
 pub async fn perform_ready_barrier_with_transport(
     transport: &super::cluster_transport::ClusterTransport,
-    control_receivers: &mut std::collections::HashMap<String, tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    control_receivers: &mut std::collections::HashMap<String, PeerChannelReceiver>,
     local_node_id: &str,
     dataflow_id: DataflowId,
     timeout: std::time::Duration,
@@ -1000,7 +1002,7 @@ pub(crate) async fn join_all<F: std::future::Future>(futures: Vec<F>) -> Vec<F::
 /// verification is the responsibility of the transport layer.
 #[cfg(feature = "transport")]
 pub(crate) fn spawn_control_dispatcher(
-    control_receivers: std::collections::HashMap<String, tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    control_receivers: std::collections::HashMap<String, PeerChannelReceiver>,
     cancel_token: CancellationToken,
     shutdown: tokio_util::sync::CancellationToken,
     events: super::peer_link::LifecycleEventSender,
@@ -1573,7 +1575,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let (events, events_rx) = tokio::sync::mpsc::unbounded_channel();
         let dispatcher = spawn_control_dispatcher(
-            std::collections::HashMap::from([("node-b".to_string(), rx)]),
+            std::collections::HashMap::from([("node-b".to_string(), rx.into())]),
             cancel_token.clone(),
             shutdown.clone(),
             events,
@@ -1783,13 +1785,13 @@ mod tests {
 
         type Senders = HashMap<&'static str, mpsc::Sender<Vec<u8>>>;
 
-        fn peers(names: &[&'static str]) -> (Senders, HashMap<String, mpsc::Receiver<Vec<u8>>>) {
+        fn peers(names: &[&'static str]) -> (Senders, HashMap<String, PeerChannelReceiver>) {
             let mut senders = HashMap::new();
             let mut receivers = HashMap::new();
             for name in names {
                 let (tx, rx) = mpsc::channel(8);
                 senders.insert(*name, tx);
-                receivers.insert(name.to_string(), rx);
+                receivers.insert(name.to_string(), rx.into());
             }
             (senders, receivers)
         }

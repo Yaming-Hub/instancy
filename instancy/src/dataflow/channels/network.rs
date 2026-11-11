@@ -458,22 +458,44 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkPush<T, D> {
                 // may have crashed, or a local write failed. The coordinator
                 // finds out which and cancels the dataflow with that reason;
                 // until then the operator waits, as for a full queue.
-                Some(outbox) => {
+                Some(outbox) if is_data => {
                     // Set before reporting: the coordinator decides whether a
-                    // drain can still complete from it.
-                    outbox.link().note_push_blocked();
-                    if !self
-                        .link_failure_reported
-                        .swap(true, std::sync::atomic::Ordering::Relaxed)
-                    {
+                    // drain can still complete from it. The first record push
+                    // the link blocks is reported even after a control signal
+                    // reported the failure, so the coordinator checks again.
+                    if outbox.link().note_push_blocked() {
+                        self.link_failure_reported
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
                         outbox.report(crate::communication::peer_link::LinkEvent::OutboundFailed(
                             crate::communication::peer_link::LinkFailure::SendFailed,
                         ));
+                    } else {
+                        self.report_link_failure(outbox);
                     }
                     Err(Error::Backpressure)
                 }
+                // A control signal (a watermark, an error) carries no records,
+                // and its sender retries it until it is taken, so waiting would
+                // stop the worker for good. The failure is reported, and the
+                // coordinator decides as above.
+                Some(outbox) => {
+                    self.report_link_failure(outbox);
+                    Ok(())
+                }
                 None => Err(Error::ChannelClosed),
             },
+        }
+    }
+
+    /// Tell the coordinator, once, that a send to the peer failed.
+    fn report_link_failure(&self, outbox: &crate::communication::peer_link::PeerOutbox) {
+        if !self
+            .link_failure_reported
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            outbox.report(crate::communication::peer_link::LinkEvent::OutboundFailed(
+                crate::communication::peer_link::LinkFailure::SendFailed,
+            ));
         }
     }
 
@@ -684,7 +706,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Drop for NetworkPush<T, D> {
 /// observe channel closure.
 #[cfg(feature = "transport")]
 async fn data_recv_bridge(
-    mut rx: tokio_mpsc::Receiver<Vec<u8>>,
+    mut rx: crate::communication::cluster_transport::PeerChannelReceiver,
     tx: std::sync::mpsc::Sender<Vec<u8>>,
     wake_handle: WakeHandle,
     monitor: Option<InboundMonitor>,
@@ -1166,9 +1188,12 @@ pub struct NetworkEdgeMaterializer<T: Timestamp + ExchangeData, D: ExchangeData>
     /// Unified transport (dedicated or shared).
     transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
 
-    /// Demuxer channel receivers for remote pull endpoints.
-    /// Key: (source_worker, target_worker) → `tokio::mpsc::Receiver<Vec<u8>>`
-    demux_receivers: std::collections::HashMap<(usize, usize), tokio_mpsc::Receiver<Vec<u8>>>,
+    /// Demuxer channel receivers for remote pull endpoints, by
+    /// (source_worker, target_worker).
+    demux_receivers: std::collections::HashMap<
+        (usize, usize),
+        crate::communication::cluster_transport::PeerChannelReceiver,
+    >,
 
     /// Local channels for same-node pairs: [src][dst]
     local_push: Vec<Vec<Option<BoundedPush<T, D, ()>>>>,
@@ -1220,10 +1245,67 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
         topology: ClusterTopology,
         local_node_id: impl Into<String>,
         transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
-        mut receivers: std::collections::HashMap<
+        receivers: std::collections::HashMap<
             String,
             std::collections::HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>,
         >,
+        capacity: usize,
+        edge_index: usize,
+        wake_handles: Vec<WakeHandle>,
+        runtime_handle: tokio::runtime::Handle,
+    ) -> Result<Self> {
+        Self::with_receivers(
+            dataflow_id,
+            topology,
+            local_node_id,
+            transport,
+            crate::communication::cluster_transport::peer_receivers(receivers),
+            capacity,
+            edge_index,
+            wake_handles,
+            runtime_handle,
+        )
+    }
+
+    /// [`Self::new`] with the unbounded receivers of a Shared session
+    /// ([`SharedTransportSession::take_receivers`](crate::communication::shared_transport::SharedTransportSession::take_receivers)).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_unbounded(
+        dataflow_id: DataflowId,
+        topology: ClusterTopology,
+        local_node_id: impl Into<String>,
+        transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
+        receivers: std::collections::HashMap<
+            String,
+            std::collections::HashMap<u64, tokio_mpsc::UnboundedReceiver<Vec<u8>>>,
+        >,
+        capacity: usize,
+        edge_index: usize,
+        wake_handles: Vec<WakeHandle>,
+        runtime_handle: tokio::runtime::Handle,
+    ) -> Result<Self> {
+        Self::with_receivers(
+            dataflow_id,
+            topology,
+            local_node_id,
+            transport,
+            crate::communication::cluster_transport::peer_receivers(receivers),
+            capacity,
+            edge_index,
+            wake_handles,
+            runtime_handle,
+        )
+    }
+
+    /// [`Self::new`] with receivers of either transport mode (bounded in
+    /// Dedicated mode, unbounded in Shared mode).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_receivers(
+        dataflow_id: DataflowId,
+        topology: ClusterTopology,
+        local_node_id: impl Into<String>,
+        transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
+        mut receivers: crate::communication::cluster_transport::PeerReceivers,
         capacity: usize,
         edge_index: usize,
         wake_handles: Vec<WakeHandle>,
@@ -2568,6 +2650,55 @@ mod tests {
             push.push(Envelope::watermark(2)).unwrap();
         }
 
+        /// A control signal to a closed link is dropped once the failure is
+        /// reported: its sender retries until it is taken, so `Backpressure`
+        /// would stop the worker for good. Records still wait, marking the
+        /// push blocked; nothing marks it for a control signal. The first
+        /// blocked record push is reported too, so the coordinator checks
+        /// again whether a drain can complete.
+        #[tokio::test]
+        async fn control_signal_to_a_closed_link_is_dropped_after_the_report() {
+            let (outbox, mut events, _sink) = monitored_outbox("node-b");
+            let (tx, rx) = tokio_mpsc::channel(4);
+            drop(rx);
+            let mut push = push_to(&outbox, tx);
+            push.push(Envelope::watermark(1)).unwrap();
+            push.push(Envelope::error("op", "failed")).unwrap();
+            push.push(Envelope::data(2, Vec::new())).unwrap();
+            assert!(!outbox.link().push_blocked());
+            assert!(matches!(
+                events.try_recv(),
+                Ok(LifecycleEvent::Link {
+                    event: LinkEvent::OutboundFailed(
+                        crate::communication::peer_link::LinkFailure::SendFailed
+                    ),
+                    ..
+                })
+            ));
+            assert!(matches!(
+                push.push(Envelope::data(3, vec![3])),
+                Err(Error::Backpressure)
+            ));
+            assert!(outbox.link().push_blocked());
+            assert!(
+                matches!(
+                    events.try_recv(),
+                    Ok(LifecycleEvent::Link {
+                        event: LinkEvent::OutboundFailed(
+                            crate::communication::peer_link::LinkFailure::SendFailed
+                        ),
+                        ..
+                    })
+                ),
+                "the first blocked record push is reported"
+            );
+            assert!(matches!(
+                push.push(Envelope::data(4, vec![4])),
+                Err(Error::Backpressure)
+            ));
+            assert!(events.try_recv().is_err(), "and only the first");
+        }
+
         fn materializers_with_monitoring(
             rt: &tokio::runtime::Handle,
         ) -> (
@@ -2846,7 +2977,7 @@ mod tests {
                     decode_envelope::<u64, u64, _, _>(&u64::codec(), &u64::codec(), bytes).is_ok()
                 },
             };
-            data_recv_bridge(rx, std_tx, WakeHandle::new(), Some(monitor)).await;
+            data_recv_bridge(rx.into(), std_tx, WakeHandle::new(), Some(monitor)).await;
             let mut seen = Vec::new();
             while let Ok(LifecycleEvent::Link { event, .. }) = events.try_recv() {
                 seen.push(event);

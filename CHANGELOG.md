@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Connection liveness (Shared mode)
+
+Implements [`docs/design/connection-liveness.md`](docs/design/connection-liveness.md)
+(decisions R54–R61 in the progress-accounting decision log).
+
+- **Fixed: a pooled connection that stops delivering no longer hangs its
+  dataflows** (a partition, a frozen peer, a half-open TCP connection).
+  Each node probes every pooled connection every `probe_interval` (1 s). A
+  connection that delivers no bytes for the new
+  `SharedConnectionConfig::silence_timeout` (30 s; `None` turns the rule
+  off; at least 3 × `probe_interval`) fails with
+  `TransportError::ConnectionSilent`, and a writer with bytes waiting that
+  writes none for that long fails it with `TransportError::WriteStalled`.
+  Only the dataflows using the connection fail, on both nodes; no node is
+  reported leaving, and the next registration replaces the connection.
+- **Fixed: a stuck connection no longer holds up the others.** Frames go
+  straight to their dataflow's connection instead of through one task per
+  peer, and each connection sends control frames first.
+- **Fixed: a dataflow can no longer end `Ok` on one node and hang on the
+  other.** Teardown used to give up on its last frames (goodbye, acks) after
+  `handshake_timeout`. A frame queued on its connection is now written even
+  once its dataflow unregisters, and Shared-mode teardown waits for its
+  frames; the liveness rule bounds the wait (with `silence_timeout: None`
+  nothing does).
+- **Fixed: a frame sent on a failed pooled connection is refused**
+  (`try_send`: `Closed`), as in Dedicated mode, instead of being reported as
+  sent and dropped. A refused watermark or error signal is dropped once the
+  failure is reported, so it no longer stops its worker for good.
+- **Fixed: a send that failed while the workers ran is reported, whatever
+  the order of events.** A run used to end `Ok` when the failure reached its
+  coordinator after a worker's success, after the peer was already given up
+  on, during a cancellation, or before the run was torn down from outside.
+  It now returns `CommunicationError::DataLoss` unless the peer finished
+  (its goodbye or ack) or cancelled. Both transport modes; in Dedicated mode
+  a failed read counts, since a reset can lose frames already written.
+- **Fixed: `RuntimeEvent::TransportDegraded` documentation.** It means one
+  pooled connection failed and needs no action; it used to advise
+  restarting the runtime, which fails every running dataflow.
+- **Changed:** a dataflow failed by its link names the connection's error
+  (for example "no bytes read ... for 30s") rather than "connection closed
+  before end of stream". `DataframeSender::try_send` returns `Full` when its
+  connection's queue (256 frames) is full.
+- **Breaking:** `SharedPeerManager::register_dataflow` and
+  `SharedTransportSession::take_receivers` return unbounded receivers, so a
+  connection's reader never waits for a consumer. Their `channel_capacity`
+  arguments must still be at least 1 and are otherwise unused. Cross-node
+  backpressure is still to come.
+- **Breaking:** the new `SharedConnectionConfig::silence_timeout` field and
+  `TransportError::ConnectionSilent` and `WriteStalled` variants.
+  `silence_timeout` defaults to 30 s and must be at least 3 ×
+  `probe_interval`, so a config that only raises `probe_interval` above
+  10 s is now refused by `SharedPeerManager::new`; set `silence_timeout`
+  too (or `None`). `NetworkEdgeMaterializer::new_unbounded` takes the
+  receivers of a Shared session.
 ### SPSC wake
 
 - **Fixed: an SPSC consumer with a wake handle wakes a producer it unblocks.**
@@ -27,6 +81,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Test suite, docs and small fixes
 
+- **Fixed: `progress::check::oracles_since` no longer misses an oracle
+  being dropped.** An oracle whose last reference was dropped on a worker
+  thread while the call ran was in neither the live nor the finished list,
+  so a test could intermittently see no oracle for a dataflow that was
+  checked (`progress_conformance`'s
+  `staged_and_simple_workers_have_one_global_view_each`). The call now
+  waits for such an oracle to finish.
 - **Fixed: a `unary_async` operator whose Tokio runtime shuts down fails its
   dataflow.** The operator runs its tasks on the Tokio runtime that is
   current when `unary_async` is called. If that runtime shut down before or

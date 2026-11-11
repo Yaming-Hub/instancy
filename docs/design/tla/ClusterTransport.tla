@@ -52,8 +52,12 @@
 (*                                                                         *)
 (* Simplified, not checked here: the lifecycle machine's soft failures     *)
 (* (deferred until the link fully closes or a grace timer expires, then    *)
-(* settled) are decided at once; transport events reach a run in the same  *)
-(* step as the read that causes them; data-channel close sentinels are not *)
+(* settled) are decided at once, and link events reach a run in the same   *)
+(* step as the read that causes them, unless Notices = "async": then every *)
+(* link event (transport notices; the peer's Cancel, goodbye and ack; the  *)
+(* link's full close) is queued for the run's coordinator, a worker may    *)
+(* succeed before it is applied, and an owed failed send is settled as the *)
+(* machine settles it. Data-channel close sentinels are not                *)
 (* modelled (completion is exact zero); linger has no deadline; the        *)
 (* handshake and ready barrier are one step, whose timeout fires only when *)
 (* the peer's run already ended; and a manager remembers every finished    *)
@@ -130,7 +134,23 @@ CONSTANTS
     StuckCap,       \* frames a writer can put into a silent direction
                     \* (the kernel's buffer) before it blocks
     SilenceNodes,   \* the nodes whose inbound direction may go silent
-    SilenceConns    \* the connections that may go silent
+    SilenceConns,   \* the connections that may go silent
+    Notices,        \* "sync": a link event reaches a run in the step that
+                    \* causes it (the earlier abstraction); "async": it is
+                    \* queued for the run's coordinator and applied in a later
+                    \* step, as the code's event channels deliver it
+    FinishCheck,    \* TRUE (async): as the workers succeed, the coordinator
+                    \* reports a lane the transport already failed as a failed
+                    \* send (R60, `note_failed_sends`)
+    Repeat,         \* async: a failed send reported again while one is owed:
+                    \* "absorb" (it keeps waiting, R60 fixed); "hard" (6ece576:
+                    \* once the workers finished it settles at once)
+    Upgrade,        \* async: TRUE, a failed send replaces an inbound end the
+                    \* machine already deferred (one soft failure per peer);
+                    \* FALSE (before): it is dropped, and nothing is owed
+    EosSettle       \* async: TRUE, the peer's goodbye that ends its link's last
+                    \* channel settles an owed send, as a full close does;
+                    \* FALSE (before): only a channel's close does
 
 N == {"a", "b"}
 Other(n) == IF n = "a" THEN "b" ELSE "a"
@@ -174,6 +194,24 @@ vars == <<rs, cs, br, rel, mem, pend, cnt, bq>>
 \*  ob: its outbox; cross: ghost, it took another run's frame;
 \*  sending: the normal enqueue happened but the caller has not returned;
 \*  late: the deliberately invalid extra send's phase (test scenarios only).
+\*  Notices = "async" only (constant otherwise), the run's coordinator:
+\*  nt: transport notices not yet applied (the io forwarder's channel: a
+\*  failed send "wfail", a failed or closed inbound link "rfail"/"closed",
+\*  corruption "corrupt"); nta: how many it applied. nc: the control
+\*  dispatcher's events not yet applied (the peer's Cancel, then "cend", its
+\*  control channel's close); np: the progress bridge's (the peer's goodbye
+\*  "bye" and ack, or "pend", its progress channel's close without a
+\*  goodbye). Each is FIFO, as each producer's channel is; they interleave
+\*  freely, except that a close is handed on only after the transport notice
+\*  that caused it (`PeerIoNotice`): its `seq` is the notices queued before.
+\*  sf: the machine's one deferred soft failure for the peer: "none", "in"
+\*  (an inbound end, waiting for the full close) or "send" (a send that
+\*  failed while the workers ran: owed until settled). cc, pc: the control
+\*  and progress channels closed (a goodbye ends the progress channel);
+\*  fully closed is both. fr, early: ghosts, the lane had failed when the
+\*  workers succeeded; an owed send was settled as a failure although an excuse
+\*  was on its way (read, or still to be read) or the peer had retired and
+\*  the link closed.
 RunInit(r) ==
     LET live == r = 1 \/ Concurrent IN
     [st |-> IF live THEN "run" ELSE "off", reg |-> IF live THEN "reg" ELSE "none",
@@ -181,7 +219,9 @@ RunInit(r) ==
      sent |-> FALSE, v |-> 0, cap |-> FALSE, gd |-> 0,
      bye |-> FALSE, ack |-> FALSE, gc |-> FALSE, cx |-> FALSE, ended |-> FALSE,
      pf |-> FALSE, obf |-> FALSE, tx |-> 0, rx |-> 0, rb |-> {}, ob |-> <<>>,
-     cross |-> FALSE, sending |-> FALSE, late |-> "none"]
+     cross |-> FALSE, sending |-> FALSE, late |-> "none",
+     nt |-> <<>>, nta |-> 0, nc |-> <<>>, np |-> <<>>, sf |-> "none",
+     cc |-> FALSE, pc |-> FALSE, fr |-> FALSE, early |-> FALSE]
 
 \* One node's end of one connection.
 \*  wst: its writer is up, shut (FIN sent) or dead; rds: its reader is up or
@@ -287,26 +327,68 @@ HitRec(rec, e) ==
             IF Retired(rec) \/ rec.gc \/ rec.cx THEN rec ELSE [rec EXCEPT !.ended = TRUE]
       [] OTHER -> rec
 
-WfailRec(rec) == [HitRec(rec, "wfail") EXCEPT !.obf = TRUE]
+Async == Notices = "async"
+
+\* A transport event for a run: applied in the same step ("sync"), or queued
+\* on the io forwarder's channel for the coordinator ("async", see
+\* `Notice`). The lane's own state (obf) changes at once either way: the
+\* transport knows.
+Tell(rec, e) ==
+    IF Async
+    THEN IF rec.st \in {"run", "done"} THEN [rec EXCEPT !.nt = Append(@, e)] ELSE rec
+    ELSE HitRec(rec, e)
+
+\* Async: the run's link from the peer has ended. The dispatcher reports its
+\* control channel's close after any Cancel it read; the progress bridge its
+\* channel's close, unless a goodbye already ended it. Each is handed on
+\* only after the transport notices queued so far (`seq`).
+LinkEnd(rec, r) ==
+    LET seq == rec.nta + Len(rec.nt)
+        goodbye == rec.bye \/ \E i \in 1..Len(rec.np) : rec.np[i].k = "bye"
+    IN
+    IF Async /\ rec.st \in {"run", "done"}
+    THEN [rec EXCEPT !.nc = Append(@, Frame("cend", Id(r), r, seq, FALSE)),
+                     !.np = IF goodbye THEN @ ELSE Append(@, Frame("pend", Id(r), r, seq, FALSE))]
+    ELSE rec
+
+WfailRec(rec) == [Tell(rec, "wfail") EXCEPT !.obf = TRUE]
 
 \* What a connection's failure does to the runs using it: lanes pinned to
 \* it fail; runs whose frames arrive on it are told the inbound side ended.
-Broken(n, c, inbound) ==
+\* `wfirst`: the failed send is reported before the inbound end. A write
+\* error reports it first (the reader stops after). A read error reports
+\* both at once, in either order: the inbound end is handed on by a task of
+\* its own (`PeerIoNotice`), which closes the link's channels once it has
+\* been, and the failed send directly. (Sync: the two commute.)
+Broken(n, c, inbound, wfirst) ==
     [r \in Runs |->
-        LET a == IF r \in Pinned(n, c) THEN WfailRec(rs[n][r]) ELSE rs[n][r]
-        IN IF r \in Arrive(n, c) THEN HitRec(a, inbound) ELSE a]
+        LET rec == rs[n][r]
+            pinned == r \in Pinned(n, c)
+        IN
+        IF r \notin Arrive(n, c)
+        THEN IF pinned THEN WfailRec(rec) ELSE rec
+        ELSE IF wfirst
+        THEN LinkEnd(Tell(IF pinned THEN WfailRec(rec) ELSE rec, inbound), r)
+        ELSE LET b == LinkEnd(Tell(rec, inbound), r) IN IF pinned THEN WfailRec(b) ELSE b]
 
-\* Consume the next payload frame of the lane.
+\* The orders a read error may report in (see Broken).
+ReadOrders == IF Notices = "async" THEN BOOLEAN ELSE {TRUE}
+
+\* Consume the next payload frame of the lane. The peer's goodbye and ack go
+\* to the coordinator, which retires the link (and acks the goodbye): at
+\* once, or queued (async).
 ConsumeRec(rec, f, r) ==
+    LET queued == Async /\ f.k \in {"bye", "ack"} IN
     [rec EXCEPT !.rx = @ + 1,
                 !.cross = @ \/ f.run # r,
                 !.v = CASE f.k = "data" -> @ - 1 [] f.k = "p1" -> @ + 1 [] OTHER -> @,
                 !.gd = IF f.k = "data" /\ f.run = r THEN @ + 1 ELSE @,
                 !.cap = @ \/ f.k = "p2",
-                !.bye = @ \/ f.k = "bye",
-                !.ack = @ \/ f.k = "ack",
-                !.ob = IF f.k = "bye" /\ rec.st \in {"run", "done"}
-                       THEN Append(@, Frame("ack", Id(r), r, -1, FALSE)) ELSE @]
+                !.bye = @ \/ (f.k = "bye" /\ ~queued),
+                !.ack = @ \/ (f.k = "ack" /\ ~queued),
+                !.ob = IF f.k = "bye" /\ ~queued /\ rec.st \in {"run", "done"}
+                       THEN Append(@, Frame("ack", Id(r), r, -1, FALSE)) ELSE @,
+                !.np = IF queued THEN Append(@, f) ELSE @]
 
 \* The earlier design: deliver buffered frames that are now next in order.
 RECURSIVE Drain(_, _)
@@ -354,7 +436,11 @@ Process(n, f, c) ==
     THEN /\ pend' = IF f.k = "cxl" /\ ~(RunIds = "pr9" /\ f.id \in mem[n])
                     THEN [pend EXCEPT ![n] = Append(@, [f |-> f, c |-> c])] ELSE pend
          /\ UNCHANGED <<rs, cnt>>
-    ELSE /\ rs' = [rs EXCEPT ![n][r] = IF f.k = "cxl" THEN CxlRec(@, f, r) ELSE PayloadRec(@, f, r)]
+    ELSE /\ rs' = [rs EXCEPT ![n][r] =
+                     CASE f.k = "cxl" /\ Async -> [@ EXCEPT !.nc = Append(@, f),
+                                                         !.cross = @ \/ f.run # r]
+                       [] f.k = "cxl" -> CxlRec(@, f, r)
+                       [] OTHER -> PayloadRec(@, f, r)]
          /\ cnt' = IF f.bad /\ rs[n][r].st \in {"run", "done"}
                    THEN [cnt EXCEPT !.bad = TRUE] ELSE cnt
          /\ UNCHANGED pend
@@ -374,10 +460,10 @@ Read(n, c) ==
             /\ cs' = [cs EXCEPT ![n][c] = [@ EXCEPT !.rds = "done", !.wq = <<>>, !.pool = "gone",
                                                     !.wst = IF @ = "up" THEN "dead" ELSE @, !.wire = <<>>],
                                 ![m][c].wire = <<>>]
-            /\ rs' = IF Pin
+            /\ \E wf \in ReadOrders : rs' = IF Pin
                      THEN [rs EXCEPT ![n] = [r \in Runs |->
-                             LET a == Broken(n, c, "rfail")[r]
-                             IN IF Id(r) = f.id /\ rs[n][r].reg = "reg" THEN HitRec(a, "corrupt") ELSE a]]
+                             LET a == Broken(n, c, "rfail", wf)[r]
+                             IN IF Id(r) = f.id /\ rs[n][r].reg = "reg" THEN Tell(a, "corrupt") ELSE a]]
                      ELSE rs
             /\ pend' = ForgetConn(n, c)
             /\ UNCHANGED cnt
@@ -391,7 +477,7 @@ Read(n, c) ==
 ReadErr(n, c) ==
     LET m == Other(n) IN
     /\ cs[n][c].rds = "up" /\ br[c] /\ cs[m][c].wire = <<>> /\ ~cs[n][c].silent
-    /\ rs' = IF Pin THEN [rs EXCEPT ![n] = Broken(n, c, "rfail")] ELSE rs
+    /\ \E wf \in ReadOrders : rs' = IF Pin THEN [rs EXCEPT ![n] = Broken(n, c, "rfail", wf)] ELSE rs
     /\ cs' = [cs EXCEPT ![n][c] = [@ EXCEPT !.rds = "done", !.wq = <<>>, !.pool = "gone",
                                             !.wst = IF @ = "up" THEN "dead" ELSE @]]
     /\ pend' = ForgetConn(n, c)
@@ -411,7 +497,8 @@ CleanEofA(n, c) ==
     /\ rs' = IF Pin
              THEN [rs EXCEPT ![n] = [r \in Runs |->
                      LET a == IF r \in pinned /\ ~keep THEN WfailRec(rs[n][r]) ELSE rs[n][r]
-                     IN IF r \in pinned \cup Arrive(n, c) THEN HitRec(a, "closed") ELSE a]]
+                         b == IF r \in pinned \cup Arrive(n, c) THEN Tell(a, "closed") ELSE a
+                     IN IF r \in Arrive(n, c) THEN LinkEnd(b, r) ELSE b]]
              ELSE rs
     /\ cs' = [cs EXCEPT ![n][c].rds = "done",
                         ![n][c].pool = IF Pin /\ keep /\ pinned # {} THEN "peerclosed" ELSE "gone"]
@@ -471,7 +558,7 @@ WriteFail(n, c) ==
         rst == closeAll /\ Unread(n, c) /\ ~br[c]
     IN
     /\ rs' = IF ~Pin THEN rs
-             ELSE IF closeAll THEN [rs EXCEPT ![n] = Broken(n, c, "rfail")]
+             ELSE IF closeAll THEN [rs EXCEPT ![n] = Broken(n, c, "rfail", TRUE)]
              ELSE [rs EXCEPT ![n] = [r \in Runs |->
                      IF r \in Pinned(n, c) THEN WfailRec(rs[n][r]) ELSE rs[n][r]]]
     /\ cs' = [cs EXCEPT ![n][c] = [@ EXCEPT !.wst = "dead", !.wq = <<>>, !.pool = "gone",
@@ -615,13 +702,140 @@ ReturnLateSend(n, r) ==
                          !.lateRejected = @ \/ reject]
     /\ UNCHANGED <<cs, br, rel, mem, pend, bq>>
 
+\* --- The coordinator, async (cluster_lifecycle's machine) ---
+
+Owed(rec) == rec.sf = "send"
+FullyClosed(rec) == rec.cc /\ rec.pc
+
+\* An excuse is on its way to run r's coordinator on n: the peer's Cancel,
+\* goodbye or ack read and not yet applied, or still on the wire to be read.
+Excuse(n, r, rec) ==
+    LET m == Other(n)
+        p == rs[m][r].pin
+    IN
+    \/ \E i \in 1..Len(rec.nc) : rec.nc[i].k = "cxl"
+    \/ \E i \in 1..Len(rec.np) : rec.np[i].k \in {"bye", "ack"}
+    \/ /\ cs[n][p].rds = "up" /\ ~cs[n][p].silent
+       /\ \E i \in 1..Len(cs[m][p].wire) :
+            cs[m][p].wire[i].run = r /\ cs[m][p].wire[i].k \in {"cxl", "bye", "ack"}
+
+\* An owed send is settled: excused if the peer retired the link, else a
+\* failure (the machine's `settle_unsent`: a link failure while the workers
+\* run, a data loss once they succeeded). `ex`: an excuse is on its way,
+\* which makes the failure false (ghost).
+Settle(rec, ex) ==
+    IF Retired(rec)
+    THEN [rec EXCEPT !.sf = "none"]
+    ELSE [rec EXCEPT !.sf = "none", !.st = "fail", !.early = @ \/ ex]
+
+\* A failed send reported to the coordinator (OutboundFailed(SendFailed)).
+\* While the workers run it is owed (deferred) until the link closes fully,
+\* the peer cancels or the grace period ends; a peer that retired or
+\* cancelled needs nothing more, and a link already closed fully fails the
+\* run at once. It replaces a deferred inbound end (Upgrade). Once they
+\* succeeded, a new one only means the peer can no longer be reached (the
+\* earlier rule, `ended`); a repeat of one owed keeps waiting (Repeat =
+\* "absorb") or, once they succeeded, settles at once ("hard").
+SendFailedRec(rec, ex) ==
+    CASE Owed(rec) /\ (Repeat = "absorb" \/ (rec.st = "run" /\ ~FullyClosed(rec))) -> rec
+      [] Owed(rec) -> Settle(rec, ex)
+      [] rec.st = "run" ->
+            CASE Retired(rec) \/ rec.gc -> rec
+              [] FullyClosed(rec) -> [rec EXCEPT !.st = "fail"]
+              [] rec.sf = "in" -> IF Upgrade THEN [rec EXCEPT !.sf = "send"] ELSE rec
+              [] OTHER -> [rec EXCEPT !.sf = "send"]
+      [] OTHER -> HitRec(rec, "wfail")
+
+\* Apply one transport notice. An inbound end is soft, as in the machine: it
+\* is deferred until the link closes fully (so a Cancel or goodbye already
+\* read is applied first), unless it already has. Corruption is fatal, and
+\* clears the deferred failure (`on_corruption`).
+ApplyT(rec, e, ex) ==
+    CASE e = "wfail" -> SendFailedRec(rec, ex)
+      [] e \in {"rfail", "closed"} ->
+            CASE Owed(rec) -> IF FullyClosed(rec) THEN Settle(rec, ex) ELSE rec
+              [] FullyClosed(rec) -> HitRec(rec, e)
+              [] rec.sf = "none" /\ rec.st \in {"run", "done"} -> [rec EXCEPT !.sf = "in"]
+              [] OTHER -> rec
+      [] OTHER -> [HitRec(rec, e) EXCEPT !.sf = "none"]
+
+\* The link has just closed fully: an owed send is settled; otherwise the
+\* link's end is decided, as a closed inbound link (ControlClosed once fully
+\* closed), and a deferred inbound end with it.
+FullClose(rec, ex) ==
+    IF Owed(rec) THEN Settle(rec, ex) ELSE [HitRec(rec, "closed") EXCEPT !.sf = "none"]
+
+\* Apply one event of the control dispatcher: the peer's Cancel (which also
+\* clears the deferred failure: a peer that cancelled needs nothing more),
+\* or the control channel's close.
+ApplyC(rec, f, r, ex) ==
+    IF f.k = "cxl"
+    THEN [CxlRec(rec, f, r) EXCEPT !.sf = "none"]
+    ELSE LET c == [rec EXCEPT !.cc = TRUE] IN IF c.pc THEN FullClose(c, ex) ELSE c
+
+\* Apply one event of the progress bridge: the peer's goodbye (acked; it
+\* ends the progress channel, and the link's last channel settles an owed
+\* send with EosSettle), its ack, or the channel's close.
+ApplyP(rec, f, r, ex) ==
+    CASE f.k = "bye" ->
+            LET b == [rec EXCEPT !.bye = TRUE, !.pc = TRUE,
+                                 !.ob = IF rec.st \in {"run", "done"}
+                                        THEN Append(@, Frame("ack", Id(r), r, -1, FALSE))
+                                        ELSE @]
+            IN IF b.cc /\ Owed(b) /\ EosSettle THEN Settle(b, ex) ELSE b
+      [] f.k = "ack" -> [rec EXCEPT !.ack = TRUE]
+      [] OTHER -> LET c == [rec EXCEPT !.pc = TRUE] IN IF c.cc THEN FullClose(c, ex) ELSE c
+
 \* The workers succeed once the view is exactly zero; the goodbye follows.
+\* With FinishCheck (async) the coordinator first asks the transport
+\* whether the lane failed, and reports a failed send if so (R60), which
+\* may fail the run or leave the send owed. `fr` (ghost): the lane had
+\* failed.
 Workers(n, r) ==
-    LET rec == rs[n][r] IN
+    LET rec == rs[n][r]
+        checked == IF Async /\ FinishCheck /\ rec.obf
+                   THEN SendFailedRec(rec, Excuse(n, r, rec)) ELSE rec
+    IN
     /\ rec.st = "run" /\ rec.sent /\ rec.cap /\ rec.v = 0
     /\ ~rec.sending /\ rec.late \notin {"armed", "pending"}
-    /\ rs' = [rs EXCEPT ![n][r].st = "done",
-                        ![n][r].ob = Append(@, Frame("bye", Id(r), r, -1, FALSE))]
+    /\ rs' = [rs EXCEPT ![n][r] =
+                IF checked.st = "fail"
+                THEN checked
+                ELSE [checked EXCEPT !.st = "done", !.fr = Async /\ rec.obf,
+                                     !.ob = Append(@, Frame("bye", Id(r), r, -1, FALSE))]]
+    /\ UNCHANGED <<cs, br, rel, mem, pend, cnt, bq>>
+
+\* The coordinator applies the next event of one of its channels (async):
+\* the io forwarder's, the control dispatcher's or the progress bridge's.
+\* A channel's close waits for the transport notices queued before it.
+Notice(n, r) ==
+    LET rec == rs[n][r]
+        handed(f) == f.k \notin {"cend", "pend"} \/ rec.nta >= f.seq
+    IN
+    /\ \/ /\ rec.nt # <<>>
+          /\ LET t == [rec EXCEPT !.nt = Tail(@), !.nta = @ + 1]
+             IN rs' = [rs EXCEPT ![n][r] = ApplyT(t, Head(rec.nt), Excuse(n, r, t))]
+       \/ /\ rec.nc # <<>> /\ handed(Head(rec.nc))
+          /\ LET t == [rec EXCEPT !.nc = Tail(@)]
+             IN rs' = [rs EXCEPT ![n][r] = ApplyC(t, Head(rec.nc), r, Excuse(n, r, t))]
+       \/ /\ rec.np # <<>> /\ handed(Head(rec.np))
+          /\ LET t == [rec EXCEPT !.np = Tail(@)]
+             IN rs' = [rs EXCEPT ![n][r] = ApplyP(t, Head(rec.np), r, Excuse(n, r, t))]
+    /\ UNCHANGED <<cs, br, rel, mem, pend, cnt, bq>>
+
+\* The grace period of an owed send ends: it is settled as a failure
+\* (retired or not: the machine reads a goodbye with the link still open as
+\* frames the peer finished without). Timing assumption: the grace
+\* (handshake_timeout) outlasts the delivery of anything already on its way
+\* to the coordinator, so it ends only once nothing is: no queued event, no
+\* excuse on the wire. `early` (ghost): it ends although the link closed
+\* fully after the peer's goodbye, which owes nothing.
+SettleTimeout(n, r) ==
+    LET rec == rs[n][r] IN
+    /\ Async /\ Owed(rec) /\ rec.st \in {"run", "done"}
+    /\ rec.nt = <<>> /\ rec.nc = <<>> /\ rec.np = <<>> /\ ~Excuse(n, r, rec)
+    /\ rs' = [rs EXCEPT ![n][r] = [rec EXCEPT !.sf = "none", !.st = "fail",
+                                              !.early = @ \/ (Retired(rec) /\ FullyClosed(rec))]]
     /\ UNCHANGED <<cs, br, rel, mem, pend, cnt, bq>>
 
 \* Teardown: once the link is retired, the peer cancelled, we broadcast a
@@ -634,6 +848,9 @@ Teardown(n, r) ==
     LET rec == rs[n][r] IN
     /\ rec.st = "done" /\ Flushed(n, r)
     /\ Retired(rec) \/ rec.gc \/ rec.cx \/ rec.ended
+    \* Async: not while a send is owed; and corruption queued behind the
+    \* event that finished the machine is still applied (teardown drains it).
+    /\ rec.sf # "send" /\ \A i \in 1..Len(rec.nt) : rec.nt[i] # "corrupt"
     /\ rs' = [rs EXCEPT ![n][r].st = "ok", ![n][r].reg = "gone"]
     /\ mem' = [mem EXCEPT ![n] = @ \cup {Id(r)}]
     /\ UNCHANGED <<cs, br, rel, pend, cnt, bq>>
@@ -780,7 +997,7 @@ Silence(n, c) ==
 DeclareDead(n, c) ==
     /\ Detect = "silence"
     /\ cs[n][c].rds = "up" /\ cs[n][c].silent
-    /\ rs' = IF Pin THEN [rs EXCEPT ![n] = Broken(n, c, "rfail")] ELSE rs
+    /\ \E wf \in ReadOrders : rs' = IF Pin THEN [rs EXCEPT ![n] = Broken(n, c, "rfail", wf)] ELSE rs
     /\ cs' = [cs EXCEPT ![n][c] = [@ EXCEPT !.rds = "done", !.pool = "gone", !.wq = <<>>,
                                             !.wst = IF @ = "up" THEN "dead" ELSE @,
                                             !.closed = TRUE, !.fin = TRUE]]
@@ -865,7 +1082,7 @@ Next ==
                             \/ Cleanup(n, r) \/ RequestStop(n, r) \/ GapTimeout(n, r)
                             \/ BarrierTimeout(n, r) \/ ReturnSend(n, r)
                             \/ ArmLateSend(n, r) \/ EnqueueLateSend(n, r) \/ ReturnLateSend(n, r)
-                            \/ ToBridge(n, r)
+                            \/ ToBridge(n, r) \/ Notice(n, r) \/ SettleTimeout(n, r)
          \/ LocalFail(n) \/ Start(n) \/ Release(n) \/ SharedBridgeStep(n)
          \/ \E c \in Conns : Write(n, c) \/ Read(n, c) \/ ReadErr(n, c) \/ CleanEofA(n, c)
                              \/ CloseOut(n, c) \/ WriteErr(n, c) \/ Corrupt(n, c)
@@ -885,7 +1102,8 @@ Fairness ==
                            /\ WF_vars(EnqueueLateSend(n, r)) /\ WF_vars(ReturnLateSend(n, r))
                            /\ WF_vars(Workers(n, r)) /\ WF_vars(Teardown(n, r))
                            /\ WF_vars(Cleanup(n, r)) /\ WF_vars(BarrierTimeout(n, r))
-                           /\ WF_vars(ToBridge(n, r))
+                           /\ WF_vars(ToBridge(n, r)) /\ WF_vars(Notice(n, r))
+                           /\ WF_vars(SettleTimeout(n, r))
         /\ \A c \in Conns : /\ WF_vars(Write(n, c)) /\ WF_vars(Read(n, c))
                             /\ WF_vars(ReadErr(n, c)) /\ WF_vars(CleanEofA(n, c))
                             /\ WF_vars(CloseOut(n, c))
@@ -904,6 +1122,12 @@ TypeOK ==
          /\ rs[n][r].v \in -2..2 /\ rs[n][r].gd \in 0..2
          /\ rs[n][r].sending \in BOOLEAN
          /\ rs[n][r].late \in {"none", "armed", "pending", "rejected", "accepted"}
+         /\ \A i \in 1..Len(rs[n][r].nt) :
+                rs[n][r].nt[i] \in {"wfail", "rfail", "closed", "corrupt"}
+         /\ \A i \in 1..Len(rs[n][r].nc) : rs[n][r].nc[i].k \in {"cxl", "cend"}
+         /\ \A i \in 1..Len(rs[n][r].np) : rs[n][r].np[i].k \in {"bye", "ack", "pend"}
+         /\ rs[n][r].sf \in {"none", "in", "send"}
+         /\ {rs[n][r].cc, rs[n][r].pc, rs[n][r].fr, rs[n][r].early} \subseteq BOOLEAN
     /\ \A n \in N, c \in Conns :
          /\ cs[n][c].wst \in {"up", "shut", "dead"} /\ cs[n][c].rds \in {"up", "done"}
          /\ cs[n][c].pool \in {"live", "peerclosed", "gone"}
@@ -913,6 +1137,28 @@ TypeOK ==
 \* Never Ok with lost data: a run whose workers succeeded consumed the record
 \* the peer sent it.
 NoLossOk == \A n \in N, r \in Runs : rs[n][r].st \in {"done", "ok"} => rs[n][r].gd = 1
+
+\* Never Ok over a send the transport knew had failed (async): a run whose
+\* lane had failed when its workers succeeded ends Ok only if the peer
+\* retired the link (it finished with what it needed) or cancelled (it
+\* needs nothing more). cluster_lifecycle's settle_unsent rule. A lane that
+\* fails only after the workers succeeded is not covered: the peer fails,
+\* and reports it.
+NoOkAfterFailedSend ==
+    \A n \in N, r \in Runs :
+        rs[n][r].st = "ok" /\ rs[n][r].fr => Retired(rs[n][r]) \/ rs[n][r].gc
+
+\* An owed send is never settled as a loss when the peer needed nothing
+\* more: not while its Cancel, goodbye or ack is on its way to the
+\* coordinator (read and not yet applied, or still to be read), whichever
+\* event the coordinator sees first; and not once its goodbye came and the
+\* link closed fully (async).
+NoFalseSettle == \A n \in N, r \in Runs : ~rs[n][r].early
+
+\* Reachability (expected to be violated): a run ends Ok although its lane
+\* had failed when its workers succeeded, so NoOkAfterFailedSend is not
+\* vacuous.
+NeverOkAfterFailedLane == ~(\E n \in N, r \in Runs : rs[n][r].st = "ok" /\ rs[n][r].fr)
 
 \* A run never takes another run's frame (payload or Cancel) for its own.
 NoCrossRun == \A n \in N, r \in Runs : ~rs[n][r].cross

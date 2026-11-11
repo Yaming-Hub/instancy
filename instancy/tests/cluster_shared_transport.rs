@@ -31,7 +31,6 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 fn test_shared_config() -> SharedConnectionConfig {
     SharedConnectionConfig {
         connections: 1,
-        probe_interval: Duration::from_secs(3600),
         rtt_ema_alpha: 0.2,
         ..SharedConnectionConfig::default()
     }
@@ -919,7 +918,6 @@ async fn shared_pool_recovers_for_new_dataflows_after_a_transient_failure() {
 
     let config = SharedConnectionConfig {
         connections: 1,
-        probe_interval: Duration::from_secs(3600),
         rtt_ema_alpha: 0.2,
         ..SharedConnectionConfig::default()
     };

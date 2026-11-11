@@ -76,6 +76,9 @@ struct TeardownState {
     done: bool,
     waker: Option<Waker>,
     data_loss: Option<DataLoss>,
+    /// A loss that counts only if every local worker succeeds: the
+    /// coordinator tore down before their results.
+    loss_if_ok: Option<DataLoss>,
 }
 
 /// Completes the teardown signal when dropped (including when the
@@ -99,6 +102,7 @@ pub(crate) fn teardown_signal(
             done: false,
             waker: None,
             data_loss: None,
+            loss_if_ok: None,
         }),
         condvar: Condvar::new(),
         runtime,
@@ -178,6 +182,11 @@ impl TeardownNotifier {
         lock_state(&self.shared).data_loss = Some(loss);
     }
 
+    /// Record a loss that counts only if every local worker succeeds.
+    pub(crate) fn set_loss_if_ok(&self, loss: DataLoss) {
+        lock_state(&self.shared).loss_if_ok = Some(loss);
+    }
+
     /// Remember the current thread as one of the transport runtime's (the
     /// coordinator runs there).
     pub(crate) fn note_runtime_thread(&self) {
@@ -223,6 +232,12 @@ impl TeardownWaiter {
     /// Data loss recorded by the coordinator, once teardown is done.
     pub(crate) fn data_loss(&self) -> Option<DataLoss> {
         lock_state(&self.shared).data_loss.clone()
+    }
+
+    /// A loss that counts only if every local worker succeeds (see
+    /// [`TeardownNotifier::set_loss_if_ok`]).
+    pub(crate) fn loss_if_ok(&self) -> Option<DataLoss> {
+        lock_state(&self.shared).loss_if_ok.clone()
     }
 
     /// Remember `name` as the name of a multi-thread runtime's threads (see
@@ -472,6 +487,10 @@ struct PeerState {
     lost: bool,
     /// A soft failure waiting for the link to close fully.
     soft_failure: Option<LinkFailure>,
+    /// The first failure the peer's connection reported: what a generic end
+    /// of the link (a channel closing, a failed send) is reported as. Only
+    /// names the failure; it decides nothing.
+    cause: Option<TransportError>,
     /// A data channel from the peer ended without its close sentinel (never
     /// in a healthy run). If the peer's goodbye completes anyway, records
     /// may be missing.
@@ -484,6 +503,12 @@ struct PeerState {
     /// (`AnnounceUnfinished`), or its link ended before its goodbye during a
     /// requested stop.
     stopped: bool,
+    /// The coordinator noted, as a worker finished, that sending to the peer
+    /// had failed (see [`LifecycleMachine::note_failed_sends`]).
+    send_failure_noted: bool,
+    /// A failed send to the peer was settled (`settle_unsent`): a later
+    /// report is the same failure.
+    send_failure_settled: bool,
     link: Arc<PeerLinkState>,
 }
 
@@ -583,9 +608,12 @@ impl LifecycleMachine {
                             control_closed: false,
                             lost: false,
                             soft_failure: None,
+                            cause: None,
                             unclean_data_channel: false,
                             cancel_received: false,
                             stopped: false,
+                            send_failure_noted: false,
+                            send_failure_settled: false,
                             link,
                         },
                     )
@@ -604,10 +632,51 @@ impl LifecycleMachine {
         self.workers_remaining == 0
     }
 
+    /// Before a worker's result: tell the machine, once per peer and while
+    /// workers still run, that sending to that peer has failed, if the
+    /// transport says so (`outbound_failed`, see
+    /// [`ClusterTransport::outbound_failed`]). The notice that follows
+    /// repeats it; the machine keeps a repeat waiting like the first.
+    pub(crate) fn note_failed_sends(
+        &mut self,
+        outbound_failed: impl Fn(&str) -> bool,
+    ) -> Vec<Action> {
+        if self.workers_done() {
+            return Vec::new();
+        }
+        let failed: Vec<String> = self
+            .peers
+            .iter()
+            .filter(|(peer, state)| !state.send_failure_noted && outbound_failed(peer))
+            .map(|(peer, _)| peer.clone())
+            .collect();
+        let mut actions = Vec::new();
+        for peer in failed {
+            if let Some(state) = self.peers.get_mut(&peer) {
+                state.send_failure_noted = true;
+            }
+            actions.extend(self.on_event(LifecycleEvent::Link {
+                peer,
+                event: LinkEvent::OutboundFailed(LinkFailure::SendFailed),
+            }));
+        }
+        actions
+    }
+
     /// Records addressed to this node that were lost while every local
     /// worker succeeded.
     pub(crate) fn data_loss(&self) -> Option<&DataLoss> {
         self.data_loss.as_ref()
+    }
+
+    /// A loss held for the workers' results that the machine will not see
+    /// (it finished first, torn down from outside): it counts if every
+    /// worker still succeeds.
+    pub(crate) fn loss_if_workers_succeed(&self) -> Option<&DataLoss> {
+        if self.workers_done() || !self.all_workers_ok {
+            return None;
+        }
+        self.pending_loss.as_ref().or(self.deferred_loss.as_ref())
     }
 
     /// A recorded data loss that no `Cancel` has announced to the peers yet
@@ -748,18 +817,29 @@ impl LifecycleMachine {
         }
     }
 
-    /// Bridges were cancelled from outside (e.g. `report_node_leave`, runtime
-    /// shutdown).
+    /// Bridges were cancelled from outside: `report_node_leave` of a
+    /// participant, which first cancels the dataflow as failed.
     ///
     /// While the local workers run, the dataflow is broken: tell the peers
     /// (Cancel) and abort. Once they have succeeded, our goodbye and
     /// acknowledgements may still sit in the lanes; tear down gracefully so
     /// the bounded flush delivers them to the reachable peers instead of
-    /// leaving those peers waiting for us.
-    pub(crate) fn on_external_abort(&mut self) -> Vec<Action> {
+    /// leaving those peers waiting for us. Either way a send still owed is
+    /// settled as its grace period would (R61). While the workers run, their
+    /// results will not reach the machine, so a send the transport has
+    /// failed (`outbound_failed`, as in [`Self::note_failed_sends`]) is
+    /// noted first, and the loss is held for their results.
+    pub(crate) fn on_external_abort(
+        &mut self,
+        outbound_failed: impl Fn(&str) -> bool,
+    ) -> Vec<Action> {
         match self.phase {
             Phase::Finished => Vec::new(),
             Phase::Draining => {
+                let actions = self.settle_owed_sends();
+                if self.phase == Phase::Finished {
+                    return actions;
+                }
                 for peer in self.peers.values_mut() {
                     if !peer.retired() {
                         peer.lost = true;
@@ -769,8 +849,11 @@ impl LifecycleMachine {
                 vec![Action::Teardown { graceful: true }]
             }
             Phase::Running => {
+                // A send still owed is held as a loss, which counts if the
+                // workers still succeed (`loss_if_workers_succeed`).
+                let mut actions = self.note_failed_sends(outbound_failed);
+                actions.extend(self.settle_owed_sends());
                 self.phase = Phase::Finished;
-                let mut actions = Vec::new();
                 if !self.cancel_broadcast {
                     self.cancel_broadcast = true;
                     actions.push(Action::BroadcastCancel);
@@ -781,8 +864,32 @@ impl LifecycleMachine {
         }
     }
 
+    /// Settle every send still owed as its grace period would: nothing more
+    /// will come to settle it (we are tearing down). A run whose workers
+    /// succeeded then reports the loss, whatever came first (R61).
+    fn settle_owed_sends(&mut self) -> Vec<Action> {
+        let owed: Vec<String> = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| peer.unsent())
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut actions = Vec::new();
+        for peer in owed {
+            actions.extend(self.settle_unsent(peer, None));
+        }
+        actions.extend(self.finish_if_resolved());
+        actions
+    }
+
     /// Every event source is gone; nothing further can arrive.
     pub(crate) fn on_events_closed(&mut self) -> Vec<Action> {
+        if self.phase == Phase::Draining {
+            let actions = self.settle_owed_sends();
+            if self.phase == Phase::Finished {
+                return actions;
+            }
+        }
         if self.phase == Phase::Finished {
             return Vec::new();
         }
@@ -886,6 +993,11 @@ impl LifecycleMachine {
             LinkEvent::ProgressEndOfStream => {
                 peer.end_of_stream += 1;
                 peer.progress_channels_ended += 1;
+                // This marker may end the last channel, after the control
+                // channel closed (they come from different tasks): the link
+                // has then closed fully, which settles a send still owed, as
+                // `ControlClosed` would. After the retirement below.
+                let closes_owed_send = peer.unsent() && peer.fully_closed();
                 if peer.end_of_stream == peer.expected_end_of_stream && !peer.goodbye_received {
                     peer.goodbye_received = true;
                     peer.link.retire();
@@ -896,8 +1008,11 @@ impl LifecycleMachine {
                     // goodbye was complete (the events come from different
                     // bridge tasks, in either order).
                     if peer.unclean_data_channel {
-                        actions.extend(self.missing_close_marker(peer_id));
+                        actions.extend(self.missing_close_marker(peer_id.clone()));
                     }
+                }
+                if closes_owed_send {
+                    actions.extend(self.on_link_failure(peer_id, LinkFailure::ChannelClosed, true));
                 }
             }
             LinkEvent::AckReceived => {
@@ -987,6 +1102,9 @@ impl LifecycleMachine {
                 // closes right after this (and not before: see
                 // `PeerIoNotice`), so a corrupt or oversize frame is never
                 // mistaken for a clean disconnect.
+                if peer.cause.is_none() {
+                    peer.cause = Some(error.duplicate());
+                }
                 let failure = LinkFailure::Transport(error);
                 if is_inbound_corruption(&failure, true) {
                     actions.extend(self.on_corruption(peer_id, failure));
@@ -1003,8 +1121,31 @@ impl LifecycleMachine {
                 // the peer queued before closing is applied first. The frames
                 // it dropped stay owed until then (`settle_unsent`). Encoding
                 // failures are always hard.
-                let hard = !(phase == Phase::Running && matches!(failure, LinkFailure::SendFailed));
-                actions.extend(self.on_link_failure(peer_id, failure, hard));
+                //
+                // A send failure already owed is reported again (the
+                // coordinator's check as the workers finished, the transport's
+                // own notice, the forwarder's report of the frames behind it):
+                // the same failure, in any phase. It keeps waiting, so a
+                // Cancel or goodbye queued before the link closed still
+                // settles it.
+                //
+                // Any other outbound failure (an oversize frame dropped, an
+                // encoding failure) lost a frame for good: while the workers
+                // run, to a peer that needs it, that is a loss if every
+                // worker still succeeds (R61).
+                let dropped = (phase == Phase::Running
+                    && !matches!(failure, LinkFailure::SendFailed)
+                    && !peer.retired()
+                    && !peer.cancel_received)
+                    .then(|| outbound_loss_detail(&failure));
+                if !(matches!(failure, LinkFailure::SendFailed) && peer.unsent()) {
+                    let hard =
+                        !(phase == Phase::Running && matches!(failure, LinkFailure::SendFailed));
+                    actions.extend(self.on_link_failure(peer_id.clone(), failure, hard));
+                }
+                if let Some(detail) = dropped {
+                    actions.extend(self.on_inbound_data_lost(peer_id, detail, false));
+                }
             }
 
             LinkEvent::InboundDataLost(_) => unreachable!("handled above"),
@@ -1216,19 +1357,52 @@ impl LifecycleMachine {
             return Vec::new();
         };
         if peer.resolved() {
+            // Given up on while the workers run (its link failed), yet it
+            // needed what we sent: a send to it that failed meanwhile is
+            // owed like any other (R61), so a success already on its way or
+            // a drain does not end Ok over the frames it dropped.
+            let owed = matches!(failure, LinkFailure::SendFailed)
+                && self.phase == Phase::Running
+                && peer.lost
+                && !peer.retired()
+                && !peer.cancel_received
+                && !peer.send_failure_settled;
+            let mut actions = Vec::new();
             if peer.stopped || peer.stopped_after_cancel(hard) {
                 // The peer cancelled, then its link ended before its goodbye
                 // (or it said it stopped): it did not finish its part (its
                 // runtime went away, its workers failed or did not drain).
                 // Re-checked as our sends to it fail.
                 peer.stopped = true;
-                return self.abort_drain_without(&peer_id);
+                actions = self.abort_drain_without(&peer_id);
             }
-            // Retired: neither side needs this link any more.
-            return Vec::new();
+            if owed {
+                let peer = self.peers.get_mut(&peer_id).expect("looked up above");
+                peer.soft_failure = Some(LinkFailure::SendFailed);
+                if hard || peer.fully_closed() {
+                    actions.extend(self.settle_unsent(peer_id, Some(LinkFailure::ChannelClosed)));
+                } else {
+                    actions.push(Action::ArmSoftFailureTimer(peer_id));
+                }
+            }
+            // Otherwise retired: neither side needs this link any more.
+            return actions;
         }
         if peer.unsent() && (hard || peer.fully_closed()) {
             return self.settle_unsent(peer_id, Some(failure));
+        }
+        if self.phase == Phase::Running && matches!(failure, LinkFailure::SendFailed) && !hard {
+            // While the workers run, the frames a failed send dropped are
+            // owed in every case, during a cancellation too: they are
+            // settled once the link has closed fully (or failed hard), the
+            // peer's Cancel has come, or the grace period has ended
+            // (`settle_unsent`), so a success already on its way, or a
+            // drain, does not end Ok over them (R61).
+            if !peer.fully_closed() {
+                return Self::defer_soft_failure(peer, peer_id, failure);
+            }
+            peer.soft_failure = Some(failure);
+            return self.settle_unsent(peer_id, Some(LinkFailure::ChannelClosed));
         }
         match self.phase {
             Phase::Running if self.cancel_broadcast && !self.requested_stop => {
@@ -1262,6 +1436,16 @@ impl LifecycleMachine {
                     return Self::defer_soft_failure(peer, peer_id, failure);
                 }
                 peer.lost = true;
+                // A generic end (a channel closing, a failed send) follows
+                // from the connection's failure, when one was reported: name
+                // that cause (the connection failed or fell silent, say).
+                let failure = match (failure, peer.cause.take()) {
+                    (LinkFailure::ChannelClosed | LinkFailure::SendFailed, Some(cause)) => {
+                        LinkFailure::Transport(cause)
+                    }
+                    (failure, _) => failure,
+                };
+
                 self.cancel_broadcast = true;
                 vec![
                     Action::LinkFailed {
@@ -1328,13 +1512,18 @@ impl LifecycleMachine {
     }
 
     /// Wait for the rest of a softly failed link to close, but only for a
-    /// grace period (see [`Action::ArmSoftFailureTimer`]).
+    /// grace period (see [`Action::ArmSoftFailureTimer`]). A failed send
+    /// replaces an inbound end already waiting: its frames are owed, which
+    /// the inbound end alone does not settle (`settle_unsent`).
     fn defer_soft_failure(
         peer: &mut PeerState,
         peer_id: String,
         failure: LinkFailure,
     ) -> Vec<Action> {
         if peer.soft_failure.is_some() {
+            if matches!(failure, LinkFailure::SendFailed) {
+                peer.soft_failure = Some(failure);
+            }
             return Vec::new();
         }
         peer.soft_failure = Some(failure);
@@ -1381,12 +1570,20 @@ impl LifecycleMachine {
         let Some(unsent) = peer.soft_failure.take() else {
             return Vec::new();
         };
+        peer.send_failure_settled = true;
         if peer.retired() {
             if closed_by.is_some() {
                 return Vec::new();
             }
         } else if self.phase == Phase::Running && !peer.lost {
-            return self.on_link_failure(peer_id, closed_by.unwrap_or(unsent), true);
+            // Fatal; and if every worker still succeeds (a success already
+            // on its way, or a drain on a cancellation), the frames it
+            // dropped are a loss (R61).
+            let detail = outbound_loss_detail(&unsent);
+            let mut actions =
+                self.on_link_failure(peer_id.clone(), closed_by.unwrap_or(unsent), true);
+            actions.extend(self.on_inbound_data_lost(peer_id, detail, false));
+            return actions;
         } else {
             peer.lost = true;
         }
@@ -1411,6 +1608,34 @@ async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
+    }
+}
+
+/// Wait until every outbox forwarder has handed its lane to its pooled
+/// connection (Shared mode, graceful teardown), with no fixed deadline. A
+/// peer reported as left (`RuntimeHandle::report_node_leave`) after `mark`
+/// (when the run started), before or during the wait and even if it has
+/// rejoined since, needs nothing more from us: its forwarder is aborted
+/// instead of waited for.
+async fn await_forwarders(
+    forwarders: HashMap<String, tokio::task::JoinHandle<()>>,
+    peers: &super::PeerRegistry,
+    mark: u64,
+) {
+    for (peer, mut forwarder) in forwarders {
+        loop {
+            let reported = peers.down_reported();
+            tokio::pin!(reported);
+            reported.as_mut().enable();
+            if peers.left_since(&peer, mark) {
+                forwarder.abort();
+                break;
+            }
+            tokio::select! {
+                _ = &mut forwarder => break,
+                () = &mut reported => {}
+            }
+        }
     }
 }
 
@@ -1483,6 +1708,9 @@ pub(crate) struct ClusterLifecycle {
     pub(crate) dispatcher: Option<tokio::task::JoinHandle<()>>,
     pub(crate) peer_registry: Arc<super::PeerRegistry>,
     pub(crate) peer_registration: Option<u64>,
+    /// The peer registry's leave reports when the run started (see
+    /// [`super::PeerRegistry::left_since`]).
+    pub(crate) departure_mark: u64,
     pub(crate) shared_managers: Option<Arc<HashMap<String, SharedPeerManager>>>,
     /// The token of this dataflow's registrations with `shared_managers`.
     pub(crate) shared_registration: Option<u64>,
@@ -1493,6 +1721,7 @@ pub(crate) struct ClusterLifecycle {
     pub(crate) unfinished_announced: bool,
     /// The first local worker error other than a cancellation.
     pub(crate) worker_failure: Option<String>,
+
     /// The flight recorder: the data loss the machine accepted was dumped
     /// (see [`dump_accepted_loss`]).
     #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
@@ -1534,7 +1763,21 @@ impl ClusterLifecycle {
                     actions.extend(self.machine.on_dataflow_cancelled(failure));
                     actions
                 }
-                _ = self.bridge_cancel.cancelled() => self.machine.on_external_abort(),
+                _ = self.bridge_cancel.cancelled() => {
+                    // Apply what is already queued first, as for a
+                    // cancellation: a worker's result or a link event already
+                    // reported must count.
+                    let mut actions = Vec::new();
+                    while let Ok(event) = self.events.try_recv() {
+                        actions.extend(self.apply(event));
+                    }
+                    let transport = Arc::clone(&self.transport);
+                    actions.extend(
+                        self.machine
+                            .on_external_abort(|peer| transport.outbound_failed(peer)),
+                    );
+                    actions
+                }
                 event = self.events.recv() => match event {
                     Some(event) => self.apply(event),
                     None => self.machine.on_events_closed(),
@@ -1616,10 +1859,20 @@ impl ClusterLifecycle {
                 if let Some(failure) = failure {
                     self.worker_failure.get_or_insert(failure);
                 }
-                self.machine.on_event(LifecycleEvent::WorkerFinished {
+                // A send the transport has already failed failed while the
+                // workers ran, though its notice may still be on its way:
+                // the machine learns of it before this result, so a worker
+                // finishing first cannot make it look like a failure after
+                // completion (ClusterTransport.tla, FinishCheck).
+                let transport = Arc::clone(&self.transport);
+                let mut actions = self
+                    .machine
+                    .note_failed_sends(|peer| transport.outbound_failed(peer));
+                actions.extend(self.machine.on_event(LifecycleEvent::WorkerFinished {
                     success,
                     failure: None,
-                })
+                }));
+                actions
             }
             event => self.machine.on_event(event),
         }
@@ -1830,32 +2083,33 @@ impl ClusterLifecycle {
             for forwarder in forwarders.values() {
                 forwarder.abort();
             }
-        } else {
+        } else if managers.is_some() {
             // Peers may still need what we queued: our goodbye, the
             // acknowledgements of their goodbyes (both in-band on the payload
             // lane) and, for a peer we stopped waiting for (it cancelled and
-            // may still be draining), our final progress. Hand our lanes to
-            // the transport and, in Shared mode, let the bridges sequence
-            // those frames before unregistering, which would drop them.
-            // One task per peer, all bounded together, so an unreachable peer
-            // does not hold up the others.
+            // may still be draining), our final progress. Each forwarder
+            // hands its lane to its pooled connection, and a frame queued
+            // there is written even once we unregister (R58), so this waits
+            // with no fixed deadline: only on a connection that accepts no
+            // frames, which the liveness rule fails (a dead verdict on either
+            // node, or the stall rule here) and which then refuses the rest,
+            // or until the peer is reported as left. Every local worker has
+            // finished (graceful), so the forwarders hold the only outboxes,
+            // and the lanes end.
+            await_forwarders(forwarders, &self.peer_registry, self.departure_mark).await;
+        } else {
+            // Dedicated mode: as above, bounded, one task per peer, all
+            // bounded together, so an unreachable peer does not hold up the
+            // others.
             let mut flushes = tokio::task::JoinSet::new();
-            for (peer, forwarder) in forwarders {
-                let managers = managers.clone();
-                flushes.spawn(async move {
-                    let _ = forwarder.await;
-                    if let Some(manager) = managers.as_ref().and_then(|m| m.get(&peer)) {
-                        manager.flush().await;
-                    }
-                });
+            for forwarder in forwarders.into_values() {
+                flushes.spawn(forwarder);
             }
             let finished = tokio::time::timeout(self.cancel_broadcast_timeout, async {
                 while flushes.join_next().await.is_some() {}
             })
             .await;
             if finished.is_err() {
-                // Release the managers the unfinished flushes hold before
-                // checking below whether ours is the last reference.
                 flushes.abort_all();
                 while flushes.join_next().await.is_some() {}
             }
@@ -1918,12 +2172,104 @@ impl ClusterLifecycle {
         if let Some(loss) = self.machine.data_loss() {
             self._teardown.set_data_loss(loss.clone());
         }
+        if let Some(loss) = self.machine.loss_if_workers_succeed() {
+            self._teardown.set_loss_if_ok(loss.clone());
+        }
     }
 }
 
 #[cfg(test)]
+mod exhaustive;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Shared teardown waits for every outbox forwarder with no deadline,
+    /// but not for one to a peer reported as left, before or during the
+    /// wait: that peer needs nothing more, and its connection may never
+    /// accept the frames.
+    #[tokio::test(start_paused = true)]
+    async fn teardown_stops_waiting_for_a_peer_reported_as_left() {
+        let stuck = || tokio::spawn(std::future::pending::<()>());
+        for reported_before in [true, false] {
+            let peers = Arc::new(super::super::PeerRegistry::new());
+            let mark = peers.departure_mark();
+            if reported_before {
+                peers.report_peer_down("b");
+            }
+            let (finish_c, c_finishes) = tokio::sync::oneshot::channel::<()>();
+            let c = tokio::spawn(async move {
+                let _ = c_finishes.await;
+            });
+            let b = stuck();
+            let b_aborted = b.abort_handle();
+            let forwarders = HashMap::from([("b".to_string(), b), ("c".to_string(), c)]);
+            let waiting = {
+                let peers = Arc::clone(&peers);
+                tokio::spawn(async move { await_forwarders(forwarders, &peers, mark).await })
+            };
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            assert!(
+                !waiting.is_finished(),
+                "returned before c's forwarder finished (reported before: {reported_before})"
+            );
+            finish_c.send(()).unwrap();
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            assert_eq!(
+                waiting.is_finished(),
+                reported_before,
+                "b's forwarder never finishes: only its report may end the wait"
+            );
+            if !reported_before {
+                peers.report_peer_down("b");
+            }
+            tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .expect("the wait did not end once b was reported as left")
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(b_aborted.is_finished(), "b's forwarder was not aborted");
+        }
+    }
+
+    /// A peer reported leaving and then rejoining, before the wait or while
+    /// the waiter has not run yet, is still not waited for: the run started
+    /// before the report.
+    #[tokio::test(start_paused = true)]
+    async fn teardown_stops_waiting_for_a_peer_that_left_and_rejoined() {
+        for during in [false, true] {
+            let peers = Arc::new(super::super::PeerRegistry::new());
+            // A leave reported before the run started does not count.
+            peers.report_peer_down("b");
+            peers.report_peer_recovered("b");
+            let mark = peers.departure_mark();
+            if !during {
+                peers.report_peer_down("b");
+                peers.report_peer_recovered("b");
+            }
+            let b = tokio::spawn(std::future::pending::<()>());
+            let b_aborted = b.abort_handle();
+            let forwarders = HashMap::from([("b".to_string(), b)]);
+            let waiting = {
+                let peers = Arc::clone(&peers);
+                tokio::spawn(async move { await_forwarders(forwarders, &peers, mark).await })
+            };
+            if during {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                assert!(!waiting.is_finished(), "b never left during this run yet");
+                // Both reports before the waiter runs again.
+                peers.report_peer_down("b");
+                peers.report_peer_recovered("b");
+            }
+            tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .unwrap_or_else(|_| panic!("still waiting for b (during: {during})"))
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(b_aborted.is_finished(), "b's forwarder was not aborted");
+        }
+    }
 
     fn machine(
         workers: usize,
@@ -2191,18 +2537,63 @@ mod tests {
                 [Action::Teardown { graceful: false }]
             ));
         }
-        // Workers that still succeed (draining) tear down without waiting for
-        // acks: every peer was told the dataflow is cancelled.
+        // Workers whose success was already on its way (it raced with the
+        // failure) still do not end Ok: frames sent on the failed link may be
+        // lost. The completion reports it, without waiting for acks.
         let (mut m, _) = machine(1, &[("b", 1), ("c", 1)]);
         m.on_event(link_event(
             "b",
             LinkEvent::OutboundFailed(LinkFailure::Transport(TransportError::ConnectionClosed)),
         ));
         let actions = m.on_event(done(true));
-        assert!(matches!(
-            actions.as_slice(),
-            [Action::SendGoodbye, Action::Teardown { graceful: true }]
-        ));
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [
+                    Action::CancelDataflow(_),
+                    Action::Teardown { graceful: false }
+                ]
+            ),
+            "{actions:?}"
+        );
+        assert_eq!(m.data_loss().map(|loss| loss.peer.as_str()), Some("b"));
+    }
+
+    /// A link's failure is reported by its connection's cause, once the
+    /// whole link has closed: its channels closing, or our sends failing,
+    /// after its connection fell silent only follow from that, whichever is
+    /// seen first.
+    #[test]
+    fn a_failed_link_reports_its_first_cause() {
+        let silent = || {
+            LinkEvent::ConnectionFailed(TransportError::ConnectionSilent {
+                timeout: Duration::from_secs(30),
+            })
+        };
+        for send_failed_first in [false, true] {
+            let (mut m, _) = machine(1, &[("b", 1)]);
+            if send_failed_first {
+                m.on_event(send_failed("b"));
+            }
+            m.on_event(link_event("b", silent()));
+            m.on_event(eof("b"));
+            let actions = m.on_event(link_event("b", LinkEvent::ControlClosed));
+            assert!(
+                matches!(
+                    actions.as_slice(),
+                    [
+                        Action::LinkFailed {
+                            failure: LinkFailure::Transport(
+                                TransportError::ConnectionSilent { .. }
+                            ),
+                            ..
+                        },
+                        Action::BroadcastCancel
+                    ]
+                ),
+                "send failed first: {send_failed_first}: {actions:?}"
+            );
+        }
     }
 
     /// An EOF is a link failure only once every channel from the peer has
@@ -2420,6 +2811,141 @@ mod tests {
             ),
             "{actions:?}"
         );
+        assert!(m.data_loss().is_none());
+    }
+
+    /// A send failure owed when the last worker finished is reported again
+    /// once the machine drains (the coordinator reports it as the workers
+    /// finish, then the transport's own notice and the forwarder's report
+    /// follow). The repeat is the same failure: the peer's Cancel, or its
+    /// goodbye and the link's close, still settle it without loss.
+    #[test]
+    fn a_repeated_failed_send_still_waits_for_the_peers_cancel_or_goodbye() {
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        assert!(matches!(
+            m.on_event(send_failed("b")).as_slice(),
+            [Action::ArmSoftFailureTimer(_)]
+        ));
+        assert!(matches!(
+            m.on_event(done(true)).as_slice(),
+            [Action::SendGoodbye]
+        ));
+        assert!(m.on_event(send_failed("b")).is_empty(), "absorbed");
+        let actions = m.on_event(link_event("b", LinkEvent::CancelReceived));
+        assert!(is_teardown(&actions, true), "{actions:?}");
+        assert!(m.data_loss().is_none());
+
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        m.on_event(send_failed("b"));
+        m.on_event(done(true));
+        assert!(m.on_event(send_failed("b")).is_empty(), "absorbed");
+        assert!(matches!(
+            m.on_event(link_event("b", LinkEvent::ProgressEndOfStream))
+                .as_slice(),
+            [Action::SendAck(_)]
+        ));
+        let actions = m.on_event(link_event("b", LinkEvent::ControlClosed));
+        assert!(is_teardown(&actions, true), "{actions:?}");
+        assert!(m.data_loss().is_none());
+
+        // Unexcused, it is still a loss once the link has closed.
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        m.on_event(send_failed("b"));
+        m.on_event(done(true));
+        m.on_event(send_failed("b"));
+        m.on_event(link_event(
+            "b",
+            LinkEvent::ProgressChannelEnded(LinkFailure::ChannelClosed),
+        ));
+        m.on_event(link_event("b", LinkEvent::ControlClosed));
+        assert!(m.data_loss().is_some());
+
+        // The goodbye's marker may end the last channel after the control
+        // channel closed: it settles the owed send (retired, closed).
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        m.on_event(send_failed("b"));
+        m.on_event(done(true));
+        m.on_event(send_failed("b"));
+        assert!(
+            m.on_event(link_event("b", LinkEvent::ControlClosed))
+                .is_empty()
+        );
+        let actions = m.on_event(link_event("b", LinkEvent::ProgressEndOfStream));
+        assert!(is_teardown(&actions, true), "{actions:?}");
+        assert!(m.data_loss().is_none());
+    }
+
+    /// A send still owed when the run is torn down from outside (a
+    /// participant reported leaving) is settled as its grace period
+    /// would: a loss, not Ok, whichever came first. While the workers run,
+    /// it is held for their results, which the machine no longer sees.
+    #[test]
+    fn a_failed_send_still_owed_at_an_external_abort_is_a_loss() {
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        m.on_event(send_failed("b"));
+        let actions = m.on_external_abort(|_| false);
+        assert!(is_teardown(&actions, false), "{actions:?}");
+        assert!(m.data_loss().is_none(), "the workers may still fail");
+        assert_eq!(
+            m.loss_if_workers_succeed().map(|loss| loss.peer.as_str()),
+            Some("b")
+        );
+        // The transport failed the lane; its notice is still on its way.
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        let actions = m.on_external_abort(|peer| peer == "b");
+        assert!(is_teardown(&actions, false), "{actions:?}");
+        assert!(m.loss_if_workers_succeed().is_some());
+        for closed in [false, true] {
+            let (mut m, _) = machine(1, &[("b", 1)]);
+            m.on_event(send_failed("b"));
+            m.on_event(done(true));
+            assert_eq!(m.phase(), Phase::Draining);
+            let actions = if closed {
+                m.on_events_closed()
+            } else {
+                m.on_external_abort(|_| false)
+            };
+            assert!(is_teardown(&actions, true), "{actions:?}");
+            assert_eq!(
+                m.data_loss().map(|loss| loss.peer.as_str()),
+                Some("b"),
+                "closed: {closed}"
+            );
+        }
+    }
+
+    /// A send that failed while the workers ran is owed even when an inbound
+    /// end of the same link was deferred first (one soft failure per peer):
+    /// once the workers succeed and the link closes, it is a loss, not Ok.
+    #[test]
+    fn a_failed_send_after_a_deferred_inbound_end_is_still_owed() {
+        let reset = || {
+            link_event(
+                "b",
+                LinkEvent::ConnectionFailed(TransportError::ConnectionClosed),
+            )
+        };
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        assert!(matches!(
+            m.on_event(reset()).as_slice(),
+            [Action::ArmSoftFailureTimer(_)]
+        ));
+        assert!(m.on_event(send_failed("b")).is_empty());
+        assert!(matches!(
+            m.on_event(done(true)).as_slice(),
+            [Action::SendGoodbye]
+        ));
+        m.on_event(eof("b"));
+        m.on_event(link_event("b", LinkEvent::ControlClosed));
+        assert!(m.data_loss().is_some(), "Ok over a send that failed");
+
+        // Excused like any owed send: the peer cancelled.
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        m.on_event(reset());
+        m.on_event(send_failed("b"));
+        m.on_event(done(true));
+        let actions = m.on_event(link_event("b", LinkEvent::CancelReceived));
+        assert!(is_teardown(&actions, true), "{actions:?}");
         assert!(m.data_loss().is_none());
     }
 
@@ -3446,12 +3972,14 @@ mod tests {
             dispatcher: None,
             peer_registry: Arc::new(super::super::PeerRegistry::new()),
             peer_registration: None,
+            departure_mark: 0,
             shared_managers: None,
             shared_registration: None,
             transport: Arc::new(ClusterTransport::Dedicated(Arc::new(session))),
             failure_announced: false,
             unfinished_announced: false,
             worker_failure: None,
+
             loss_dumped: false,
             _teardown: notifier,
         };
@@ -3507,6 +4035,164 @@ mod tests {
         );
         drop(rings);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A send the transport failed before the last worker finished failed
+    /// while the workers ran, even when its notice reaches the coordinator
+    /// only after the worker's result: the completion reports the loss, not
+    /// Ok (ClusterTransport.tla: ct_notice_refuse, ct_notice_checked).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[tokio::test]
+    async fn a_send_failed_before_the_workers_finished_is_a_loss_though_its_notice_is_late() {
+        let id = DataflowId::new();
+        let dir = std::env::temp_dir().join(format!("instancy-trace-late-{}", id.as_uuid()));
+        let ring = crate::progress::trace::recorder_for_test(id, "node-a", None, "node-b", 2, &dir);
+        let (m, _) = machine(1, &[("node-b", 1)]);
+        let late = link_event("node-b", LinkEvent::OutboundFailed(LinkFailure::SendFailed));
+        // The notice arrives after the worker's result, then the peer's
+        // channels close, which settles the failed send.
+        let events = vec![
+            done(true),
+            late,
+            link_event(
+                "node-b",
+                LinkEvent::ProgressChannelEnded(LinkFailure::ChannelClosed),
+            ),
+            link_event("node-b", LinkEvent::ControlClosed),
+        ];
+        let (a, node_b, waiter) = coordinator(id, m, "node-b", events, &ring);
+        // The peer's end is gone: the next write fails, and the transport
+        // knows before any notice is delivered.
+        drop(node_b);
+        let frame = Frame {
+            dataflow_id: id,
+            channel_id: 7,
+            payload: vec![1],
+        };
+        let _ = a.transport.data_sender("node-b").unwrap().send(frame).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !a.transport.outbound_failed("node-b") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the write failed");
+        tokio::time::timeout(Duration::from_secs(10), a.run())
+            .await
+            .unwrap();
+        let loss = waiter.data_loss().expect("the completion reports the loss");
+        assert_eq!(loss.peer, "node-b");
+        drop(ring);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dedicated mode: a connection that failed on its read side (a reset,
+    /// say) may have lost frames already written, though the idle writer has
+    /// not failed. As the workers succeed the check reports a failed send,
+    /// as Shared mode's failed lane does, so the run reports the loss when
+    /// the peer's channels close, not Ok once the goodbye's write fails.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[tokio::test]
+    async fn a_read_failure_before_the_workers_finished_is_a_failed_send() {
+        use tokio::io::AsyncWriteExt;
+        let id = DataflowId::new();
+        let dir = std::env::temp_dir().join(format!("instancy-trace-readfail-{}", id.as_uuid()));
+        let ring = crate::progress::trace::recorder_for_test(id, "node-a", None, "node-b", 2, &dir);
+        let (m, _) = machine(1, &[("node-b", 1)]);
+        let read_failed = TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "connection closed mid-frame",
+        ));
+        // The read failure's notice arrives after the worker's result, then
+        // the peer's channels close.
+        let events = vec![
+            done(true),
+            link_event("node-b", LinkEvent::ConnectionFailed(read_failed)),
+            link_event(
+                "node-b",
+                LinkEvent::ProgressChannelEnded(LinkFailure::ChannelClosed),
+            ),
+            link_event("node-b", LinkEvent::ControlClosed),
+        ];
+        let (a, node_b, waiter) = coordinator(id, m, "node-b", events, &ring);
+        // Half a frame, then the end of the stream: our reader fails, while
+        // our writer still works (the peer's end stays open).
+        let mut peer = node_b.into_inner();
+        peer.write_all(&[1, 2, 3]).await.unwrap();
+        peer.shutdown().await.unwrap();
+        let ClusterTransport::Dedicated(session) = &*a.transport else {
+            panic!("the test transport is Dedicated");
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !session.read_failed("node-b") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the read failed");
+        assert!(
+            !session.data_sender("node-b").unwrap().is_closed(),
+            "the writer has not failed"
+        );
+        tokio::time::timeout(Duration::from_secs(10), a.run())
+            .await
+            .unwrap();
+        let loss = waiter.data_loss().expect("the completion reports the loss");
+        assert_eq!(loss.peer, "node-b");
+        drop(peer);
+        drop(ring);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run torn down from outside (a participant reported leaving) with a
+    /// send still owed: a worker's success already queued
+    /// is applied first, and the run reports the loss; otherwise the loss is
+    /// held for the workers' results, which come after teardown, and fails
+    /// the completion only if they succeed.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[tokio::test]
+    async fn an_external_abort_keeps_an_owed_send_for_the_workers_results() {
+        for queued_success in [false, true] {
+            let id = DataflowId::new();
+            let dir = std::env::temp_dir().join(format!("instancy-trace-abort-{}", id.as_uuid()));
+            let ring =
+                crate::progress::trace::recorder_for_test(id, "node-a", None, "node-b", 2, &dir);
+            let (mut m, _) = machine(1, &[("node-b", 1)]);
+            m.on_event(send_failed("node-b"));
+            let events = if queued_success {
+                vec![done(true)]
+            } else {
+                Vec::new()
+            };
+            let (a, _node_b, waiter) = coordinator(id, m, "node-b", events, &ring);
+            a.bridge_cancel.cancel();
+            tokio::time::timeout(Duration::from_secs(10), a.run())
+                .await
+                .unwrap();
+            let held = if queued_success {
+                waiter.data_loss()
+            } else {
+                assert!(waiter.data_loss().is_none(), "the workers may still fail");
+                waiter.loss_if_ok()
+            };
+            assert_eq!(
+                held.map(|loss| loss.peer),
+                Some("node-b".to_string()),
+                "queued success: {queued_success}"
+            );
+            assert!(
+                super::super::merge_data_loss(Ok(()), &waiter).is_err(),
+                "a success reports the loss"
+            );
+            if !queued_success {
+                assert!(matches!(
+                    super::super::merge_data_loss(Err(Error::Cancelled { reason: None }), &waiter),
+                    Err(Error::Cancelled { .. })
+                ));
+            }
+            drop(ring);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// The checkpoint after teardown: records reported behind the
@@ -3615,13 +4301,13 @@ mod tests {
         // While the workers run, an external abort tells the peers.
         let (mut m, _) = machine(1, &[("b", 1)]);
         assert!(matches!(
-            m.on_external_abort().as_slice(),
+            m.on_external_abort(|_| false).as_slice(),
             [
                 Action::BroadcastCancel,
                 Action::Teardown { graceful: false }
             ]
         ));
-        assert!(m.on_external_abort().is_empty());
+        assert!(m.on_external_abort(|_| false).is_empty());
         assert!(m.on_event(done(true)).is_empty());
 
         // After local success it tears down gracefully: the flush delivers
@@ -3630,7 +4316,7 @@ mod tests {
         m.on_event(done(true));
         assert_eq!(m.phase(), Phase::Draining);
         assert!(matches!(
-            m.on_external_abort().as_slice(),
+            m.on_external_abort(|_| false).as_slice(),
             [Action::Teardown { graceful: true }]
         ));
         assert!(!links[0].is_retired());
@@ -3638,7 +4324,7 @@ mod tests {
         let (mut m, _) = machine(1, &[("b", 1)]);
         m.on_dataflow_cancelled(false);
         assert!(matches!(
-            m.on_external_abort().as_slice(),
+            m.on_external_abort(|_| false).as_slice(),
             [Action::Teardown { graceful: false }]
         ));
 

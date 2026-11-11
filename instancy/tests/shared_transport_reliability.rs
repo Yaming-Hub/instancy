@@ -28,7 +28,6 @@ fn health_tx() -> tokio::sync::broadcast::Sender<instancy::RuntimeEvent> {
 fn config(connections: usize) -> SharedConnectionConfig {
     SharedConnectionConfig {
         connections,
-        probe_interval: Duration::from_secs(3600),
         ..SharedConnectionConfig::default()
     }
 }

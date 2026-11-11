@@ -8,21 +8,29 @@
 //!
 //! ```text
 //! SharedPeerManager (per peer, owns the pooled connections)
-//! ├── Pool: `connections` connections, each with a writer task and a reader task
-//! ├── Bridge task: sequences payload frames and routes every frame of a
-//! │   dataflow to the connection its lane is pinned to
-//! ├── Probe loop: periodic RTT probes per connection (metrics only)
+//! ├── Pool: `connections` connections, each with
+//! │   ├── a writer task with two queues: control frames, always served
+//! │   │   first, and payload frames (bounded: full means backpressure)
+//! │   └── a reader task, which hands each frame on without ever waiting
+//! ├── Control router: puts each control frame on its dataflow's connection
+//! ├── Probe loop: a probe on each connection every `probe_interval`, and
+//! │   the liveness verdicts (see "Connection liveness")
 //! └── Per dataflow registration:
 //!     ├── the pinned connection (chosen at registration, never changes)
-//!     ├── send and receive sequence numbers of the payload lane
+//!     ├── its payload lane: frames are numbered as they are queued on the
+//!     │   pinned connection
+//!     ├── the sequence number the next frame from the peer must carry
 //!     └── per-channel receivers
 //!
 //! SharedTransportSession (per dataflow, lightweight handle)
 //! ├── References a SharedPeerManager for each peer
-//! ├── data_sender(peer) → shared payload channel
+//! ├── data_sender(peer) → the dataflow's lane to the peer
 //! ├── progress_sender(peer) → same as data_sender (FIFO preserved)
 //! └── control_sender(peer) → priority channel
 //! ```
+//!
+//! Nothing is shared between a peer's connections: a connection that is
+//! slow or stuck holds up only the dataflows pinned to it.
 //!
 //! # Pinned lanes
 //!
@@ -31,11 +39,31 @@
 //! T is sent before the progress message releasing T. When a dataflow
 //! registers, its lane (and its control frames) is pinned to one pooled
 //! connection, the one with the fewest lanes, so TCP keeps its frames in
-//! order. Each payload frame carries the lane's next sequence number, and
-//! the receiver checks it: a frame that does not carry exactly the next
-//! number (a lost or duplicated frame), or a lane whose frames arrive on two
+//! order.
+//!
+//! A payload frame takes its lane's next sequence number as it is queued on
+//! the pinned connection, in one step under the lane's lock: a frame that
+//! can't be queued (the queue is full) takes no number, and the queue holds
+//! the lane's frames in number order whichever task sends them. The receiver
+//! checks the number: a frame that does not carry exactly the next number (a
+//! lost or duplicated frame), or a lane whose frames arrive on two
 //! connections, fails the dataflow ([`TransportError::OutOfSequence`],
 //! [`TransportError::LaneViolation`]) instead of being delivered.
+//!
+//! # Connection liveness
+//!
+//! With [`SharedConnectionConfig::silence_timeout`] set (T, 30 s by
+//! default), each node probes every pooled connection every
+//! [`probe_interval`](SharedConnectionConfig::probe_interval), so a healthy
+//! connection always has bytes arriving. A connection whose reader has read
+//! no bytes for T fails like a read error
+//! ([`TransportError::ConnectionSilent`]); one whose writer has had bytes
+//! waiting and written none for T fails like a write error
+//! ([`TransportError::WriteStalled`]). Both rules count bytes, not frames,
+//! and judge one connection, never a node: a node leaving stays the
+//! application's to report
+//! ([`RuntimeHandle::report_node_leave`](crate::RuntimeHandle::report_node_leave)).
+//! The design, with the timing condition, is `docs/design/connection-liveness.md`.
 //!
 //! # Connection failures (fail-stop)
 //!
@@ -44,28 +72,31 @@
 //! nodes, like a lost connection in Dedicated mode (and as in timely, which
 //! stops on any connection error):
 //!
-//! - when its writer fails, every dataflow whose lane is pinned to it is told
-//!   ([`PeerIoEvent::WriteFailed`]), and the whole connection is closed
-//!   (its reader stops too), so the peer sees it end even when the write
-//!   half alone would tell it nothing (`tokio::io::split` halves, as with
-//!   TLS);
+//! - when its writer fails (a write error, or the stall rule), every
+//!   dataflow whose lane is pinned to it is told
+//!   ([`PeerIoEvent::WriteFailed`]), and the whole connection is closed (its
+//!   reader stops too), so the peer sees it end even when the write half
+//!   alone would tell it nothing (`tokio::io::split` halves, as with TLS);
 //! - when its reader ends with an error (an I/O error, EOF mid-frame, a
-//!   corrupt or oversize frame, or the writer's failure), every dataflow
-//!   whose frames from the peer arrive on it, or whose lane is pinned to it,
-//!   is told, the channels of a dataflow whose frames arrive on it close,
-//!   and the connection leaves the pool;
+//!   corrupt or oversize frame, the silence rule, or the writer's failure),
+//!   every dataflow whose frames from the peer arrive on it, or whose lane is
+//!   pinned to it, is told, the channels of a dataflow whose frames arrive on
+//!   it close, and the connection leaves the pool;
 //! - when the peer closes its side cleanly (EOF at a frame boundary), the
 //!   same dataflows are told, but the lanes pinned to it keep writing until
 //!   a write fails: a released manager keeps reading for its peers' last
 //!   frames (goodbyes, acknowledgements, a `Cancel`), as in Dedicated mode.
 //!   The connection takes no new lanes and is closed once its last lane
 //!   unregisters;
-//! - a payload frame that cannot be sent (its connection failed, or it
-//!   exceeds the frame size limit) fails its dataflow and nobody else's.
+//! - a payload frame that cannot be sent (on a reserved channel, or over the
+//!   frame size limit) fails its dataflow and nobody else's.
 //!
 //! The failed connection leaves the pool. The pool is not redialled in the
 //! background: the next dataflow that registers re-establishes missing
-//! connections through the application's [`ConnectionFactory`].
+//! connections through the application's [`ConnectionFactory`]. A
+//! connection failure is reported as
+//! [`RuntimeEvent::TransportDegraded`](crate::RuntimeEvent::TransportDegraded),
+//! which needs no action: the pool recovers on its own.
 //!
 //! # One run per `DataflowId`
 //!
@@ -74,41 +105,49 @@
 //! run's id could take that run's late frames for its own, so a manager
 //! refuses to register an id it remembers as finished (the most recent
 //! 16,384) and drops the late frames of such an id; a retry needs a fresh
-//! id. Payload frames are queued with their registration, so those still
-//! queued when it ends are dropped, never numbered into another
-//! registration's lane.
+//! id. A frame is numbered into its own registration's lane as it is queued,
+//! so a queued frame is written even if its registration ends meanwhile (a
+//! peer whose run has finished drops it as late), and a frame sent after the
+//! registration ended is dropped, never numbered into another registration's
+//! lane.
 //!
 //! # Transport contract
 //!
-//! The application provides the connections and owns their liveness:
-//! detecting that a peer is dead, partitioned or unreachable, through its
-//! transport (keepalives, TLS or QUIC idle timeouts) or its membership layer
-//! ([`RuntimeHandle::report_node_leave`](crate::RuntimeHandle::report_node_leave)).
-//! instancy owns safety: it never reports success with lost, duplicated,
-//! reordered or corrupted data (every frame is checksummed, and every lane is
-//! sequenced), and it fails the affected dataflows promptly when a connection
-//! reports an error or EOF, or when the application reports a node leaving.
-//! A connection that silently stops delivering without ever failing (a
-//! network partition with no keepalive) makes its dataflows wait; they are
-//! never reported as successful.
+//! The application provides the connections and the node membership. instancy
+//! detects a connection that stops delivering (see "Connection liveness") and
+//! owns safety: it never reports success with lost, duplicated, reordered or
+//! corrupted data (every frame is checksummed, and every lane is sequenced),
+//! and it fails the affected dataflows promptly when a connection fails,
+//! falls silent, or the application reports a node leaving. With
+//! `silence_timeout: None` a connection that silently stops delivering makes
+//! its dataflows wait; they are never reported as successful.
 //!
 //! # Probe Protocol
 //!
-//! RTT probes use the standard [`Frame`] wire format with a reserved
-//! `PROBE_CHANNEL_ID` to avoid mixing wire formats on the same TCP stream.
-//! They only feed [`SharedPeerManager::metrics_snapshot`].
+//! Probes use the standard [`Frame`] wire format with a reserved
+//! `PROBE_CHANNEL_ID` to avoid mixing wire formats on the same stream. They
+//! keep each connection's bytes flowing for the liveness rule, and measure
+//! its round-trip time for [`SharedPeerManager::metrics_snapshot`].
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+// Schedule tests (`--cfg instancy_shuttle`, Linux) substitute Shuttle's mutex
+// for a lane's lock; see `lane_shuttle` below.
+#[cfg(all(test, target_os = "linux", instancy_shuttle))]
+use shuttle::sync::Mutex as LaneMutex;
+#[cfg(not(all(test, target_os = "linux", instancy_shuttle)))]
+use std::sync::Mutex as LaneMutex;
+
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc as tokio_mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::communication::codec::MAX_MESSAGE_SIZE;
 use crate::communication::probing::{ProbeCounter, ProbeKind, ProbeMessage, RttProber};
@@ -130,22 +169,6 @@ pub const PROBE_CHANNEL_ID: u64 = u64::MAX;
 /// Size of the sequence number that prefixes every payload frame.
 const SEQUENCE_PREFIX: usize = 8;
 
-/// An entry of a manager's payload queue, which the bridge task processes in
-/// order.
-enum Outbound {
-    /// A payload frame of the registration made with `token`. Dropped if
-    /// that registration has ended: its frames are never sequenced into
-    /// another registration's lane.
-    Payload {
-        dataflow_id: DataflowId,
-        token: u64,
-        frame: Frame,
-    },
-    /// A flush barrier (see [`SharedPeerManager::flush`]): everything queued
-    /// before it has been processed. Never sent.
-    Barrier(tokio::sync::oneshot::Sender<()>),
-}
-
 /// How long a released [`SharedPeerManager`] keeps its connections open to
 /// write the frames already queued on them and to wait for the peer to close
 /// its side (see [`linger`]).
@@ -166,14 +189,37 @@ const PENDING_CONTROL_TTL: Duration = Duration::from_secs(120);
 /// frames of its finished run are dropped.
 const MAX_COMPLETED_DATAFLOWS: usize = 16_384;
 
-/// Capacity of a pooled connection's writer queue.
+/// Capacity of a pooled connection's payload queue. When it is full, a
+/// frame offered without waiting is refused (the pushing operator sees
+/// backpressure) and takes no sequence number.
 const WRITER_QUEUE: usize = 256;
+
+/// Capacity of a manager's control queue, which the control router drains.
+const CONTROL_QUEUE: usize = 256;
+
+/// A frame for a connection's writer: a payload frame with the sequence
+/// number its lane gave it as it was queued (written in front of its
+/// payload), or a probe.
+struct Outgoing {
+    seq: Option<u64>,
+    frame: Frame,
+}
+
+/// The queues of one connection's writer, which serves `control` first.
+#[derive(Clone)]
+struct ConnQueues {
+    /// Payload frames and probes. Bounded: a full queue is backpressure.
+    payload: tokio_mpsc::Sender<Outgoing>,
+    /// Control frames. Unbounded: routing one never waits for a connection.
+    control: tokio_mpsc::UnboundedSender<Frame>,
+}
 
 /// Background tasks of a [`SharedPeerManager`].
 ///
-/// Connection writers and readers are kept apart from the other tasks:
-/// releasing the manager aborts the other tasks immediately but closes the
-/// connections gracefully (see [`linger`]).
+/// Connection writers and readers are kept apart from the other tasks (the
+/// control router and the probe loop): releasing the manager aborts the
+/// other tasks immediately but closes the connections gracefully (see
+/// [`linger`]).
 #[derive(Default)]
 struct TaskHandles {
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -183,18 +229,14 @@ struct TaskHandles {
 
 impl TaskHandles {
     fn take(handles: &Mutex<Vec<tokio::task::JoinHandle<()>>>) -> Vec<tokio::task::JoinHandle<()>> {
-        std::mem::take(
-            &mut *handles
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
+        std::mem::take(&mut *handles.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     fn abort_tasks(&self) {
         for handle in self
             .tasks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .iter()
         {
             handle.abort();
@@ -220,13 +262,14 @@ async fn drain_tasks(mut tasks: Vec<tokio::task::JoinHandle<()>>, deadline: toki
 /// Close a released manager's connections without losing what is already
 /// queued on them.
 ///
-/// The caller has dropped the writer queues' senders, which lets every
-/// writer finish the frames queued on its connection (a dataflow's last
-/// frames: its end-of-stream markers, acknowledgements or `Cancel`) and then
-/// close its half of the connection. The readers keep reading until the peer
-/// closes its half too: closing a socket with unread data makes the OS reset
-/// the connection, which can destroy frames the peer has not read yet. A
-/// peer that stops reading, or never closes, is cut off at the deadlines.
+/// The caller has closed the pool and the lanes, which drops the writer
+/// queues' senders and lets every writer finish the frames queued on its
+/// connection (a dataflow's last frames: its end-of-stream markers,
+/// acknowledgements or `Cancel`) and then close its half of the connection.
+/// The readers keep reading until the peer closes its half too: closing a
+/// socket with unread data makes the OS reset the connection, which can
+/// destroy frames the peer has not read yet. A peer that stops reading, or
+/// never closes, is cut off at the deadlines.
 async fn linger(
     writers: Vec<tokio::task::JoinHandle<()>>,
     readers: Vec<tokio::task::JoinHandle<()>>,
@@ -257,6 +300,176 @@ fn push_task_handle(
 }
 
 // ---------------------------------------------------------------------------
+// Connection liveness
+// ---------------------------------------------------------------------------
+
+/// What the liveness rule knows about one connection (see the module
+/// documentation): when its reader last read bytes, when its writer last
+/// wrote some, and since when its writer has had a frame to write.
+struct ConnLiveness {
+    /// Times are nanoseconds since this instant (the manager's creation).
+    epoch: tokio::time::Instant,
+    last_read: AtomicU64,
+    last_write: AtomicU64,
+    /// One more than when the writer took the frame it is writing; 0 while
+    /// it has none.
+    waiting_since: AtomicU64,
+    reader_open: AtomicBool,
+    writer_open: AtomicBool,
+    /// Stops the reader and the writer at once.
+    kill: CancellationToken,
+    /// Why the connection was killed (the first reason wins).
+    reason: Mutex<Option<TransportError>>,
+}
+
+impl ConnLiveness {
+    /// A connection established now: its silence is counted from now, so
+    /// one that never delivers a byte is failed too.
+    fn new(epoch: tokio::time::Instant) -> Self {
+        let liveness = Self {
+            epoch,
+            last_read: AtomicU64::new(0),
+            last_write: AtomicU64::new(0),
+            waiting_since: AtomicU64::new(0),
+            reader_open: AtomicBool::new(true),
+            writer_open: AtomicBool::new(true),
+            kill: CancellationToken::new(),
+            reason: Mutex::new(None),
+        };
+        liveness.last_read.store(liveness.now(), Ordering::Relaxed);
+        liveness
+    }
+
+    fn now(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// The reader read some bytes.
+    fn read(&self) {
+        self.last_read.store(self.now(), Ordering::Relaxed);
+    }
+
+    /// The writer wrote some bytes.
+    fn wrote(&self) {
+        self.last_write.store(self.now(), Ordering::Relaxed);
+    }
+
+    /// The writer took a frame to write.
+    fn begin_write(&self) {
+        self.waiting_since.store(self.now() + 1, Ordering::Relaxed);
+    }
+
+    /// The writer wrote its frame.
+    fn end_write(&self) {
+        self.waiting_since.store(0, Ordering::Relaxed);
+    }
+
+    /// How long the open reader has read nothing, at `now`.
+    fn silent_for(&self, now: u64) -> Option<Duration> {
+        self.reader_open.load(Ordering::Relaxed).then(|| {
+            Duration::from_nanos(now.saturating_sub(self.last_read.load(Ordering::Relaxed)))
+        })
+    }
+
+    /// How long the writer has had bytes waiting and written none, at `now`.
+    fn stalled_for(&self, now: u64) -> Option<Duration> {
+        let waiting = self.waiting_since.load(Ordering::Relaxed);
+        if waiting == 0 || !self.writer_open.load(Ordering::Relaxed) {
+            return None;
+        }
+        let since = (waiting - 1).max(self.last_write.load(Ordering::Relaxed));
+        Some(Duration::from_nanos(now.saturating_sub(since)))
+    }
+
+    fn tasks_open(&self) -> bool {
+        self.reader_open.load(Ordering::Relaxed) || self.writer_open.load(Ordering::Relaxed)
+    }
+
+    /// Stop the reader and the writer at once; the reader ends with
+    /// `reason` (unless the connection was killed already).
+    fn kill(&self, reason: TransportError) {
+        self.reason
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(reason);
+        self.kill.cancel();
+    }
+
+    /// Why the connection was killed.
+    fn reason(&self) -> TransportError {
+        self.reason
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map_or(TransportError::ConnectionClosed, TransportError::duplicate)
+    }
+}
+
+/// Marks a connection's reader or writer task ended when dropped, also
+/// when the task is aborted.
+struct TaskOpen<'a>(&'a AtomicBool);
+
+impl Drop for TaskOpen<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
+/// A connection's read half that records every read returning bytes.
+struct TimedReader {
+    inner: DynReader,
+    liveness: Arc<ConnLiveness>,
+}
+
+impl AsyncRead for TimedReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(polled, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            self.liveness.read();
+        }
+        polled
+    }
+}
+
+/// A connection's write half that records every write taking bytes, and
+/// every completed flush (a buffering stream may move its bytes only then).
+struct TimedWriter {
+    inner: DynWriter,
+    liveness: Arc<ConnLiveness>,
+}
+
+impl AsyncWrite for TimedWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let polled = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if matches!(polled, Poll::Ready(Ok(written)) if written > 0) {
+            self.liveness.wrote();
+        }
+        polled
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let polled = Pin::new(&mut self.inner).poll_flush(cx);
+        if matches!(polled, Poll::Ready(Ok(()))) {
+            self.liveness.wrote();
+        }
+        polled
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ConnectionFactory — user-provided connection establishment
 // ---------------------------------------------------------------------------
 
@@ -274,18 +487,28 @@ fn push_task_handle(
 ///   independently: the factory must pair each connection one node
 ///   establishes with one the peer establishes (one side dials, the other
 ///   accepts and hands over the accepted stream, for example). A connection
-///   whose other end no manager reads never delivers anything, and the
-///   dataflows pinned to it fail their handshake.
+///   whose other end no manager reads never delivers anything: the dataflows
+///   pinned to it fail their handshake, and the connection is failed once it
+///   has delivered nothing for
+///   [`silence_timeout`](SharedConnectionConfig::silence_timeout).
 /// - **Reliable, ordered bytes.** A stream must deliver bytes in order
 ///   without loss or duplication while it lives. instancy checksums every
 ///   frame and sequences every dataflow's lane, so a violation fails the
 ///   affected dataflows instead of being accepted.
-/// - **Liveness is the application's.** A stream must eventually fail (an
-///   error or EOF) when the peer is gone, through TCP keepalive, a TLS or
-///   QUIC idle timeout, or similar; or the application reports the node
-///   leaving ([`RuntimeHandle::report_node_leave`](crate::RuntimeHandle::report_node_leave)).
-///   A stream that silently stops delivering without ever failing makes the
-///   dataflows using it wait; they never report success.
+/// - **Liveness.** A stream that stops delivering without ever failing (a
+///   partition, a frozen peer) is detected by instancy: once it has
+///   delivered no bytes for
+///   [`silence_timeout`](SharedConnectionConfig::silence_timeout), or its
+///   writer has written nothing for that long while bytes waited, it fails
+///   and exactly the dataflows using it fail. Progress is observed at the
+///   halves the factory returns: bytes read, bytes a write accepted, and
+///   completed flushes. A writer that buffers hides the progress below it
+///   while its buffer drains, so keep any buffer small enough to drain well
+///   within `silence_timeout` on the slowest link. A peer node that leaves is the
+///   application's to report
+///   ([`RuntimeHandle::report_node_leave`](crate::RuntimeHandle::report_node_leave)).
+///   With `silence_timeout: None`, a stream that silently stops delivering
+///   makes the dataflows using it wait forever; they never report success.
 ///
 /// instancy ships a default [`TcpConnectionFactory`] for plain TCP.
 /// Applications that need other transports implement this trait directly.
@@ -324,11 +547,12 @@ impl PeerAddressResolver for std::collections::HashMap<String, std::net::SocketA
 
 /// Default connection factory using plain TCP (no TLS, no keepalive).
 ///
-/// It sets no TCP keepalive, so a peer that vanishes without resetting the
-/// connection (a network partition) is never detected through it: an
-/// application using it in production should enable keepalive itself (with
-/// its own factory) or rely on its membership layer and
-/// [`RuntimeHandle::report_node_leave`](crate::RuntimeHandle::report_node_leave).
+/// It sets no TCP keepalive: a connection that stops delivering (a peer that
+/// vanished without resetting it, a partition) is detected by instancy's own
+/// liveness rule
+/// ([`SharedConnectionConfig::silence_timeout`]), which fails exactly the
+/// dataflows using it. A peer node that leaves is still the application's to
+/// report ([`RuntimeHandle::report_node_leave`](crate::RuntimeHandle::report_node_leave)).
 ///
 /// This is a convenience implementation for applications that use plain TCP.
 /// The application instantiates this with a resolver that maps peer node IDs
@@ -398,15 +622,237 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Lanes: numbering at enqueue
+// ---------------------------------------------------------------------------
+
+/// Why a lane takes no more frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaneEnd {
+    /// Its registration ended: later frames are dropped.
+    Ended,
+    /// Its connection failed, and the dataflow was told: later frames are
+    /// dropped.
+    Failed,
+    /// The manager was released: later sends fail.
+    Released,
+}
+
+struct LaneState {
+    /// The sequence number of the next frame queued.
+    next_seq: u64,
+    /// The pinned connection's payload queue, until the lane ends.
+    queue: Option<tokio_mpsc::Sender<Outgoing>>,
+    end: Option<LaneEnd>,
+}
+
+/// One registration's payload lane to the peer.
+///
+/// A frame is numbered and queued on the pinned connection in one step,
+/// under the lane's lock. So only a frame that is queued takes a number, the
+/// queue holds the lane's frames in number order whichever task sends them,
+/// and a lane that has ended takes no numbers. A queued frame is written even
+/// if the registration ends meanwhile: its number belongs to that
+/// registration's lane.
+struct Lane {
+    dataflow_id: DataflowId,
+    /// The pinned connection.
+    conn: usize,
+    state: LaneMutex<LaneState>,
+    /// The registration's connection events, for rejected frames.
+    events: tokio_mpsc::Sender<PeerIoNotice>,
+    /// To fail the connection when its writer is found gone.
+    inner: Weak<Inner>,
+}
+
+/// What became of a frame offered to a lane.
+#[derive(Debug)]
+enum Enqueued {
+    /// Numbered and queued on the connection.
+    Admitted,
+    /// The queue is full (only when not waiting): no number was taken.
+    Full(Frame),
+    /// Dropped: the registration ended (a late frame).
+    Dropped,
+    /// Refused: the lane's connection failed (the dataflow was told).
+    Failed(Frame),
+    /// Never sendable (a reserved channel, or too large): reported to the
+    /// dataflow, and no number was taken.
+    Rejected,
+    /// Refused: the connection's writer is gone, so the connection failed
+    /// (see [`Lane::writer_gone`]).
+    WriterGone(Frame),
+    /// The manager was released.
+    Released(Frame),
+}
+
+impl Lane {
+    fn new(
+        dataflow_id: DataflowId,
+        conn: usize,
+        queue: tokio_mpsc::Sender<Outgoing>,
+        events: tokio_mpsc::Sender<PeerIoNotice>,
+        inner: Weak<Inner>,
+    ) -> Self {
+        Self {
+            dataflow_id,
+            conn,
+            state: LaneMutex::new(LaneState {
+                next_seq: 0,
+                queue: Some(queue),
+                end: None,
+            }),
+            events,
+            inner,
+        }
+    }
+
+    fn lock(&self) -> impl std::ops::DerefMut<Target = LaneState> + '_ {
+        // Critical sections never panic; recover the data if one ever did.
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Why `frame` can never go on a lane: the receiver handles the control
+    /// and probe channels outside the lane, and a frame over the size limit
+    /// (with its sequence number) cannot be written.
+    fn rejection(frame: &Frame) -> Option<TransportError> {
+        if [CONTROL_CHANNEL_ID, PROBE_CHANNEL_ID].contains(&frame.channel_id) {
+            Some(TransportError::ReservedChannel {
+                channel_id: frame.channel_id,
+            })
+        } else if frame.payload.len() > MAX_MESSAGE_SIZE - SEQUENCE_PREFIX {
+            Some(TransportError::PayloadTooLarge {
+                size: frame.payload.len() + SEQUENCE_PREFIX,
+                max: MAX_MESSAGE_SIZE,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Fail only this dataflow: the connection is untouched.
+    fn reject(&self, frame: &Frame, error: TransportError) {
+        #[cfg(feature = "tracing")]
+        tracing::error!(
+            dataflow_id = %self.dataflow_id,
+            channel_id = frame.channel_id,
+            "payload frame rejected: {error}"
+        );
+        #[cfg(not(feature = "tracing"))]
+        let _ = frame;
+        let _ = self
+            .events
+            .try_send(PeerIoNotice::new(PeerIoEvent::FrameRejected(error)));
+    }
+
+    /// `frame`'s fate on a lane that has ended.
+    fn ended(state: &LaneState, frame: Frame) -> Enqueued {
+        match state.end {
+            Some(LaneEnd::Released) => Enqueued::Released(frame),
+            Some(LaneEnd::Failed) => Enqueued::Failed(frame),
+            Some(LaneEnd::Ended) | None => Enqueued::Dropped,
+        }
+    }
+
+    /// Number `frame` and queue it, without waiting.
+    fn try_enqueue(&self, frame: Frame) -> Enqueued {
+        let rejection = Self::rejection(&frame);
+        let mut state = self.lock();
+        if state.queue.is_none() {
+            return Self::ended(&state, frame);
+        }
+        if let Some(error) = rejection {
+            drop(state);
+            self.reject(&frame, error);
+            return Enqueued::Rejected;
+        }
+        let LaneState {
+            next_seq, queue, ..
+        } = &mut *state;
+        let Some(queue) = queue.as_ref() else {
+            return Enqueued::Dropped;
+        };
+        match queue.try_reserve() {
+            Ok(permit) => {
+                let seq = *next_seq;
+                *next_seq += 1;
+                permit.send(Outgoing {
+                    seq: Some(seq),
+                    frame,
+                });
+                Enqueued::Admitted
+            }
+            Err(tokio_mpsc::error::TrySendError::Full(())) => Enqueued::Full(frame),
+            Err(tokio_mpsc::error::TrySendError::Closed(())) => Enqueued::WriterGone(frame),
+        }
+    }
+
+    /// Number `frame` and queue it, waiting for room. Room is reserved
+    /// first, so the number is taken (under the lock) only once the frame
+    /// can be queued.
+    async fn enqueue(&self, frame: Frame) -> Enqueued {
+        let rejection = Self::rejection(&frame);
+        let queue = {
+            let state = self.lock();
+            match &state.queue {
+                Some(queue) => queue.clone(),
+                None => return Self::ended(&state, frame),
+            }
+        };
+        if let Some(error) = rejection {
+            self.reject(&frame, error);
+            return Enqueued::Rejected;
+        }
+        // Tokio's queue is opaque to the schedule tests: this scheduling
+        // point lets them run other producers between the lane's lock and
+        // the reservation (see `lane_shuttle`).
+        #[cfg(all(test, target_os = "linux", instancy_shuttle))]
+        shuttle::thread::yield_now();
+        let Ok(permit) = queue.reserve().await else {
+            return Enqueued::WriterGone(frame);
+        };
+        let mut state = self.lock();
+        if state.queue.is_none() {
+            // The reserved room is given back.
+            return Self::ended(&state, frame);
+        }
+        let seq = state.next_seq;
+        state.next_seq += 1;
+        permit.send(Outgoing {
+            seq: Some(seq),
+            frame,
+        });
+        Enqueued::Admitted
+    }
+
+    /// The connection's writer is gone: its connection failed, and so did
+    /// this lane (the dataflow is told once).
+    fn writer_gone(&self) {
+        if let Some(inner) = self.inner.upgrade() {
+            inner.fail_outbound(self.conn, TransportError::ConnectionClosed);
+        }
+    }
+
+    /// Take no more frames (`end` says why). Frames already queued are
+    /// still written.
+    fn close(&self, end: LaneEnd) {
+        let mut state = self.lock();
+        state.queue = None;
+        if state.end.is_none() || end == LaneEnd::Released {
+            state.end = Some(end);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Manager state
 // ---------------------------------------------------------------------------
 
 /// One pooled connection.
 struct PooledConnection {
     metrics: Arc<ConnectionMetrics>,
-    /// Queue of the connection's writer task. Dropping it lets the writer
-    /// finish what is queued and close its half of the connection.
-    writer: tokio_mpsc::Sender<Frame>,
+    /// The writer's queues. Dropping them (with the lanes' clones) lets the
+    /// writer finish what is queued and close its half of the connection.
+    queues: ConnQueues,
     /// Registered dataflows whose lane is pinned to this connection.
     pinned: usize,
     /// The peer closed its side cleanly (EOF at a frame boundary): it sends
@@ -426,16 +872,17 @@ struct DataflowRegistration {
     token: u64,
     /// The pooled connection this dataflow's frames to the peer use.
     conn: usize,
-    /// Sequence number of the next payload frame sent to the peer.
-    next_send_seq: u64,
+    /// The dataflow's payload lane to the peer.
+    lane: Arc<Lane>,
     /// Sequence number the next payload frame from the peer must carry.
     next_recv_seq: u64,
     /// The connection the peer's frames for this dataflow arrive on: set by
     /// the first one, normally the peer's handshake.
     inbound_conn: Option<usize>,
-    /// Per-channel senders delivering the peer's frames. Taken (which closes
+    /// Per-channel senders delivering the peer's frames. Unbounded: the
+    /// connection's reader never waits for a consumer. Taken (which closes
     /// the channels) once the inbound side has failed.
-    channel_senders: Option<HashMap<u64, tokio_mpsc::Sender<Vec<u8>>>>,
+    channel_senders: Option<HashMap<u64, tokio_mpsc::UnboundedSender<Vec<u8>>>>,
     /// Where connection events of this dataflow are reported.
     events: tokio_mpsc::Sender<PeerIoNotice>,
     /// Set once someone hands the events on (see
@@ -565,6 +1012,9 @@ struct State {
     /// Live pooled connections, by id.
     connections: BTreeMap<usize, PooledConnection>,
     next_conn_id: usize,
+    /// Every connection whose reader or writer still runs, in the pool or
+    /// not, for the liveness verdicts.
+    liveness: BTreeMap<usize, Arc<ConnLiveness>>,
     registered: HashMap<DataflowId, DataflowRegistration>,
     /// Ids a spawn has claimed (by its registration token) and not yet
     /// registered: no other token may claim or register them. A claim
@@ -583,8 +1033,9 @@ enum InboundEnd {
     /// The peer closed the connection at a frame boundary.
     Closed,
     /// Reading failed: an I/O error, EOF mid-frame, a corrupt or oversize
-    /// frame. `owner` is the dataflow of the failing frame, when its header
-    /// checksum was verified.
+    /// frame, or the connection was killed (it fell silent, or its writer
+    /// failed). `owner` is the dataflow of the failing frame, when its
+    /// header checksum was verified.
     Failed {
         error: TransportError,
         owner: Option<DataflowId>,
@@ -631,7 +1082,7 @@ enum Report {
     InboundEnded {
         events: tokio_mpsc::Sender<PeerIoNotice>,
         event: PeerIoEvent,
-        senders: Option<HashMap<u64, tokio_mpsc::Sender<Vec<u8>>>>,
+        senders: Option<HashMap<u64, tokio_mpsc::UnboundedSender<Vec<u8>>>>,
         hold: Arc<AtomicBool>,
     },
 }
@@ -656,14 +1107,14 @@ struct Inner {
     init_lock: TokioMutex<()>,
     /// Health event sender (connection failures).
     health_tx: tokio::sync::broadcast::Sender<crate::runtime_event::RuntimeEvent>,
+    /// Liveness times are measured from here.
+    epoch: tokio::time::Instant,
 }
 
 impl Inner {
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         // Critical sections never panic; recover the data if one ever did.
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn live_connections(&self) -> usize {
@@ -676,8 +1127,9 @@ impl Inner {
 
     /// Add an established connection to the pool and start its tasks.
     fn add_connection(self: &Arc<Self>, reader: DynReader, writer: DynWriter) -> usize {
-        let (tx, rx) = tokio_mpsc::channel::<Frame>(WRITER_QUEUE);
-        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+        let (payload, payload_rx) = tokio_mpsc::channel::<Outgoing>(WRITER_QUEUE);
+        let (control, control_rx) = tokio_mpsc::unbounded_channel::<Frame>();
+        let liveness = Arc::new(ConnLiveness::new(self.epoch));
         let (conn_id, metrics) = {
             let mut state = self.state();
             let conn_id = state.next_conn_id;
@@ -687,109 +1139,43 @@ impl Inner {
                 conn_id,
                 PooledConnection {
                     metrics: Arc::clone(&metrics),
-                    writer: tx,
+                    queues: ConnQueues { payload, control },
                     pinned: 0,
                     peer_closed: false,
                 },
             );
+            state.liveness.insert(conn_id, Arc::clone(&liveness));
             (conn_id, metrics)
+        };
+        let writer = TimedWriter {
+            inner: writer,
+            liveness: Arc::clone(&liveness),
+        };
+        let reader = TimedReader {
+            inner: reader,
+            liveness: Arc::clone(&liveness),
         };
         let writer_handle = self.runtime_handle.spawn(writer_task(
             Arc::downgrade(self),
             conn_id,
             writer,
-            rx,
+            payload_rx,
+            control_rx,
             metrics,
-            close_tx,
+            Arc::clone(&liveness),
         ));
         let reader_handle =
             self.runtime_handle
-                .spawn(reader_task(Arc::clone(self), conn_id, reader, close_rx));
+                .spawn(reader_task(Arc::clone(self), conn_id, reader, liveness));
         push_task_handle(&self.task_handles.writers, writer_handle);
         push_task_handle(&self.task_handles.readers, reader_handle);
         conn_id
     }
 
-    /// Sequence a payload frame of the registration `token` of
-    /// `dataflow_id` and queue it on the dataflow's pinned connection.
-    async fn send_payload(self: &Arc<Self>, dataflow_id: DataflowId, token: u64, mut frame: Frame) {
-        // The receiver handles the control and probe channels outside the
-        // lane, and a frame over the size limit cannot be written: reject
-        // any of them without consuming a sequence number. Only this
-        // dataflow fails; the connection is untouched.
-        let rejected = if [CONTROL_CHANNEL_ID, PROBE_CHANNEL_ID].contains(&frame.channel_id) {
-            Some(TransportError::ReservedChannel {
-                channel_id: frame.channel_id,
-            })
-        } else if frame.payload.len() > MAX_MESSAGE_SIZE - SEQUENCE_PREFIX {
-            Some(TransportError::PayloadTooLarge {
-                size: frame.payload.len() + SEQUENCE_PREFIX,
-                max: MAX_MESSAGE_SIZE,
-            })
-        } else {
-            None
-        };
-        let (conn_id, writer, seq) = {
-            let mut state = self.state();
-            let State {
-                registered,
-                connections,
-                ..
-            } = &mut *state;
-            // The registration has ended (the dataflow has torn down): its
-            // frames still queued are dropped, never sequenced into another
-            // registration's lane.
-            let Some(reg) = registered
-                .get_mut(&dataflow_id)
-                .filter(|reg| reg.token == token)
-            else {
-                return;
-            };
-            if let Some(error) = rejected {
-                #[cfg(feature = "tracing")]
-                tracing::error!(
-                    peer = %self.peer_node_id,
-                    %dataflow_id,
-                    channel_id = frame.channel_id,
-                    "payload frame rejected: {error}"
-                );
-                let _ = reg
-                    .events
-                    .try_send(PeerIoNotice::new(PeerIoEvent::FrameRejected(error)));
-                return;
-            }
-            if reg.outbound_failed {
-                return;
-            }
-            let Some(conn) = connections.get(&reg.conn) else {
-                // Unreachable: a connection leaves the pool only after its
-                // lanes are marked failed. Report it anyway.
-                reg.outbound_failed = true;
-                let _ = reg
-                    .events
-                    .try_send(PeerIoNotice::new(PeerIoEvent::WriteFailed(
-                        TransportError::ConnectionClosed,
-                    )));
-                return;
-            };
-            let seq = reg.next_send_seq;
-            reg.next_send_seq += 1;
-            (reg.conn, conn.writer.clone(), seq)
-        };
-        let mut payload = Vec::with_capacity(SEQUENCE_PREFIX + frame.payload.len());
-        payload.extend_from_slice(&seq.to_le_bytes());
-        payload.extend_from_slice(&frame.payload);
-        frame.payload = payload;
-        frame.dataflow_id = dataflow_id;
-        if writer.send(frame).await.is_err() {
-            // The writer stopped: its connection failed, and this frame is lost.
-            self.fail_outbound(conn_id, TransportError::ConnectionClosed);
-        }
-    }
-
     /// Queue a control frame on its dataflow's pinned connection (any
-    /// connection for a dataflow not registered here).
-    async fn send_control(self: &Arc<Self>, frame: Frame) {
+    /// connection for a dataflow not registered here). Never waits: the
+    /// control queues are unbounded.
+    fn route_control(self: &Arc<Self>, frame: Frame) {
         let target = {
             let state = self.state();
             match state.registered.get(&frame.dataflow_id) {
@@ -798,17 +1184,17 @@ impl Inner {
                 Some(reg) => state
                     .connections
                     .get(&reg.conn)
-                    .map(|conn| (reg.conn, conn.writer.clone())),
+                    .map(|conn| (reg.conn, conn.queues.control.clone())),
                 // A dataflow that failed before registering here, or has
                 // unregistered (a late Cancel): any pool connection will do.
                 None => state
                     .connections
                     .iter()
                     .find(|(_, conn)| !conn.peer_closed)
-                    .map(|(id, conn)| (*id, conn.writer.clone())),
+                    .map(|(id, conn)| (*id, conn.queues.control.clone())),
             }
         };
-        let Some((conn_id, writer)) = target else {
+        let Some((conn_id, control)) = target else {
             #[cfg(feature = "tracing")]
             tracing::warn!(
                 peer = %self.peer_node_id,
@@ -817,13 +1203,15 @@ impl Inner {
             );
             return;
         };
-        if writer.send(frame).await.is_err() {
+        if control.send(frame).is_err() {
+            // The writer stopped: its connection failed, and this frame is lost.
             self.fail_outbound(conn_id, TransportError::ConnectionClosed);
         }
     }
 
-    /// Handle a frame read from connection `conn_id`.
-    async fn on_frame(self: &Arc<Self>, conn_id: usize, frame: Frame) {
+    /// Handle a frame read from connection `conn_id`. Never waits: the
+    /// channels are unbounded, so the reader never waits for a consumer.
+    fn on_frame(self: &Arc<Self>, conn_id: usize, frame: Frame) {
         if frame.channel_id == PROBE_CHANNEL_ID {
             self.on_probe(conn_id, &frame);
             return;
@@ -890,7 +1278,7 @@ impl Inner {
         self.deliver(reports);
         if let Some((tx, payload)) = delivery {
             // A dataflow whose receiver is gone is tearing down.
-            let _ = tx.send(payload).await;
+            let _ = tx.send(payload);
         }
     }
 
@@ -904,7 +1292,7 @@ impl Inner {
         lane_conn: usize,
         conn_id: usize,
         frame: Frame,
-    ) -> Result<Option<(tokio_mpsc::Sender<Vec<u8>>, Vec<u8>)>, TransportError> {
+    ) -> Result<Option<(tokio_mpsc::UnboundedSender<Vec<u8>>, Vec<u8>)>, TransportError> {
         if lane_conn != conn_id {
             return Err(TransportError::LaneViolation {
                 detail: format!(
@@ -955,37 +1343,45 @@ impl Inner {
                     channel_id: PROBE_CHANNEL_ID,
                     payload: ProbeMessage::reply_to(&probe).encode().to_vec(),
                 };
-                // Best effort: a full queue already shows the RTT.
-                let _ = conn.writer.try_send(reply);
+                // Best effort: a full queue already has bytes to send.
+                let _ = conn.queues.payload.try_send(Outgoing {
+                    seq: None,
+                    frame: reply,
+                });
             }
         }
     }
 
-    /// Writing to connection `conn_id` failed: the frames queued on it are
-    /// lost. Fail every dataflow whose lane is pinned to it, and stop using
-    /// it. Its reader is stopped next, which closes the whole connection
-    /// (see [`writer_task`]) and fails the dataflows reading from it (see
-    /// [`Self::fail_inbound`]).
-    fn fail_outbound(self: &Arc<Self>, conn_id: usize, error: TransportError) {
-        let reports = {
+    /// Writing to connection `conn_id` failed (a write error, or the stall
+    /// rule): the frames queued on it are lost. Fail every dataflow whose
+    /// lane is pinned to it, and stop using it. Its reader is stopped next,
+    /// which closes the whole connection (see [`writer_task`]) and fails the
+    /// dataflows reading from it (see [`Self::fail_inbound`]). Returns
+    /// whether the failure was reported (the connection was in the pool, or
+    /// lanes were pinned to it).
+    fn fail_outbound(self: &Arc<Self>, conn_id: usize, error: TransportError) -> bool {
+        let (reports, reported) = {
             let mut state = self.state();
             let removed = state.connections.remove(&conn_id).is_some();
             let mut reports = Vec::new();
             for reg in state.registered.values_mut() {
                 if reg.conn == conn_id && !reg.outbound_failed {
                     reg.outbound_failed = true;
+                    reg.lane.close(LaneEnd::Failed);
                     reports.push(Report::Event {
                         events: reg.events.clone(),
                         event: PeerIoEvent::WriteFailed(error.duplicate()),
                     });
                 }
             }
-            if removed || !reports.is_empty() {
+            let reported = removed || !reports.is_empty();
+            if reported {
                 self.report_health(conn_id, &format!("writing failed: {error}"));
             }
-            reports
+            (reports, reported)
         };
         self.deliver(reports);
+        reported
     }
 
     /// Connection `conn_id`'s read side ended. Frames the peer sent on it
@@ -994,13 +1390,13 @@ impl Inner {
     /// reported).
     ///
     /// A read error (an I/O error, EOF mid-frame, a corrupt or oversize
-    /// frame, or the writer's failure) breaks the whole connection: the
-    /// frames queued on it may be lost too, so the dataflows whose lane is
-    /// pinned to it fail as well, and it leaves the pool. A clean EOF is the
-    /// peer closing its side only: it may still read (a released manager
-    /// lingers for the last frames of its peers, see [`linger`]), so the
-    /// lanes pinned here are told but keep writing until a write fails, and
-    /// the connection only stops taking new lanes (see
+    /// frame, the silence rule, or the writer's failure) breaks the whole
+    /// connection: the frames queued on it may be lost too, so the dataflows
+    /// whose lane is pinned to it fail as well, and it leaves the pool. A
+    /// clean EOF is the peer closing its side only: it may still read (a
+    /// released manager lingers for the last frames of its peers, see
+    /// [`linger`]), so the lanes pinned here are told but keep writing until
+    /// a write fails, and the connection only stops taking new lanes (see
     /// [`PooledConnection::peer_closed`]).
     fn fail_inbound(self: &Arc<Self>, conn_id: usize, end: InboundEnd) {
         let clean = matches!(end, InboundEnd::Closed);
@@ -1039,6 +1435,7 @@ impl Inner {
                     });
                 } else {
                     reg.outbound_failed = true;
+                    reg.lane.close(LaneEnd::Failed);
                     reports.push(Report::Event {
                         events: reg.events.clone(),
                         event: PeerIoEvent::WriteFailed(TransportError::ConnectionClosed),
@@ -1062,6 +1459,8 @@ impl Inner {
         self.deliver(reports);
     }
 
+    /// Report a failed pooled connection (see
+    /// [`RuntimeEvent::TransportDegraded`](crate::RuntimeEvent::TransportDegraded)).
     fn report_health(&self, conn_id: usize, what: &str) {
         let detail = format!("pooled connection {conn_id} failed: {what}");
         #[cfg(feature = "tracing")]
@@ -1107,7 +1506,81 @@ impl Inner {
         }
     }
 
-    /// Remove `dataflow_id`'s registration (only `token`'s, if given).
+    /// The liveness verdicts (see the module documentation), at one probe
+    /// tick: a connection whose open reader has read nothing for `timeout`
+    /// fails like a read error, and one whose writer has had bytes waiting
+    /// and written none for `timeout` fails like a write error. Without a
+    /// timeout (the rule disabled) it only forgets the connections whose
+    /// tasks have ended.
+    fn judge_liveness(self: &Arc<Self>, timeout: Option<Duration>) {
+        let watched: Vec<(usize, Arc<ConnLiveness>)> = {
+            let mut state = self.state();
+            state.liveness.retain(|_, liveness| liveness.tasks_open());
+            if timeout.is_none() {
+                return;
+            }
+            state
+                .liveness
+                .iter()
+                .map(|(&id, liveness)| (id, Arc::clone(liveness)))
+                .collect()
+        };
+        let Some(timeout) = timeout else {
+            return;
+        };
+        for (conn_id, liveness) in watched {
+            if liveness.kill.is_cancelled() {
+                continue;
+            }
+            let now = liveness.now();
+            if liveness
+                .silent_for(now)
+                .is_some_and(|silent| silent >= timeout)
+            {
+                // The reader ends with this error (see `reader_task`), and
+                // the writer is aborted, dropping what is queued. The lanes
+                // pinned here fail now, as a write error fails them, so a
+                // worker that finishes before the reader runs still sees
+                // the failed send (`DataframeSender::has_failed`), and the
+                // connection leaves the pool, so no new lane is pinned to
+                // it; the reader reports it (`fail_inbound`).
+                {
+                    let mut state = self.state();
+                    state.connections.remove(&conn_id);
+                    for reg in state.registered.values() {
+                        if reg.conn == conn_id && !reg.outbound_failed {
+                            reg.lane.close(LaneEnd::Failed);
+                        }
+                    }
+                }
+                liveness.kill(TransportError::ConnectionSilent { timeout });
+            } else if liveness
+                .stalled_for(now)
+                .is_some_and(|stalled| stalled >= timeout)
+            {
+                let error = TransportError::WriteStalled { timeout };
+                let detail = error.to_string();
+                if !self.fail_outbound(conn_id, error) {
+                    // Out of the pool, with no lane left: still a failure.
+                    self.report_health(conn_id, &format!("writing failed: {detail}"));
+                }
+                liveness.kill(writer_failed(&detail));
+            }
+        }
+    }
+
+    /// The manager is released: its pool closes, and its lanes take no more
+    /// frames. What is already queued is still written (see [`linger`]).
+    fn release(&self) {
+        let mut state = self.state();
+        state.connections.clear();
+        for reg in state.registered.values() {
+            reg.lane.close(LaneEnd::Released);
+        }
+    }
+
+    /// Remove `dataflow_id`'s registration (only `token`'s, if given). Its
+    /// lane takes no more frames; those already queued are still written.
     fn unregister(&self, dataflow_id: &DataflowId, token: Option<u64>) {
         let mut state = self.state();
         let State {
@@ -1120,6 +1593,7 @@ impl Inner {
         match registered.get(dataflow_id) {
             Some(reg) if token.is_none_or(|token| token == reg.token) => {
                 let conn = reg.conn;
+                reg.lane.close(LaneEnd::Ended);
                 registered.remove(dataflow_id);
                 if let Some(pooled) = connections.get_mut(&conn) {
                     pooled.pinned = pooled.pinned.saturating_sub(1);
@@ -1167,6 +1641,15 @@ impl Inner {
         };
         Some(TransportError::InvalidRegistration { reason })
     }
+}
+
+/// The error a connection's reader ends with after its writer failed with
+/// `detail`.
+fn writer_failed(detail: &str) -> TransportError {
+    TransportError::Io(std::io::Error::new(
+        std::io::ErrorKind::ConnectionAborted,
+        format!("the pooled connection was closed after writing to it failed: {detail}"),
+    ))
 }
 
 /// A refused [`SharedPeerManager::register`].
@@ -1224,64 +1707,110 @@ pub(crate) fn new_registration_token() -> u64 {
 // Background tasks
 // ---------------------------------------------------------------------------
 
-/// Per-connection writer task: writes queued frames to the connection.
+/// Write one frame from a connection's queues: a payload frame with its
+/// sequence number in front of its payload, or a probe.
+async fn write_outgoing(
+    framed: &mut FramedWriter<TimedWriter>,
+    seq: Option<u64>,
+    frame: &Frame,
+) -> Result<(), TransportError> {
+    match seq {
+        Some(seq) => framed.write_prefixed_frame(frame, &seq.to_le_bytes()).await,
+        None => framed.write_frame(frame).await,
+    }
+}
+
+/// Per-connection writer task: writes the queued frames to the connection,
+/// control frames first.
 ///
 /// On a write error the frames queued on the connection are lost: it fails
-/// the dataflows pinned to the connection, then has the reader stop
-/// (`close`), so both halves are dropped and the whole connection closes.
-/// Dropping only the write half would tell the peer nothing with halves
-/// such as `tokio::io::split`'s (TLS streams, pipes): the peer would wait
-/// for frames that never come, and keep the connection in its pool while
-/// this side replaces it. With the connection closed, the peer fails the
-/// same dataflows and both pools refill together.
+/// the dataflows pinned to the connection, then kills the connection, which
+/// stops the reader, so both halves are dropped and the whole connection
+/// closes. Dropping only the write half would tell the peer nothing with
+/// halves such as `tokio::io::split`'s (TLS streams, pipes): the peer would
+/// wait for frames that never come, and keep the connection in its pool
+/// while this side replaces it. With the connection closed, the peer fails
+/// the same dataflows and both pools refill together. A killed connection
+/// (it fell silent, or its writer stalled) stops writing at once.
 async fn writer_task(
-    inner: std::sync::Weak<Inner>,
+    inner: Weak<Inner>,
     conn_id: usize,
-    writer: DynWriter,
-    mut rx: tokio_mpsc::Receiver<Frame>,
+    writer: TimedWriter,
+    mut payload_rx: tokio_mpsc::Receiver<Outgoing>,
+    mut control_rx: tokio_mpsc::UnboundedReceiver<Frame>,
     metrics: Arc<ConnectionMetrics>,
-    close: tokio::sync::oneshot::Sender<TransportError>,
+    liveness: Arc<ConnLiveness>,
 ) {
+    let _open = TaskOpen(&liveness.writer_open);
     let mut framed = FramedWriter::new(writer);
-    while let Some(frame) = rx.recv().await {
-        let payload_size = frame.payload.len();
+    let (mut control_open, mut payload_open) = (true, true);
+    while control_open || payload_open {
+        let (seq, frame) = tokio::select! {
+            biased;
+            () = liveness.kill.cancelled() => return,
+            frame = control_rx.recv(), if control_open => match frame {
+                Some(frame) => (None, frame),
+                None => {
+                    control_open = false;
+                    continue;
+                }
+            },
+            next = payload_rx.recv(), if payload_open => match next {
+                Some(Outgoing { seq, frame }) => (seq, frame),
+                None => {
+                    payload_open = false;
+                    continue;
+                }
+            },
+        };
+        let size = frame.payload.len() + seq.map_or(0, |_| SEQUENCE_PREFIX);
         let is_user_traffic = frame.channel_id != PROBE_CHANNEL_ID;
-        if let Err(error) = framed.write_frame(&frame).await {
+        liveness.begin_write();
+        let written = tokio::select! {
+            biased;
+            () = liveness.kill.cancelled() => return,
+            written = write_outgoing(&mut framed, seq, &frame) => written,
+        };
+        liveness.end_write();
+        if let Err(error) = written {
             let detail = error.to_string();
             if let Some(inner) = inner.upgrade() {
                 inner.fail_outbound(conn_id, error);
             }
-            drop(framed);
-            let _ = close.send(TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                format!("the pooled connection was closed after writing to it failed: {detail}"),
-            )));
+            liveness.kill(writer_failed(&detail));
             return;
         }
-        metrics.record_write(payload_size, is_user_traffic);
+        metrics.record_write(size, is_user_traffic);
     }
     // Nothing more will be written: tell the peer. Only some write halves
     // do that when dropped (`OwnedWriteHalf`); with others (TLS streams,
     // pipes, `tokio::io::split`) the peer would not see the end of the
     // stream until the whole connection is dropped. The reader keeps going
-    // (`close` is dropped unsent) until the peer closes its side.
-    let _ = tokio::time::timeout(WRITER_DRAIN_GRACE, framed.into_inner().shutdown()).await;
+    // until the peer closes its side.
+    let mut writer = framed.into_inner();
+    let shutdown = tokio::time::timeout(WRITER_DRAIN_GRACE, writer.shutdown());
+    tokio::select! {
+        biased;
+        () = liveness.kill.cancelled() => {}
+        _ = shutdown => {}
+    }
 }
 
 /// Per-connection reader task: reads frames and hands them to
-/// [`Inner::on_frame`] until the connection ends, or until the writer
-/// failed and sends `close`.
+/// [`Inner::on_frame`], which never waits, until the connection ends or is
+/// killed (it fell silent, or its writer failed).
 async fn reader_task(
     inner: Arc<Inner>,
     conn_id: usize,
-    reader: DynReader,
-    close: tokio::sync::oneshot::Receiver<TransportError>,
+    reader: TimedReader,
+    liveness: Arc<ConnLiveness>,
 ) {
+    let open = TaskOpen(&liveness.reader_open);
     let mut framed = FramedReader::new(reader);
     let reading = async {
         loop {
             match framed.read_frame().await {
-                Ok(frame) => inner.on_frame(conn_id, frame).await,
+                Ok(frame) => inner.on_frame(conn_id, frame),
                 Err(TransportError::ConnectionClosed) => break InboundEnd::Closed,
                 Err(error) => {
                     break InboundEnd::Failed {
@@ -1292,53 +1821,53 @@ async fn reader_task(
             }
         }
     };
-    // A frame cut off by `close` belongs to a lane on this connection,
-    // which `fail_inbound` fails. A `close` dropped unsent (the writer
-    // finished normally) disables its branch; reading goes on. `close` is
-    // polled first: under sustained traffic `reading` uses up the task's
-    // cooperative budget, and a `close` polled after it would never fire.
+    // A frame cut off by the kill belongs to a lane on this connection,
+    // which `fail_inbound` fails. The kill is polled first: under sustained
+    // traffic `reading` uses up the task's cooperative budget, and a kill
+    // polled after it would never fire.
     let end = tokio::select! {
         biased;
-        Ok(error) = close => InboundEnd::Failed { error, owner: None },
+        () = liveness.kill.cancelled() => InboundEnd::Failed {
+            error: liveness.reason(),
+            owner: None,
+        },
         end = reading => end,
     };
+    drop(open);
     inner.fail_inbound(conn_id, end);
 }
 
-/// Bridge task: routes control frames (with priority) and payload frames to
-/// their dataflows' pinned connections, sequencing the payload frames, and
-/// wakes flush barriers.
-async fn bridge_task(
+/// Control router: puts each control frame on its connection's control
+/// queue, without ever waiting, so a stuck connection holds up no other
+/// dataflow's control frames. A message on `barriers` asks it to route
+/// everything queued so far first (see [`SharedPeerManager::close`]). It is
+/// served first, and waits only for the frames ahead of it (at most
+/// [`CONTROL_QUEUE`]), so later control frames can never hold it up.
+async fn control_router(
     inner: Arc<Inner>,
-    mut payload_rx: tokio_mpsc::Receiver<Outbound>,
     mut control_rx: tokio_mpsc::Receiver<Frame>,
+    mut barriers: tokio_mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>>,
 ) {
-    let mut control_open = true;
-    let mut payload_open = true;
-    while control_open || payload_open {
+    loop {
         tokio::select! {
             biased;
-
-            result = control_rx.recv(), if control_open => match result {
-                Some(frame) => inner.send_control(frame).await,
-                None => control_open = false,
-            },
-
-            result = payload_rx.recv(), if payload_open => match result {
-                Some(Outbound::Payload { dataflow_id, token, frame }) => {
-                    inner.send_payload(dataflow_id, token, frame).await;
+            Some(routed) = barriers.recv() => {
+                for _ in 0..CONTROL_QUEUE {
+                    let Ok(frame) = control_rx.try_recv() else { break };
+                    inner.route_control(frame);
                 }
-                // Every entry queued before the barrier has been processed.
-                Some(Outbound::Barrier(waiter)) => {
-                    let _ = waiter.send(());
-                }
-                None => payload_open = false,
+                let _ = routed.send(());
+            }
+            frame = control_rx.recv() => match frame {
+                Some(frame) => inner.route_control(frame),
+                None => return,
             },
         }
     }
 }
 
-/// Periodic probe loop: sends an RTT probe on each connection.
+/// Periodic probe loop: queues a probe on each pooled connection, then
+/// applies the liveness verdicts.
 async fn probe_loop(inner: Arc<Inner>) {
     let mut ticker = tokio::time::interval(inner.config.probe_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1346,14 +1875,14 @@ async fn probe_loop(inner: Arc<Inner>) {
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        let writers: Vec<_> = inner
+        let queues: Vec<_> = inner
             .state()
             .connections
             .values()
             .filter(|conn| !conn.peer_closed)
-            .map(|conn| conn.writer.clone())
+            .map(|conn| conn.queues.payload.clone())
             .collect();
-        for writer in writers {
+        for queue in queues {
             let seq = inner.probe_counter.next_seq();
             let send_ts = inner.prober.timestamp().now_nanos();
             inner.prober.record_probe_sent(seq, send_ts);
@@ -1362,15 +1891,23 @@ async fn probe_loop(inner: Arc<Inner>) {
                 channel_id: PROBE_CHANNEL_ID,
                 payload: ProbeMessage::new_request(seq, send_ts).encode().to_vec(),
             };
-            // Best effort: a full queue already shows the RTT.
-            let _ = writer.try_send(frame);
+            // Best effort: a full queue already has bytes waiting to flow.
+            let _ = queue.try_send(Outgoing { seq: None, frame });
         }
+        inner.judge_liveness(inner.config.silence_timeout);
     }
 }
 
 // ---------------------------------------------------------------------------
 // SharedPeerManager — owns pooled connections to one peer
 // ---------------------------------------------------------------------------
+
+/// The channel receivers and connection events of a dataflow registered
+/// with a [`SharedPeerManager`], by channel id.
+type Registered = (
+    HashMap<u64, tokio_mpsc::UnboundedReceiver<Vec<u8>>>,
+    tokio_mpsc::Receiver<PeerIoNotice>,
+);
 
 /// Manages a fixed pool of shared connections to a single remote peer.
 ///
@@ -1382,22 +1919,22 @@ async fn probe_loop(inner: Arc<Inner>) {
 /// registers.
 pub struct SharedPeerManager {
     inner: Arc<Inner>,
-    /// Payload queue: frames from every dataflow (and flush barriers), for
-    /// sequencing and routing by the bridge task.
-    payload_tx: tokio_mpsc::Sender<Outbound>,
-    /// Control sender: high-priority frames bypass sequencing.
+    /// Control sender: high-priority frames, routed to their dataflow's
+    /// connection by the control router.
     control_tx: tokio_mpsc::Sender<Frame>,
+    /// Asks the control router to route everything queued so far.
+    router_barrier: tokio_mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl Drop for SharedPeerManager {
     fn drop(&mut self) {
         self.inner.task_handles.abort_tasks();
         // Close the connections gracefully in the background (if the runtime
-        // is shutting down, it ends these tasks itself): dropping the writer
-        // queues lets the writers finish what is queued on them.
+        // is shutting down, it ends these tasks itself): closing the pool and
+        // the lanes lets the writers finish what is queued on them.
         let writers = TaskHandles::take(&self.inner.task_handles.writers);
         let readers = TaskHandles::take(&self.inner.task_handles.readers);
-        self.inner.state().connections.clear();
+        self.inner.release();
         if !writers.is_empty() || !readers.is_empty() {
             let deadline = tokio::time::Instant::now() + WRITER_DRAIN_GRACE;
             self.inner
@@ -1425,6 +1962,11 @@ impl SharedPeerManager {
         health_tx: tokio::sync::broadcast::Sender<crate::runtime_event::RuntimeEvent>,
     ) -> crate::Result<Self> {
         config.validate()?;
+        // `Instant::now` reads the runtime's clock (paused in tests).
+        let epoch = {
+            let _entered = runtime_handle.enter();
+            tokio::time::Instant::now()
+        };
         let inner = Arc::new(Inner {
             peer_node_id,
             config,
@@ -1436,22 +1978,20 @@ impl SharedPeerManager {
             task_handles: TaskHandles::default(),
             init_lock: TokioMutex::new(()),
             health_tx,
+            epoch,
         });
 
-        // Payload queue: dataflow tasks send their frames here.
-        let (payload_tx, payload_rx) = tokio_mpsc::channel::<Outbound>(1024);
-        // Control channel: high-priority frames
-        let (control_tx, control_rx) = tokio_mpsc::channel::<Frame>(256);
-
-        let bridge = runtime_handle.spawn(bridge_task(Arc::clone(&inner), payload_rx, control_rx));
-        push_task_handle(&inner.task_handles.tasks, bridge);
+        let (control_tx, control_rx) = tokio_mpsc::channel::<Frame>(CONTROL_QUEUE);
+        let (router_barrier, barriers) = tokio_mpsc::unbounded_channel();
+        let router = runtime_handle.spawn(control_router(Arc::clone(&inner), control_rx, barriers));
+        push_task_handle(&inner.task_handles.tasks, router);
         let probes = runtime_handle.spawn(probe_loop(Arc::clone(&inner)));
         push_task_handle(&inner.task_handles.tasks, probes);
 
         Ok(Self {
             inner,
-            payload_tx,
             control_tx,
+            router_barrier,
         })
     }
 
@@ -1462,6 +2002,12 @@ impl SharedPeerManager {
     /// receivers for incoming frames and the dataflow's connection events
     /// (see [`PeerIoEvent`]): a pooled connection that fails, a frame from the
     /// peer out of sequence, or one of the dataflow's frames rejected.
+    ///
+    /// The receivers are unbounded: a pooled connection's reader never waits
+    /// for a consumer, which would hold up every dataflow on the connection
+    /// and make a healthy connection look silent (see the
+    /// [module documentation](self)). `channel_capacity` must be at least 1
+    /// and is otherwise unused.
     ///
     /// First establishes the pool's connections if any are missing. The
     /// dataflow's lane is then pinned to the connection with the fewest
@@ -1486,13 +2032,7 @@ impl SharedPeerManager {
         dataflow_id: DataflowId,
         channel_ids: &[u64],
         channel_capacity: usize,
-    ) -> Result<
-        (
-            HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>,
-            tokio_mpsc::Receiver<PeerIoNotice>,
-        ),
-        TransportError,
-    > {
+    ) -> Result<Registered, TransportError> {
         self.register(
             dataflow_id,
             new_registration_token(),
@@ -1501,14 +2041,15 @@ impl SharedPeerManager {
             Arc::new(AtomicBool::new(false)),
         )
         .await
+        .map(|(receivers, events, _)| (receivers, events))
         .map_err(|refused| refused.error)
     }
 
     /// [`Self::register_dataflow`] with the registration's token (see
     /// [`Self::unregister_registration`]) and the flag that holds the
-    /// channels open until a read-side event was handed on. A refusal says
-    /// whether the id belonged to another run (see [`RegisterError`]).
-    #[allow(clippy::type_complexity)]
+    /// channels open until a read-side event was handed on. Also returns the
+    /// registration's sender. A refusal says whether the id belonged to
+    /// another run (see [`RegisterError`]).
     pub(crate) async fn register(
         &self,
         dataflow_id: DataflowId,
@@ -1518,8 +2059,9 @@ impl SharedPeerManager {
         hold_channels: Arc<AtomicBool>,
     ) -> Result<
         (
-            HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>,
+            HashMap<u64, tokio_mpsc::UnboundedReceiver<Vec<u8>>>,
             tokio_mpsc::Receiver<PeerIoNotice>,
+            DataframeSender,
         ),
         RegisterError,
     > {
@@ -1551,14 +2093,13 @@ impl SharedPeerManager {
 
         let mut receivers = HashMap::new();
         let mut channel_senders = HashMap::new();
-        // The control channel also receives the control frames that arrived
-        // before registration, so it holds at least as many as are buffered.
-        let control_capacity = channel_capacity.max(MAX_PENDING_FRAMES_PER_DATAFLOW);
-        let (tx, rx) = tokio_mpsc::channel(control_capacity);
-        channel_senders.insert(CONTROL_CHANNEL_ID, tx);
-        receivers.insert(CONTROL_CHANNEL_ID, rx);
-        for &ch_id in channel_ids.iter().filter(|&&id| id != CONTROL_CHANNEL_ID) {
-            let (tx, rx) = tokio_mpsc::channel(channel_capacity);
+        for ch_id in std::iter::once(CONTROL_CHANNEL_ID).chain(
+            channel_ids
+                .iter()
+                .copied()
+                .filter(|&id| id != CONTROL_CHANNEL_ID),
+        ) {
+            let (tx, rx) = tokio_mpsc::unbounded_channel();
             channel_senders.insert(ch_id, tx);
             receivers.insert(ch_id, rx);
         }
@@ -1596,10 +2137,17 @@ impl SharedPeerManager {
             .into());
         };
         conn.pinned += 1;
+        let lane = Arc::new(Lane::new(
+            dataflow_id,
+            conn_id,
+            conn.queues.payload.clone(),
+            events_tx.clone(),
+            Arc::downgrade(&self.inner),
+        ));
         let mut reg = DataflowRegistration {
             token,
             conn: conn_id,
-            next_send_seq: 0,
+            lane: Arc::clone(&lane),
             next_recv_seq: 0,
             inbound_conn: None,
             channel_senders: Some(channel_senders),
@@ -1608,8 +2156,7 @@ impl SharedPeerManager {
             outbound_failed: false,
             inbound_failed: false,
         };
-        // Deliver control frames that arrived before registration (the
-        // channel holds them all, see above).
+        // Deliver control frames that arrived before registration.
         let pending = pending_control
             .take(&dataflow_id)
             .map(|pending| pending.frames)
@@ -1623,7 +2170,7 @@ impl SharedPeerManager {
             .and_then(|senders| senders.get(&CONTROL_CHANNEL_ID))
         {
             for (_, payload) in pending {
-                let _ = tx.try_send(payload);
+                let _ = tx.send(payload);
             }
         }
         // The registration takes over this token's claim, if it holds one.
@@ -1633,7 +2180,7 @@ impl SharedPeerManager {
         registered.insert(dataflow_id, reg);
         drop(state);
 
-        Ok((receivers, events_rx))
+        Ok((receivers, events_rx, DataframeSender { lane }))
     }
 
     /// Establish the pool's missing connections.
@@ -1674,38 +2221,33 @@ impl SharedPeerManager {
         Ok(())
     }
 
-    /// Wait until every payload frame queued before this call has been
-    /// processed by the bridge task (sequenced and handed to a connection
-    /// writer, or dropped because its dataflow has failed or unregistered).
-    ///
-    /// Unregistering a dataflow drops its payload frames that are still
-    /// queued, so a dataflow that wants its last frames delivered calls this
-    /// first. The barrier waits behind every dataflow's frames queued before
-    /// it; callers should bound the wait.
-    pub(crate) async fn flush(&self) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        if self.payload_tx.send(Outbound::Barrier(tx)).await.is_ok() {
-            let _ = rx.await;
+    /// Wait until every control frame queued on [`Self::control_sender`]
+    /// before this call has been put on its connection (whose writer sends
+    /// it even once the manager is released).
+    pub(crate) async fn route_queued_control(&self) {
+        let (routed, done) = tokio::sync::oneshot::channel();
+        if self.router_barrier.send(routed).is_ok() {
+            let _ = done.await;
         }
     }
 
-    /// Release this manager once everything already queued on it has been
-    /// written to its connections, bounded by `timeout`.
+    /// Release the manager, waiting until what was queued on its connections
+    /// has been written, bounded by `timeout`.
     ///
-    /// Dropping a manager also closes its connections gracefully in the
-    /// background (see [`linger`]); this waits until the writers are done, so
-    /// the caller knows its frames have been handed to the connections when
-    /// it returns (unless the timeout expired, in which case the remaining
-    /// writers are aborted). The readers keep waiting for the peer to close
-    /// in the background. Control frames are flushed too: the bridge task
-    /// prefers them over the payload barrier.
+    /// Control frames still waiting for the control router (a `Cancel`, for
+    /// example) are first put on their connections. Dropping a manager also
+    /// closes its connections gracefully in the background (see [`linger`]);
+    /// this waits until the writers are done, so the caller knows its frames
+    /// have been handed to the connections when it returns (unless the
+    /// timeout expired, in which case the remaining writers are aborted). The
+    /// readers keep waiting for the peer to close in the background.
     pub(crate) async fn close(self, timeout: Duration) {
         let deadline = tokio::time::Instant::now() + timeout;
-        let _ = tokio::time::timeout_at(deadline, self.flush()).await;
+        let _ = tokio::time::timeout_at(deadline, self.route_queued_control()).await;
         self.inner.task_handles.abort_tasks();
         let writers = TaskHandles::take(&self.inner.task_handles.writers);
         let readers = TaskHandles::take(&self.inner.task_handles.readers);
-        self.inner.state().connections.clear();
+        self.inner.release();
         let runtime = self.inner.runtime_handle.clone();
         drop(self);
         drain_tasks(writers, deadline).await;
@@ -1717,17 +2259,22 @@ impl SharedPeerManager {
     }
 
     /// Unregister a dataflow, removing its channels and pending control
-    /// frames; its payload frames still queued are dropped. The id is
-    /// remembered (boundedly) as finished: it cannot be registered again,
-    /// and the late frames of this run are dropped.
+    /// frames. Control frames already queued on [`Self::control_sender`]
+    /// (its `Cancel`, say) are first put on its connection, and its payload
+    /// frames already queued there are still written; frames sent after this
+    /// are dropped. The id is remembered (boundedly) as finished: it cannot
+    /// be registered again, and the late frames of this run are dropped.
     pub async fn unregister_dataflow(&self, dataflow_id: &DataflowId) {
+        self.route_queued_control().await;
         self.inner.unregister(dataflow_id, None);
     }
 
     /// Unregister `dataflow_id` only if it is still the registration made
     /// with `token`: a cleanup must not remove another registration of the
-    /// same id.
+    /// same id. Queued control frames go first, as in
+    /// [`Self::unregister_dataflow`].
     pub(crate) async fn unregister_registration(&self, dataflow_id: &DataflowId, token: u64) {
+        self.route_queued_control().await;
         self.inner.unregister(dataflow_id, Some(token));
     }
 
@@ -1774,15 +2321,15 @@ impl SharedPeerManager {
     /// registration ends are dropped. `None` if the dataflow is not
     /// registered.
     pub fn dataflow_sender(&self, dataflow_id: &DataflowId) -> Option<DataframeSender> {
-        let token = self.inner.state().registered.get(dataflow_id)?.token;
-        Some(DataframeSender {
-            dataflow_id: *dataflow_id,
-            token,
-            tx: self.payload_tx.clone(),
-        })
+        let lane = Arc::clone(&self.inner.state().registered.get(dataflow_id)?.lane);
+        Some(DataframeSender { lane })
     }
 
     /// Get the control sender for submitting high-priority frames.
+    ///
+    /// Control frames bypass the lanes' numbering. Each is routed to its
+    /// dataflow's pinned connection (any connection for a dataflow not
+    /// registered here), whose writer sends control frames before payload.
     pub fn control_sender(&self) -> &tokio_mpsc::Sender<Frame> {
         &self.control_tx
     }
@@ -1808,6 +2355,7 @@ impl SharedPeerManager {
     }
 
     /// Diagnostic snapshot of every live pooled connection, by id.
+    /// `queued_frames` counts the payload queue only.
     pub fn metrics_snapshot(&self) -> Vec<ConnectionSnapshot> {
         self.inner
             .state()
@@ -1816,7 +2364,7 @@ impl SharedPeerManager {
             .filter(|conn| !conn.peer_closed)
             .map(|conn| ConnectionSnapshot {
                 id: conn.metrics.id,
-                queued_frames: conn.writer.max_capacity() - conn.writer.capacity(),
+                queued_frames: conn.queues.payload.max_capacity() - conn.queues.payload.capacity(),
                 pinned_lanes: conn.pinned,
                 avg_rtt: conn.metrics.average_rtt(),
                 total_bytes: conn.metrics.total_bytes_written(),
@@ -1852,7 +2400,8 @@ pub struct SharedTransportSession {
     control_senders: HashMap<String, tokio_mpsc::Sender<Frame>>,
     /// Per-peer channel receivers (peer → channel_id → receiver).
     /// Wrapped in Option so they can be taken out once.
-    receivers: Option<HashMap<String, HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>>>,
+    #[allow(clippy::type_complexity)]
+    receivers: Option<HashMap<String, HashMap<u64, tokio_mpsc::UnboundedReceiver<Vec<u8>>>>>,
     /// Per-peer connection events.
     io_events: Option<HashMap<String, tokio_mpsc::Receiver<PeerIoNotice>>>,
     /// Set by [`Self::hold_channels_for_io_events`].
@@ -1866,7 +2415,8 @@ impl SharedTransportSession {
     /// - `dataflow_id`: Identifies this dataflow
     /// - `peer_managers`: Map of peer_node_id → SharedPeerManager
     /// - `channel_ids`: Channel IDs to register for each peer
-    /// - `channel_capacity`: Buffer capacity for per-channel receivers
+    /// - `channel_capacity`: Must be at least 1; the per-channel receivers
+    ///   are unbounded (see [`SharedPeerManager::register_dataflow`])
     ///
     /// # Errors
     ///
@@ -1906,7 +2456,7 @@ impl SharedTransportSession {
         let mut io_events = HashMap::new();
 
         for (peer_id, manager) in peer_managers {
-            let (receivers, events) = match manager
+            let (receivers, events, sender) = match manager
                 .register(
                     dataflow_id,
                     token,
@@ -1927,14 +2477,7 @@ impl SharedTransportSession {
                 }
             };
 
-            payload_senders.insert(
-                peer_id.clone(),
-                DataframeSender {
-                    dataflow_id,
-                    token,
-                    tx: manager.payload_tx.clone(),
-                },
-            );
+            payload_senders.insert(peer_id.clone(), sender);
             control_senders.insert(peer_id.clone(), manager.control_sender().clone());
             all_receivers.insert(peer_id.clone(), receivers);
             io_events.insert(peer_id.clone(), events);
@@ -1952,15 +2495,15 @@ impl SharedTransportSession {
 
     /// Get a data sender for a peer.
     ///
-    /// Returns the shared payload sender. Data and progress share the same
-    /// sequenced lane to preserve the timely ordering invariant.
+    /// Returns the dataflow's lane to the peer. Data and progress share the
+    /// same sequenced lane to preserve the timely ordering invariant.
     pub fn data_sender(&self, peer_node_id: &str) -> Option<DataframeSender> {
         self.payload_senders.get(peer_node_id).cloned()
     }
 
     /// Get a progress sender for a peer.
     ///
-    /// Returns the same shared payload sender as [`data_sender`](Self::data_sender).
+    /// Returns the same lane as [`data_sender`](Self::data_sender).
     pub fn progress_sender(&self, peer_node_id: &str) -> Option<DataframeSender> {
         self.data_sender(peer_node_id)
     }
@@ -1972,18 +2515,20 @@ impl SharedTransportSession {
         self.control_senders.get(peer_node_id)
     }
 
-    /// Take the per-peer channel receivers (can only be called once).
+    /// Take the per-peer channel receivers (can only be called once). They
+    /// are unbounded (see [`SharedPeerManager::register_dataflow`]).
+    #[allow(clippy::type_complexity)]
     pub fn take_receivers(
         &mut self,
-    ) -> Option<HashMap<String, HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>>> {
+    ) -> Option<HashMap<String, HashMap<u64, tokio_mpsc::UnboundedReceiver<Vec<u8>>>>> {
         self.receivers.take()
     }
 
     /// Take the per-peer connection events (can only be called once).
     ///
     /// Each event tells this dataflow that its link with a peer failed (a
-    /// pooled connection it uses failed, a frame from the peer was out of
-    /// sequence, or one of its frames was rejected). Call
+    /// pooled connection it uses failed or fell silent, a frame from the
+    /// peer was out of sequence, or one of its frames was rejected). Call
     /// [`Self::hold_channels_for_io_events`] once they are being consumed.
     pub fn take_io_events(
         &mut self,
@@ -2010,61 +2555,83 @@ impl SharedTransportSession {
 }
 
 // ---------------------------------------------------------------------------
-// DataframeSender — wraps payload channel with dataflow context
+// DataframeSender — a registration's payload lane
 // ---------------------------------------------------------------------------
 
 /// A sender of one dataflow registration's payload frames (see
 /// [`SharedPeerManager::dataflow_sender`]).
 ///
-/// Tags each frame with the dataflow id and its registration: frames it
-/// sends after the registration has ended are dropped, never sequenced into
-/// another registration's lane.
+/// It queues each frame straight on the registration's pinned connection,
+/// numbering it as it is queued. A frame it sends after its connection
+/// failed (the dataflow is told) is refused, never reported as sent; one it
+/// sends after the registration ended is dropped as late. Neither is
+/// numbered into another registration's lane.
 #[derive(Clone)]
 pub struct DataframeSender {
-    dataflow_id: DataflowId,
-    token: u64,
-    tx: tokio_mpsc::Sender<Outbound>,
+    lane: Arc<Lane>,
 }
 
 impl DataframeSender {
-    fn entry(&self, mut frame: Frame) -> Outbound {
-        frame.dataflow_id = self.dataflow_id;
-        Outbound::Payload {
-            dataflow_id: self.dataflow_id,
-            token: self.token,
-            frame,
-        }
-    }
-
-    fn frame_of(entry: Outbound) -> Frame {
-        match entry {
-            Outbound::Payload { frame, .. } => frame,
-            Outbound::Barrier(_) => unreachable!("a sender only queues payload frames"),
-        }
-    }
-
-    /// Send a frame through the shared transport.
+    /// Send a frame, waiting for room in its connection's queue.
     ///
-    /// The frame's `dataflow_id` is normalized to this sender's dataflow, a
-    /// sequence number is assigned, and the frame is queued on the
-    /// dataflow's pinned connection.
-    pub async fn send(&self, frame: Frame) -> Result<(), tokio_mpsc::error::SendError<Frame>> {
-        self.tx
-            .send(self.entry(frame))
-            .await
-            .map_err(|e| tokio_mpsc::error::SendError(Self::frame_of(e.0)))
+    /// The frame's `dataflow_id` is normalized to this sender's dataflow, and
+    /// it is queued on the dataflow's pinned connection with the lane's next
+    /// sequence number. While the connection is stuck this waits, until the
+    /// liveness rule fails the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns the frame if the dataflow's connection failed, or the manager
+    /// was released: the frame will never be written.
+    pub async fn send(&self, mut frame: Frame) -> Result<(), tokio_mpsc::error::SendError<Frame>> {
+        frame.dataflow_id = self.lane.dataflow_id;
+        match self.lane.enqueue(frame).await {
+            // `enqueue` waits for room, so never finds the queue full.
+            Enqueued::Released(frame) | Enqueued::Full(frame) | Enqueued::Failed(frame) => {
+                Err(tokio_mpsc::error::SendError(frame))
+            }
+            Enqueued::WriterGone(frame) => {
+                self.lane.writer_gone();
+                Err(tokio_mpsc::error::SendError(frame))
+            }
+            Enqueued::Admitted | Enqueued::Dropped | Enqueued::Rejected => Ok(()),
+        }
     }
 
-    /// Try to send a frame without blocking.
-    pub fn try_send(&self, frame: Frame) -> Result<(), tokio_mpsc::error::TrySendError<Frame>> {
-        self.tx.try_send(self.entry(frame)).map_err(|e| match e {
-            tokio_mpsc::error::TrySendError::Full(v) => {
-                tokio_mpsc::error::TrySendError::Full(Self::frame_of(v))
+    /// Try to send a frame without waiting.
+    ///
+    /// # Errors
+    ///
+    /// [`TrySendError::Full`](tokio_mpsc::error::TrySendError::Full) if the
+    /// connection's queue is full (no sequence number was taken; try again
+    /// later), [`TrySendError::Closed`](tokio_mpsc::error::TrySendError::Closed)
+    /// if the dataflow's connection failed or the manager was released (the
+    /// frame will never be written).
+    pub fn try_send(&self, mut frame: Frame) -> Result<(), tokio_mpsc::error::TrySendError<Frame>> {
+        frame.dataflow_id = self.lane.dataflow_id;
+        match self.lane.try_enqueue(frame) {
+            Enqueued::Full(frame) => Err(tokio_mpsc::error::TrySendError::Full(frame)),
+            Enqueued::Released(frame) | Enqueued::Failed(frame) => {
+                Err(tokio_mpsc::error::TrySendError::Closed(frame))
             }
-            tokio_mpsc::error::TrySendError::Closed(v) => {
-                tokio_mpsc::error::TrySendError::Closed(Self::frame_of(v))
+            Enqueued::WriterGone(frame) => {
+                self.lane.writer_gone();
+                Err(tokio_mpsc::error::TrySendError::Closed(frame))
             }
-        })
+            Enqueued::Admitted | Enqueued::Dropped | Enqueued::Rejected => Ok(()),
+        }
+    }
+
+    /// Whether the dataflow's connection failed: frames sent now are
+    /// refused, and frames still queued on it are lost. The transport knows
+    /// at once; the dataflow's connection event follows.
+    pub(crate) fn has_failed(&self) -> bool {
+        let state = self.lane.lock();
+        state.end == Some(LaneEnd::Failed)
+            || state
+                .queue
+                .as_ref()
+                .is_some_and(tokio_mpsc::Sender::is_closed)
     }
 }
 
@@ -2086,6 +2653,7 @@ mod tests {
         SharedConnectionConfig {
             connections,
             probe_interval: Duration::from_secs(3600),
+            silence_timeout: None,
             ..Default::default()
         }
     }
@@ -2192,28 +2760,23 @@ mod tests {
         frame(dataflow_id, channel_id, bytes)
     }
 
-    /// Queue a payload frame of `dataflow_id`'s current registration (one
-    /// that matches no registration if it is not registered).
+    /// Queue a payload frame of `dataflow_id`'s current registration (none
+    /// if it is not registered).
     async fn send(
         manager: &SharedPeerManager,
         dataflow_id: DataflowId,
         channel_id: u64,
         payload: Vec<u8>,
     ) {
-        let sender = manager
-            .dataflow_sender(&dataflow_id)
-            .unwrap_or(DataframeSender {
-                dataflow_id,
-                token: 0,
-                tx: manager.payload_tx.clone(),
-            });
-        sender
-            .send(frame(dataflow_id, channel_id, payload))
-            .await
-            .unwrap();
+        if let Some(sender) = manager.dataflow_sender(&dataflow_id) {
+            sender
+                .send(frame(dataflow_id, channel_id, payload))
+                .await
+                .unwrap();
+        }
     }
 
-    async fn recv<T>(rx: &mut tokio_mpsc::Receiver<T>) -> Option<T> {
+    async fn recv<T>(rx: &mut tokio_mpsc::UnboundedReceiver<T>) -> Option<T> {
         tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("nothing arrived within 5 s")
@@ -2320,11 +2883,11 @@ mod tests {
         assert!(state.pending_control.by_dataflow.contains_key(&fresh));
     }
 
-    /// Payload frames still queued when their registration ends are dropped:
-    /// they are never sequenced into another registration of the same id
+    /// A frame sent through a sender of a finished registration is dropped:
+    /// it is never numbered into another registration of the same id
     /// (possible only once the id is no longer remembered).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_finished_registrations_queued_frames_never_reach_another() {
+    async fn a_finished_registrations_frames_never_reach_another() {
         let (manager, peer) = manager_with_raw_peer();
         let df = DataflowId::new();
         let _first = manager.register_dataflow(df, &[1], 4).await.unwrap();
@@ -2334,8 +2897,8 @@ mod tests {
         manager.inner.state().completed = RecentIds::default();
         let (mut rx, _events) = manager.register_dataflow(df, &[1], 4).await.unwrap();
         old.send(frame(df, 1, b"old run".to_vec())).await.unwrap();
+        old.try_send(frame(df, 1, b"old run".to_vec())).unwrap();
         send(&manager, df, 1, b"new run".to_vec()).await;
-        manager.flush().await;
         let (peer_read, _peer_write) = tokio::io::split(peer);
         let mut peer_reader = FramedReader::new(peer_read);
         let first = peer_reader.read_frame().await.unwrap();
@@ -2427,6 +2990,61 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    /// A control frame queued before unregistering (a teardown's `Cancel`)
+    /// is put on the dataflow's own connection while it is still
+    /// registered, not routed later as one for an unregistered dataflow
+    /// (any pooled connection). Single-threaded: the router runs only when
+    /// unregistering waits for it.
+    #[tokio::test]
+    async fn queued_control_is_routed_before_unregistering() {
+        let (a, _b, _relays) = managers(2);
+        let (other, df) = (DataflowId::new(), DataflowId::new());
+        let _r_other = a.register_dataflow(other, &[1], 16).await.unwrap();
+        let _r_df = a.register_dataflow(df, &[1], 16).await.unwrap();
+        assert_eq!(a.inner.state().registered[&df].conn, 1);
+        let full = a.control_tx.max_capacity();
+        // Let the router settle anything queued by the registrations.
+        a.route_queued_control().await;
+        a.control_tx
+            .try_send(Frame {
+                dataflow_id: df,
+                channel_id: CONTROL_CHANNEL_ID,
+                payload: b"cancel".to_vec(),
+            })
+            .unwrap();
+        assert_eq!(a.control_tx.capacity(), full - 1, "queued, not routed yet");
+        a.unregister_dataflow(&df).await;
+        assert_eq!(
+            a.control_tx.capacity(),
+            full,
+            "routed before the registration ended"
+        );
+    }
+
+    /// Unregistering waits only for the control frames queued before it:
+    /// another dataflow's control frames arriving all the while don't hold it
+    /// up. Single-threaded, with the queue full when unregistering starts and
+    /// refilled as fast as the router takes frames, so it is never empty.
+    #[tokio::test]
+    async fn unregistering_is_not_held_up_by_later_control_frames() {
+        let (a, _b, _relays) = managers(1);
+        let df = DataflowId::new();
+        let _registered = a.register_dataflow(df, &[1], 16).await.unwrap();
+        a.route_queued_control().await;
+        let frame = Frame {
+            dataflow_id: DataflowId::new(),
+            channel_id: CONTROL_CHANNEL_ID,
+            payload: Vec::new(),
+        };
+        while a.control_tx.try_send(frame.clone()).is_ok() {}
+        let control = a.control_tx.clone();
+        let flood = tokio::spawn(async move { while control.send(frame.clone()).await.is_ok() {} });
+        let unregistered =
+            tokio::time::timeout(Duration::from_secs(2), a.unregister_dataflow(&df)).await;
+        flood.abort();
+        assert!(unregistered.is_ok(), "unregistering waited on later frames");
     }
 
     /// Dataflows spread over the pool, one connection each: every frame of a
@@ -2565,26 +3183,6 @@ mod tests {
         assert!(
             matches!(&bystander_event, TransportError::Io(e) if e.kind() == std::io::ErrorKind::ConnectionAborted),
             "{bystander_event:?}"
-        );
-    }
-
-    /// A flush barrier is the manager's own queue entry, never a frame: an
-    /// abandoned flush (its caller timed out) wakes nobody and fails nobody,
-    /// and a later flush still completes.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_abandoned_flush_is_harmless() {
-        let (a, _b, _relays) = managers(1);
-        let df = DataflowId::new();
-        let (_rx, mut events) = a.register_dataflow(df, &[1], 16).await.unwrap();
-        let _ = tokio::time::timeout(Duration::ZERO, a.flush()).await;
-        send(&a, df, 1, vec![1]).await;
-        tokio::time::timeout(Duration::from_secs(5), a.flush())
-            .await
-            .expect("flush");
-        assert!(
-            event_within(&mut events, Duration::from_millis(100))
-                .await
-                .is_none()
         );
     }
 
@@ -2728,6 +3326,7 @@ mod tests {
         send(&b, df, 1, b"z".to_vec()).await;
         assert_eq!(recv(rb.get_mut(&1).unwrap()).await.unwrap(), b"a");
         assert_eq!(recv(ra.get_mut(&1).unwrap()).await.unwrap(), b"z");
+        assert!(!a.dataflow_sender(&df).unwrap().has_failed());
 
         relays[0].abort();
         // Both sides: the inbound side ended.
@@ -2742,15 +3341,20 @@ mod tests {
         assert_eq!(recv(rb.get_mut(&1).unwrap()).await, None);
         assert_eq!(a.connection_count(), 0);
         // The connection is gone both ways: the next write fails, and is
-        // reported (its frame is lost) ...
-        send(&a, df, 1, b"b".to_vec()).await;
+        // reported (its frame is lost; it may also be refused at once) ...
+        let sender = a.dataflow_sender(&df).unwrap();
+        let _ = sender.send(frame(df, 1, b"b".to_vec())).await;
         assert!(matches!(
             next_event(&mut ea).await,
             PeerIoEvent::WriteFailed(_)
         ));
-        // ... once: frames sent now go nowhere, and the dataflow already
-        // failed.
-        send(&a, df, 1, b"c".to_vec()).await;
+        assert!(sender.has_failed(), "the transport knows");
+        // ... once, and later frames are refused, never reported as sent.
+        assert!(matches!(
+            sender.try_send(frame(df, 1, b"c".to_vec())),
+            Err(tokio_mpsc::error::TrySendError::Closed(_))
+        ));
+        assert!(sender.send(frame(df, 1, b"d".to_vec())).await.is_err());
         assert!(
             event_within(&mut ea, Duration::from_millis(100))
                 .await
@@ -3055,7 +3659,7 @@ mod tests {
         let (manager, peer) = manager_with_raw_peer();
         let df = DataflowId::new();
         let hold = Arc::new(AtomicBool::new(true));
-        let (mut rx, mut events) = manager
+        let (mut rx, mut events, _) = manager
             .register(df, 1, &[1], 16, Arc::clone(&hold))
             .await
             .unwrap();
@@ -3068,7 +3672,10 @@ mod tests {
         assert_eq!(recv(rx.get_mut(&1).unwrap()).await.unwrap(), b"x");
         drop((writer, peer_read));
         let notice = loop {
-            let notice = recv(&mut events).await.unwrap();
+            let notice = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("no connection event within 5 s")
+                .unwrap();
             if matches!(notice.event(), PeerIoEvent::Closed) {
                 break notice;
             }
@@ -3084,37 +3691,42 @@ mod tests {
 
     // --- Teardown -----------------------------------------------------------
 
+    /// A frame queued on its connection is written even once its
+    /// registration has ended (DA R58): its number belongs to that
+    /// registration's lane. Frames sent after the end are dropped.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn flush_then_unregister_delivers_every_queued_frame() {
+    async fn queued_frames_are_written_after_unregistration() {
         let (manager, peer) = manager_with_raw_peer();
         let df = DataflowId::new();
         let _registered = manager.register_dataflow(df, &[1], 16).await.unwrap();
+        let sender = manager.dataflow_sender(&df).unwrap();
         for i in 0..200u8 {
-            send(&manager, df, 1, vec![i]).await;
+            sender.send(frame(df, 1, vec![i])).await.unwrap();
         }
-        manager.flush().await;
         manager.unregister_dataflow(&df).await;
+        sender.send(frame(df, 1, b"late".to_vec())).await.unwrap();
+        sender.try_send(frame(df, 1, b"late".to_vec())).unwrap();
 
         let mut reader = FramedReader::new(peer);
         for i in 0..200u8 {
             let frame = tokio::time::timeout(Duration::from_secs(5), reader.read_frame())
                 .await
-                .expect("frame queued before the flush was dropped")
+                .expect("a queued frame was dropped")
                 .unwrap();
             assert_eq!(frame.channel_id, 1);
             assert_eq!(frame.payload[..8], u64::from(i).to_le_bytes());
             assert_eq!(&frame.payload[8..], &[i]);
         }
-        // The barrier itself never goes on the wire.
         assert!(
             tokio::time::timeout(Duration::from_millis(200), reader.read_frame())
                 .await
-                .is_err()
+                .is_err(),
+            "a frame sent after the registration ended was written"
         );
     }
 
-    /// Frames the bridge already handed to a connection writer survive the
-    /// manager being released, whether it is closed (waiting for its writers)
+    /// Frames already queued on a connection survive the manager being
+    /// released, whether it is closed (waiting for its writers)
     /// or simply dropped (writers finish in the background). Then the peer
     /// sees the connection end at once, not when the readers give up waiting
     /// 10 s later.
@@ -3137,7 +3749,6 @@ mod tests {
             for i in 0..100u8 {
                 send(&manager, df, 1, vec![i; 32]).await;
             }
-            manager.flush().await;
             manager.unregister_dataflow(&df).await;
             let reading = tokio::spawn(async move {
                 let mut reader = FramedReader::new(theirs);
@@ -3214,7 +3825,6 @@ mod tests {
                 while writer.write_frame(&frame).await.is_ok() {}
             });
             send(&manager, df, 1, b"last".to_vec()).await;
-            manager.flush().await;
             manager.unregister_dataflow(&df).await;
             tokio::time::sleep(Duration::from_millis(100)).await;
             if close {
@@ -3241,23 +3851,6 @@ mod tests {
                 "close={close}: the manager's last frame was lost"
             );
         }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn flush_without_connections_returns() {
-        let manager = SharedPeerManager::new(
-            "peer".into(),
-            config(1),
-            Pre::factory([]),
-            &tokio::runtime::Handle::current(),
-            health_tx(),
-        )
-        .unwrap();
-        let df = DataflowId::new();
-        send(&manager, df, 1, vec![1]).await;
-        tokio::time::timeout(Duration::from_secs(5), manager.flush())
-            .await
-            .expect("flush must not wait for a connection");
     }
 
     // --- Registration lifetime and bounded state ------------------------------
@@ -3399,6 +3992,650 @@ mod tests {
         assert!(snapshot.total_frames > 0);
     }
 
+    // --- Connection liveness (DA R54–R58) ----------------------------------------
+
+    /// The liveness tests' silence timeout (T) and probe interval (P).
+    const T: Duration = Duration::from_secs(5);
+    const P: Duration = Duration::from_secs(1);
+
+    fn live(connections: usize) -> SharedConnectionConfig {
+        SharedConnectionConfig {
+            connections,
+            probe_interval: P,
+            silence_timeout: Some(T),
+            ..Default::default()
+        }
+    }
+
+    /// One direction of a [`valved`] connection. Shut, it forwards nothing
+    /// more and hides the end of the stream, like a partition.
+    struct Valve(tokio::sync::watch::Sender<bool>);
+
+    impl Valve {
+        fn shut(&self) {
+            self.0.send_replace(false);
+        }
+
+        fn open(&self) {
+            self.0.send_replace(true);
+        }
+    }
+
+    /// Forward `from` to `to` while `open`, `pace` bytes at a time, one
+    /// chunk per period, if given.
+    async fn pipe(
+        mut from: tokio::io::ReadHalf<DuplexStream>,
+        mut to: tokio::io::WriteHalf<DuplexStream>,
+        mut open: tokio::sync::watch::Receiver<bool>,
+        pace: Option<(usize, Duration)>,
+    ) {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            if open.wait_for(|open| *open).await.is_err() {
+                return;
+            }
+            let limit = pace.map_or(buf.len(), |(chunk, _)| chunk);
+            let read = from.read(&mut buf[..limit]).await;
+            // A valve shut meanwhile holds what was read, or the end.
+            if open.wait_for(|open| *open).await.is_err() {
+                return;
+            }
+            match read {
+                Ok(0) | Err(_) => {
+                    let _ = to.shutdown().await;
+                    return;
+                }
+                Ok(read) => {
+                    if to.write_all(&buf[..read]).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            if let Some((_, period)) = pace {
+                tokio::time::sleep(period).await;
+            }
+        }
+    }
+
+    /// A connection between two managers through a valve per direction:
+    /// the two ends, and the valves from the first end and from the second.
+    fn valved(pace: Option<(usize, Duration)>) -> (DuplexStream, DuplexStream, Valve, Valve) {
+        let (a, relay_a) = duplex(64 * 1024);
+        let (b, relay_b) = duplex(64 * 1024);
+        let (from_a, to_a) = tokio::io::split(relay_a);
+        let (from_b, to_b) = tokio::io::split(relay_b);
+        let (a_to_b, a_to_b_open) = tokio::sync::watch::channel(true);
+        let (b_to_a, b_to_a_open) = tokio::sync::watch::channel(true);
+        tokio::spawn(pipe(from_a, to_b, a_to_b_open, pace));
+        tokio::spawn(pipe(from_b, to_a, b_to_a_open, pace));
+        (a, b, Valve(a_to_b), Valve(b_to_a))
+    }
+
+    type Health = tokio::sync::broadcast::Receiver<crate::RuntimeEvent>;
+
+    /// Two managers over `pairs` (a's end, b's end), with their health
+    /// events.
+    fn live_pair(
+        pairs: Vec<(DuplexStream, DuplexStream)>,
+        config_a: SharedConnectionConfig,
+        config_b: SharedConnectionConfig,
+    ) -> (SharedPeerManager, SharedPeerManager, Health, Health) {
+        let rt = tokio::runtime::Handle::current();
+        let (ends_a, ends_b): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+        let (health_a, watch_a) = tokio::sync::broadcast::channel(64);
+        let (health_b, watch_b) = tokio::sync::broadcast::channel(64);
+        let a = SharedPeerManager::new("b".into(), config_a, Pre::factory(ends_a), &rt, health_a)
+            .unwrap();
+        let b = SharedPeerManager::new("a".into(), config_b, Pre::factory(ends_b), &rt, health_b)
+            .unwrap();
+        (a, b, watch_a, watch_b)
+    }
+
+    /// The first event within `wait` matching `wanted`, after the ones that
+    /// don't.
+    async fn event_matching(
+        events: &mut tokio_mpsc::Receiver<PeerIoNotice>,
+        wait: Duration,
+        wanted: impl Fn(&PeerIoEvent) -> bool,
+    ) -> Option<PeerIoEvent> {
+        tokio::time::timeout(wait, async {
+            loop {
+                let event = events.recv().await?.into_parts().0;
+                if wanted(&event) {
+                    return Some(event);
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    fn silent(event: &PeerIoEvent) -> bool {
+        matches!(
+            event,
+            PeerIoEvent::ReadFailed(TransportError::ConnectionSilent { timeout }) if *timeout == T
+        )
+    }
+
+    fn degraded(health: &mut Health) -> Vec<String> {
+        let mut details = Vec::new();
+        while let Ok(crate::RuntimeEvent::TransportDegraded { detail, .. }) = health.try_recv() {
+            details.push(detail);
+        }
+        details
+    }
+
+    /// Register `df` on both managers and bind it to its connection both
+    /// ways (its first frames); returns its receivers and events on a and b.
+    #[allow(clippy::type_complexity)]
+    async fn bound(
+        a: &SharedPeerManager,
+        b: &SharedPeerManager,
+        df: DataflowId,
+    ) -> (
+        HashMap<u64, tokio_mpsc::UnboundedReceiver<Vec<u8>>>,
+        tokio_mpsc::Receiver<PeerIoNotice>,
+        HashMap<u64, tokio_mpsc::UnboundedReceiver<Vec<u8>>>,
+        tokio_mpsc::Receiver<PeerIoNotice>,
+    ) {
+        let (mut ra, ea) = a.register_dataflow(df, &[1], 1).await.unwrap();
+        let (mut rb, eb) = b.register_dataflow(df, &[1], 1).await.unwrap();
+        send(a, df, 1, b"from a".to_vec()).await;
+        send(b, df, 1, b"from b".to_vec()).await;
+        assert_eq!(recv(rb.get_mut(&1).unwrap()).await.unwrap(), b"from a");
+        assert_eq!(recv(ra.get_mut(&1).unwrap()).await.unwrap(), b"from b");
+        (ra, ea, rb, eb)
+    }
+
+    /// CL1, CL2: an idle connection is kept alive by its probes; once it
+    /// stops delivering both ways, each node fails it by its own timer,
+    /// within T ± P of the cut, as a read error, and fails the dataflows
+    /// using it. It is reported, never as a node leaving.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_silent_both_ways_fails_on_both_nodes() {
+        let (a_end, b_end, a_to_b, b_to_a) = valved(None);
+        let (a, b, mut health_a, mut health_b) = live_pair(vec![(a_end, b_end)], live(1), live(1));
+        let df = DataflowId::new();
+        let (mut ra, mut ea, mut rb, mut eb) = bound(&a, &b, df).await;
+        tokio::time::sleep(4 * T).await;
+        assert!(ea.try_recv().is_err() && eb.try_recv().is_err());
+        assert!(degraded(&mut health_a).is_empty() && degraded(&mut health_b).is_empty());
+
+        a_to_b.shut();
+        b_to_a.shut();
+        let cut = tokio::time::Instant::now();
+        for (events, node) in [(&mut ea, "a"), (&mut eb, "b")] {
+            let event = event_matching(events, 2 * T, silent).await;
+            let after = cut.elapsed();
+            assert!(event.is_some(), "{node} never failed the silent connection");
+            assert!(
+                after >= T - P && after <= T + P,
+                "{node} failed it {after:?} after the cut (T = {T:?}, P = {P:?})"
+            );
+        }
+        assert_eq!(recv(ra.get_mut(&1).unwrap()).await, None);
+        assert_eq!(recv(rb.get_mut(&1).unwrap()).await, None);
+        assert_eq!((a.connection_count(), b.connection_count()), (0, 0));
+        for health in [&mut health_a, &mut health_b] {
+            let details = degraded(health);
+            assert!(
+                details.iter().any(|d| d.contains("no bytes read")),
+                "{details:?}"
+            );
+        }
+        // Frames sent now are refused, never reported as sent: the dataflow
+        // was told its lane failed.
+        let sender = a.dataflow_sender(&df).unwrap();
+        assert!(matches!(
+            sender.try_send(frame(df, 1, b"lost".to_vec())),
+            Err(tokio_mpsc::error::TrySendError::Closed(_))
+        ));
+        assert!(sender.send(frame(df, 1, b"lost".to_vec())).await.is_err());
+        assert!(matches!(
+            event_matching(&mut ea, P, |_| true).await,
+            None | Some(PeerIoEvent::WriteFailed(_))
+        ));
+    }
+
+    /// The silence verdict fails the lanes pinned to the connection at once:
+    /// its writer drops what is queued as soon as it sees the kill, and a
+    /// worker finishing before the reader reports the failure must still see
+    /// a failed send (R60). The reader then reports it.
+    #[tokio::test(start_paused = true)]
+    async fn the_silence_verdict_fails_the_lanes_at_once() {
+        let (a_end, b_end, _a_to_b, _b_to_a) = valved(None);
+        let (a, b, _health_a, _health_b) = live_pair(vec![(a_end, b_end)], live(1), live(1));
+        let df = DataflowId::new();
+        let (_ra, mut ea, _rb, _eb) = bound(&a, &b, df).await;
+        tokio::time::sleep(2 * T).await;
+        let sender = a.dataflow_sender(&df).unwrap();
+        let liveness: Vec<Arc<ConnLiveness>> = a.inner.state().liveness.values().cloned().collect();
+        for liveness in &liveness {
+            liveness.last_read.store(0, Ordering::Relaxed);
+        }
+        // No await between the verdict and the check: no task runs.
+        a.inner.judge_liveness(Some(T));
+        assert!(liveness.iter().all(|l| l.kill.is_cancelled()));
+        assert!(sender.has_failed(), "the lane is failed with the verdict");
+        assert_eq!(a.connection_count(), 0, "no new lane is pinned to it");
+        assert!(
+            event_matching(&mut ea, P, silent).await.is_some(),
+            "the reader reports the silence"
+        );
+    }
+
+    /// CL1: a connection that stops delivering one way is failed by the node
+    /// that reads nothing, by its timer; the other node sees it end.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_silent_one_way_fails_on_both_nodes() {
+        let (a_end, b_end, a_to_b, _b_to_a) = valved(None);
+        let (a, b, _health_a, _health_b) = live_pair(vec![(a_end, b_end)], live(1), live(1));
+        let df = DataflowId::new();
+        let (_ra, mut ea, mut rb, mut eb) = bound(&a, &b, df).await;
+        a_to_b.shut();
+        let cut = tokio::time::Instant::now();
+        assert!(
+            event_matching(&mut eb, 2 * T, silent).await.is_some(),
+            "b never failed the connection that delivers nothing to it"
+        );
+        let on_b = cut.elapsed();
+        assert!(on_b >= T - P && on_b <= T + P, "{on_b:?}");
+        assert_eq!(recv(rb.get_mut(&1).unwrap()).await, None);
+        let on_a = event_matching(&mut ea, P, |event| {
+            matches!(event, PeerIoEvent::Closed | PeerIoEvent::ReadFailed(_))
+        })
+        .await;
+        assert!(on_a.is_some(), "a never saw the connection end");
+    }
+
+    /// CL2: a frame that takes longer than T to cross a slow link keeps its
+    /// connection alive while its bytes move (bytes count, not frames).
+    #[tokio::test(start_paused = true)]
+    async fn a_large_frame_on_a_slow_link_is_not_failed() {
+        // 10 KiB/s: the frame takes about 20 s, four times T.
+        let (a_end, b_end, _a_to_b, _b_to_a) = valved(Some((1024, Duration::from_millis(100))));
+        let (a, b, mut health_a, mut health_b) = live_pair(vec![(a_end, b_end)], live(1), live(1));
+        let df = DataflowId::new();
+        let (_ra, mut ea, mut rb, mut eb) = bound(&a, &b, df).await;
+        let started = tokio::time::Instant::now();
+        let big = vec![7u8; 200 * 1024];
+        send(&a, df, 1, big.clone()).await;
+        let got = tokio::time::timeout(Duration::from_secs(60), rb.get_mut(&1).unwrap().recv())
+            .await
+            .expect("the frame never arrived")
+            .unwrap();
+        assert!(started.elapsed() > 3 * T, "{:?}", started.elapsed());
+        assert_eq!(got, big);
+        assert!(ea.try_recv().is_err() && eb.try_recv().is_err());
+        assert!(degraded(&mut health_a).is_empty() && degraded(&mut health_b).is_empty());
+    }
+
+    /// CL6: a consumer that takes nothing never stops the connection's
+    /// reader: another dataflow on it still receives at once, and the
+    /// connection is never failed.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_consumer_does_not_stop_the_reader() {
+        let (a_end, b_end, _a_to_b, _b_to_a) = valved(None);
+        let (a, b, _health_a, mut health_b) = live_pair(vec![(a_end, b_end)], live(1), live(1));
+        let (slow, other) = (DataflowId::new(), DataflowId::new());
+        let (_r_slow, _e_slow, mut slow_rx, mut slow_events) = bound(&a, &b, slow).await;
+        let (_r_other, _e_other, mut other_rx, mut other_events) = bound(&a, &b, other).await;
+        for i in 0..1000u32 {
+            send(&a, slow, 1, i.to_le_bytes().to_vec()).await;
+        }
+        send(&a, other, 1, b"behind".to_vec()).await;
+        assert_eq!(
+            recv(other_rx.get_mut(&1).unwrap()).await.unwrap(),
+            b"behind"
+        );
+        tokio::time::sleep(3 * T).await;
+        assert!(slow_events.try_recv().is_err() && other_events.try_recv().is_err());
+        assert!(degraded(&mut health_b).is_empty());
+        for i in 0..1000u32 {
+            assert_eq!(
+                recv(slow_rx.get_mut(&1).unwrap()).await.unwrap(),
+                i.to_le_bytes()
+            );
+        }
+    }
+
+    /// R56: a writer that has had bytes waiting and written none for T fails
+    /// its connection like a write error, while the connection still reads.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_writer_fails_its_connection_after_the_timeout() {
+        let (a_end, b_end, a_to_b, _b_to_a) = valved(None);
+        // b never declares the connection dead, and keeps a reading.
+        let quiet = SharedConnectionConfig {
+            silence_timeout: None,
+            ..live(1)
+        };
+        let (a, b, mut health_a, _health_b) = live_pair(vec![(a_end, b_end)], live(1), quiet);
+        let df = DataflowId::new();
+        let (_ra, mut ea, _rb, _eb) = bound(&a, &b, df).await;
+        a_to_b.shut();
+        let cut = tokio::time::Instant::now();
+        let sender = a.dataflow_sender(&df).unwrap();
+        while sender.try_send(frame(df, 1, vec![0; 4096])).is_ok() {
+            tokio::task::yield_now().await;
+        }
+        let event = event_matching(&mut ea, 3 * T, |event| {
+            matches!(event, PeerIoEvent::WriteFailed(_))
+        })
+        .await;
+        let after = cut.elapsed();
+        assert!(
+            matches!(
+                event,
+                Some(PeerIoEvent::WriteFailed(TransportError::WriteStalled { timeout })) if timeout == T
+            ),
+            "{event:?}"
+        );
+        assert!(after >= T && after <= T + 2 * P, "{after:?}");
+        assert!(
+            degraded(&mut health_a)
+                .iter()
+                .any(|d| d.contains("nothing written")),
+        );
+        assert_eq!(a.connection_count(), 0);
+    }
+
+    /// R56 also holds out of the pool: a connection the peer closed, whose
+    /// last dataflow left with frames still queued (written even so, R58),
+    /// is killed and reported once its writer has written nothing for T.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_writer_out_of_the_pool_is_still_failed() {
+        let (ours, theirs) = duplex(64 * 1024);
+        let (health, mut watch) = tokio::sync::broadcast::channel(16);
+        let manager = SharedPeerManager::new(
+            "peer".into(),
+            live(1),
+            Pre::factory([ours]),
+            &tokio::runtime::Handle::current(),
+            health,
+        )
+        .unwrap();
+        let df = DataflowId::new();
+        let _registered = manager.register_dataflow(df, &[1], 4).await.unwrap();
+        let sender = manager.dataflow_sender(&df).unwrap();
+        // The peer reads nothing: the writer blocks with frames queued.
+        while sender.try_send(frame(df, 1, vec![0; 4096])).is_ok() {
+            tokio::task::yield_now().await;
+        }
+        drop(sender);
+        let (_peer_read, mut peer_write) = tokio::io::split(theirs);
+        peer_write.shutdown().await.unwrap();
+        tokio::task::yield_now().await;
+        manager.unregister_dataflow(&df).await;
+        let watched = {
+            let state = manager.inner.state();
+            assert!(state.connections.is_empty(), "still in the pool");
+            state.liveness.values().next().cloned().unwrap()
+        };
+        assert!(watched.tasks_open(), "the writer has frames left");
+        tokio::time::sleep(T + 2 * P).await;
+        assert!(!watched.tasks_open(), "the stuck writer was not stopped");
+        let degraded = degraded(&mut watch);
+        assert!(
+            degraded
+                .iter()
+                .any(|d| d.contains("writing failed") && d.contains("nothing written")),
+            "{degraded:?}"
+        );
+    }
+
+    /// Two managers with two connections: dataflow X is pinned to the first
+    /// on both nodes and Y to the second, and X's queue on a is full behind a
+    /// one-way stall of the first connection from a.
+    struct Stalled {
+        a: SharedPeerManager,
+        b: SharedPeerManager,
+        y: DataflowId,
+        /// The first connection, from a.
+        x_valve: Valve,
+        /// How many of X's frames a queued.
+        x_frames: usize,
+        /// X's channels on b.
+        x_on_b: HashMap<u64, tokio_mpsc::UnboundedReceiver<Vec<u8>>>,
+        /// Y's channels and events on b.
+        y_on_b: HashMap<u64, tokio_mpsc::UnboundedReceiver<Vec<u8>>>,
+        y_events_b: tokio_mpsc::Receiver<PeerIoNotice>,
+        /// The other directions, kept open.
+        _open: [Valve; 3],
+    }
+
+    async fn x_stuck_behind_a_stall() -> Stalled {
+        let (a1, b1, x_valve, x_back) = valved(None);
+        let (a2, b2, y_valve, y_back) = valved(None);
+        let (a, b, _, _) = live_pair(vec![(a1, b1), (a2, b2)], live(2), live(2));
+        let (x, y) = (DataflowId::new(), DataflowId::new());
+        let (_, _, x_on_b, _) = bound(&a, &b, x).await;
+        let (_, _, y_on_b, y_events_b) = bound(&a, &b, y).await;
+        for manager in [&a, &b] {
+            let state = manager.inner.state();
+            assert_eq!(
+                (state.registered[&x].conn, state.registered[&y].conn),
+                (0, 1)
+            );
+        }
+        x_valve.shut();
+        let sender = a.dataflow_sender(&x).unwrap();
+        let mut x_frames = 0;
+        while sender.try_send(frame(x, 1, vec![0; 4096])).is_ok() {
+            x_frames += 1;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(a.metrics_snapshot()[0].queued_frames, WRITER_QUEUE);
+        Stalled {
+            a,
+            b,
+            y,
+            x_valve,
+            x_frames,
+            x_on_b,
+            y_on_b,
+            y_events_b,
+            _open: [x_back, y_valve, y_back],
+        }
+    }
+
+    /// CL4: a stuck connection holds up only its own dataflows: another
+    /// dataflow's payload and control frames to the same peer cross at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_writer_does_not_delay_another_connection() {
+        let mut stalled = x_stuck_behind_a_stall().await;
+        let (a, y) = (&stalled.a, stalled.y);
+        let started = tokio::time::Instant::now();
+        for i in 0..10u8 {
+            send(a, y, 1, vec![i]).await;
+        }
+        a.control_sender()
+            .send(frame(y, CONTROL_CHANNEL_ID, b"control".to_vec()))
+            .await
+            .unwrap();
+        for i in 0..10u8 {
+            assert_eq!(
+                recv(stalled.y_on_b.get_mut(&1).unwrap()).await.unwrap(),
+                [i]
+            );
+        }
+        assert_eq!(
+            recv(stalled.y_on_b.get_mut(&CONTROL_CHANNEL_ID).unwrap())
+                .await
+                .unwrap(),
+            b"control"
+        );
+        assert!(started.elapsed() < P, "{:?}", started.elapsed());
+        assert!(stalled.y_events_b.try_recv().is_err());
+    }
+
+    /// R58: a dataflow that finishes while another connection to the peer is
+    /// stuck unregisters at once, and its last frames (its goodbye and
+    /// acknowledgement) still reach the peer.
+    #[tokio::test(start_paused = true)]
+    async fn a_dataflow_finishing_during_another_stall_delivers_its_last_frames() {
+        let mut stalled = x_stuck_behind_a_stall().await;
+        let (a, y) = (&stalled.a, stalled.y);
+        let started = tokio::time::Instant::now();
+        let last = a.dataflow_sender(&y).unwrap();
+        last.send(frame(y, 1, b"goodbye".to_vec())).await.unwrap();
+        last.send(frame(y, 1, b"ack".to_vec())).await.unwrap();
+        a.unregister_dataflow(&y).await;
+        let on_b = stalled.y_on_b.get_mut(&1).unwrap();
+        assert_eq!(recv(on_b).await.unwrap(), b"goodbye");
+        assert_eq!(recv(on_b).await.unwrap(), b"ack");
+        assert!(started.elapsed() < P, "{:?}", started.elapsed());
+        assert!(stalled.y_events_b.try_recv().is_err());
+    }
+
+    /// A stall that heals before T loses nothing and fails nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_stall_shorter_than_the_timeout_loses_nothing() {
+        let mut stalled = x_stuck_behind_a_stall().await;
+        tokio::time::sleep(T - 2 * P).await;
+        stalled.x_valve.open();
+        let on_b = stalled.x_on_b.get_mut(&1).unwrap();
+        for _ in 0..stalled.x_frames {
+            assert_eq!(recv(on_b).await.unwrap().len(), 4096);
+        }
+        tokio::time::sleep(2 * T).await;
+        assert!(on_b.try_recv().is_err());
+        assert_eq!(
+            (stalled.a.connection_count(), stalled.b.connection_count()),
+            (2, 2)
+        );
+    }
+
+    /// With `silence_timeout: None` nothing is ever declared dead.
+    #[tokio::test(start_paused = true)]
+    async fn no_silence_timeout_disables_the_rule() {
+        let (a_end, b_end, a_to_b, b_to_a) = valved(None);
+        let off = SharedConnectionConfig {
+            silence_timeout: None,
+            ..live(1)
+        };
+        let (a, b, mut health_a, mut health_b) = live_pair(vec![(a_end, b_end)], off.clone(), off);
+        let df = DataflowId::new();
+        let (_ra, mut ea, _rb, mut eb) = bound(&a, &b, df).await;
+        a_to_b.shut();
+        b_to_a.shut();
+        tokio::time::sleep(20 * T).await;
+        assert!(ea.try_recv().is_err() && eb.try_recv().is_err());
+        assert!(degraded(&mut health_a).is_empty() && degraded(&mut health_b).is_empty());
+        assert_eq!((a.connection_count(), b.connection_count()), (1, 1));
+    }
+
+    /// With the rule off, the probe tick still forgets the connections that
+    /// ended: a pool whose connections keep failing and being replaced
+    /// watches no more than it holds.
+    #[tokio::test(start_paused = true)]
+    async fn ended_connections_are_forgotten_with_the_rule_off() {
+        const ROUNDS: usize = 8;
+        let ends: Vec<_> = (0..ROUNDS)
+            .map(|_| {
+                // The far end is gone: each connection fails on its first read.
+                let (ours, _theirs) = duplex(4096);
+                ours
+            })
+            .collect();
+        let manager = SharedPeerManager::new(
+            "peer".into(),
+            SharedConnectionConfig {
+                silence_timeout: None,
+                ..live(1)
+            },
+            Pre::factory(ends),
+            &tokio::runtime::Handle::current(),
+            health_tx(),
+        )
+        .unwrap();
+        for round in 0..ROUNDS {
+            let df = DataflowId::new();
+            let _registered = manager.register_dataflow(df, &[1], 4).await.unwrap();
+            tokio::time::sleep(P).await;
+            assert_eq!(manager.connection_count(), 0, "round {round}");
+            manager.unregister_dataflow(&df).await;
+        }
+        tokio::time::sleep(2 * P).await;
+        assert_eq!(manager.inner.state().liveness.len(), 0);
+    }
+
+    /// An idle pool, with no dataflow registered, stays alive on its probes;
+    /// once it stops delivering it is dropped, failing no dataflow, and the
+    /// next registration refills the pool.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_pool_stays_alive_until_it_falls_silent() {
+        let (a1, b1, a_to_b, b_to_a) = valved(None);
+        let (a2, b2, _valve_a, _valve_b) = valved(None);
+        let (a, b, mut health_a, mut health_b) =
+            live_pair(vec![(a1, b1), (a2, b2)], live(1), live(1));
+        let df = DataflowId::new();
+        let _bound = bound(&a, &b, df).await;
+        a.unregister_dataflow(&df).await;
+        b.unregister_dataflow(&df).await;
+        tokio::time::sleep(10 * T).await;
+        assert!(degraded(&mut health_a).is_empty() && degraded(&mut health_b).is_empty());
+        assert_eq!((a.connection_count(), b.connection_count()), (1, 1));
+
+        a_to_b.shut();
+        b_to_a.shut();
+        tokio::time::sleep(T + 2 * P).await;
+        assert_eq!((a.connection_count(), b.connection_count()), (0, 0));
+        for health in [&mut health_a, &mut health_b] {
+            assert!(degraded(health).iter().any(|d| d.contains("no bytes read")));
+        }
+        let next = DataflowId::new();
+        let (_ra, mut ea, _rb, mut eb) = bound(&a, &b, next).await;
+        assert_eq!((a.connection_count(), b.connection_count()), (1, 1));
+        tokio::time::sleep(2 * T).await;
+        assert!(ea.try_recv().is_err() && eb.try_recv().is_err());
+    }
+
+    /// A control frame overtakes the payload frames queued before it on its
+    /// connection: the writer serves the control queue first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_frames_overtake_queued_payload() {
+        let (ours, theirs) = duplex(4096);
+        let manager = SharedPeerManager::new(
+            "peer".into(),
+            config(1),
+            Pre::factory([ours]),
+            &tokio::runtime::Handle::current(),
+            health_tx(),
+        )
+        .unwrap();
+        let df = DataflowId::new();
+        let _registered = manager.register_dataflow(df, &[1], 4).await.unwrap();
+        let sender = manager.dataflow_sender(&df).unwrap();
+        for i in 0..64u8 {
+            sender.try_send(frame(df, 1, vec![i; 1024])).unwrap();
+        }
+        // The writer is blocked on the pipe, with most frames still queued.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(manager.metrics_snapshot()[0].queued_frames > 32);
+        manager
+            .control_sender()
+            .send(frame(df, CONTROL_CHANNEL_ID, b"cancel".to_vec()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut reader = FramedReader::new(theirs);
+        let mut order = Vec::new();
+        for _ in 0..65 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), reader.read_frame())
+                .await
+                .expect("a frame is missing")
+                .unwrap();
+            order.push(frame.channel_id);
+        }
+        let control_at = order
+            .iter()
+            .position(|&channel| channel == CONTROL_CHANNEL_ID)
+            .unwrap();
+        assert!(control_at < 32, "the control frame came at {control_at}");
+    }
+
     // --- Session --------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3415,45 +4652,266 @@ mod tests {
         assert!(session.data_sender("nonexistent").is_none());
         assert_eq!(session.peer_node_ids().collect::<Vec<_>>(), vec!["b"]);
         assert_eq!(session.dataflow_id(), df);
-        assert!(session.take_receivers().is_some());
+        let receivers = session.take_receivers().unwrap();
         assert!(session.take_receivers().is_none());
         assert!(session.take_io_events().is_some());
         assert!(session.take_io_events().is_none());
+        // The receivers build an exchange edge through the public API.
+        let topology = crate::execute::ClusterTopology::multi_node(vec![
+            crate::execute::NodeConfig::new("a", 1),
+            crate::execute::NodeConfig::new("b", 1),
+        ])
+        .unwrap();
+        let transport = Arc::new(
+            crate::communication::cluster_transport::ClusterTransport::Shared {
+                session: Arc::new(session),
+            },
+        );
+        crate::dataflow::channels::network::NetworkEdgeMaterializer::<u64, u64>::new_unbounded(
+            df,
+            topology,
+            "a",
+            transport,
+            receivers,
+            16,
+            0,
+            (0..2)
+                .map(|_| crate::dataflow::channels::wake::WakeHandle::new())
+                .collect(),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
     }
 
+    /// A lane tags each frame with its dataflow and numbers what it queues;
+    /// a frame refused for a full queue takes no number; once the manager is
+    /// released, sends fail.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dataframe_sender_tags_with_dataflow_id_and_registration() {
-        let (tx, mut rx) = tokio_mpsc::channel::<Outbound>(16);
+    async fn a_lane_numbers_what_it_queues() {
+        let (queue, mut rx) = tokio_mpsc::channel::<Outgoing>(2);
+        let (events, _events_rx) = tokio_mpsc::channel(8);
         let df = DataflowId::new();
         let sender = DataframeSender {
-            dataflow_id: df,
-            token: 7,
-            tx,
+            lane: Arc::new(Lane::new(df, 0, queue, events, Weak::new())),
         };
         sender
-            .send(frame(DataflowId::new(), 1, vec![1, 2, 3]))
+            .send(frame(DataflowId::new(), 1, vec![1]))
             .await
             .unwrap();
-        let Some(Outbound::Payload {
-            dataflow_id,
-            token,
-            frame: received,
-        }) = rx.recv().await
-        else {
-            panic!("expected a payload entry");
-        };
-        assert_eq!((dataflow_id, token), (df, 7));
-        assert_eq!(received.dataflow_id, df);
-        assert_eq!(received.payload, vec![1, 2, 3]);
-        drop(rx);
+        sender.try_send(frame(df, 1, vec![2])).unwrap();
+        assert!(matches!(
+            sender.try_send(frame(df, 1, vec![3])),
+            Err(tokio_mpsc::error::TrySendError::Full(refused)) if refused.payload == [3]
+        ));
+        for (seq, payload) in [(0, 1u8), (1, 2)] {
+            let Outgoing { seq: got, frame } = rx.recv().await.unwrap();
+            assert_eq!(got, Some(seq));
+            assert_eq!(frame.dataflow_id, df);
+            assert_eq!(frame.payload, [payload]);
+        }
+        sender.try_send(frame(df, 1, vec![4])).unwrap();
+        assert_eq!(rx.recv().await.unwrap().seq, Some(2));
+
+        sender.lane.close(LaneEnd::Released);
+        assert!(matches!(
+            sender.try_send(frame(df, 1, vec![5])),
+            Err(tokio_mpsc::error::TrySendError::Closed(_))
+        ));
         assert_eq!(
             sender
-                .send(frame(df, 1, vec![4]))
+                .send(frame(df, 1, vec![6]))
                 .await
                 .unwrap_err()
                 .0
                 .payload,
-            vec![4]
+            [6]
         );
+        assert!(rx.try_recv().is_err());
+    }
+}
+
+/// Schedule tests of numbering at enqueue (DA R57), under Shuttle (Linux,
+/// `RUSTFLAGS="--cfg instancy_shuttle"`; see `docs/testing/nextest.md`). A
+/// lane's producers (worker threads offering frames without waiting, the
+/// outbox forwarder waiting for room) and its end run on their own threads;
+/// the depth-first scheduler runs every interleaving of the lane's lock.
+/// They check the lane's obligations: only a frame that is queued takes a
+/// number, the queue holds the frames in number order, a lane that has ended
+/// takes no numbers, and a frame whose waiting send returned is in the queue.
+#[cfg(all(test, target_os = "linux", instancy_shuttle))]
+mod lane_shuttle {
+    use super::*;
+    use std::sync::atomic::AtomicUsize as Count;
+
+    // The scheduler explores interleavings only if the lane's lock is
+    // Shuttle's model.
+    const _: fn(&Lane) -> &shuttle::sync::Mutex<LaneState> = |lane| &lane.state;
+
+    fn dataflow_id() -> DataflowId {
+        DataflowId::from_bytes([0x57; 16])
+    }
+
+    /// A lane whose connection queue holds `capacity` frames.
+    fn lane(capacity: usize) -> (Arc<Lane>, tokio_mpsc::Receiver<Outgoing>) {
+        let (queue, rx) = tokio_mpsc::channel(capacity);
+        let (events, _) = tokio_mpsc::channel(8);
+        let lane = Lane::new(dataflow_id(), 0, queue, events, Weak::new());
+        (Arc::new(lane), rx)
+    }
+
+    /// Frame `i` of `producer`.
+    fn frame(producer: u8, i: u8) -> Frame {
+        Frame {
+            dataflow_id: dataflow_id(),
+            channel_id: 1,
+            payload: vec![producer, i],
+        }
+    }
+
+    /// The queued frames are numbered 0, 1, 2, ... in queue order, and each
+    /// producer's frames are in its order.
+    fn check_order(queued: &[Outgoing]) {
+        for (position, out) in queued.iter().enumerate() {
+            assert_eq!(
+                out.seq,
+                Some(position as u64),
+                "queue order is not number order, or a number was skipped: {:?}",
+                queued.iter().map(|o| o.seq).collect::<Vec<_>>()
+            );
+        }
+        for producer in 0..2u8 {
+            let mine: Vec<u8> = queued
+                .iter()
+                .filter(|out| out.frame.payload[0] == producer)
+                .map(|out| out.frame.payload[1])
+                .collect();
+            assert!(mine.is_sorted(), "producer {producer}'s order: {mine:?}");
+        }
+    }
+
+    fn run(test: impl Fn() + Send + Sync + 'static) -> usize {
+        let mut config = shuttle::Config::new();
+        config.stack_size = 0x10_0000;
+        config.max_steps = shuttle::MaxSteps::FailAfter(10_000);
+        config.max_time = None;
+        let scheduler = shuttle::scheduler::DfsScheduler::new(None, false);
+        shuttle::Runner::new(scheduler, config).run(test)
+    }
+
+    /// Two producers offer two frames each, without waiting, to a lane with
+    /// room for three, while a third thread ends the lane.
+    #[test]
+    fn offered_frames_are_numbered_as_queued_until_the_lane_ends() {
+        static PASSED: Count = Count::new(0);
+        PASSED.store(0, Ordering::Relaxed);
+        let executions = run(|| {
+            let (lane, mut rx) = lane(3);
+            // Set once `close` returned (a std flag: Shuttle runs every
+            // thread on one OS thread).
+            let ended = Arc::new(AtomicBool::new(false));
+            let producers = [0u8, 1].map(|producer| {
+                let (lane, ended) = (Arc::clone(&lane), Arc::clone(&ended));
+                shuttle::thread::spawn(move || {
+                    (0..2u8)
+                        .map(|i| {
+                            let after_end = ended.load(Ordering::SeqCst);
+                            (after_end, lane.try_enqueue(frame(producer, i)))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            });
+            let closer = {
+                let (lane, ended) = (Arc::clone(&lane), Arc::clone(&ended));
+                shuttle::thread::spawn(move || {
+                    lane.close(LaneEnd::Ended);
+                    ended.store(true, Ordering::SeqCst);
+                })
+            };
+            let outcomes: Vec<(bool, Enqueued)> = producers
+                .into_iter()
+                .flat_map(|producer| producer.join().unwrap())
+                .collect();
+            closer.join().unwrap();
+            let mut queued = Vec::new();
+            while let Ok(out) = rx.try_recv() {
+                queued.push(out);
+            }
+            check_order(&queued);
+            let admitted = outcomes
+                .iter()
+                .filter(|(_, outcome)| matches!(outcome, Enqueued::Admitted))
+                .count();
+            assert_eq!(admitted, queued.len(), "only a queued frame takes a number");
+            for (after_end, outcome) in &outcomes {
+                assert!(
+                    !after_end || matches!(outcome, Enqueued::Dropped),
+                    "a frame offered after the lane ended: {outcome:?}"
+                );
+                assert!(
+                    matches!(
+                        outcome,
+                        Enqueued::Admitted | Enqueued::Full(_) | Enqueued::Dropped
+                    ),
+                    "{outcome:?}"
+                );
+            }
+            PASSED.fetch_add(1, Ordering::Relaxed);
+        });
+        println!("{executions} interleavings");
+        assert!(executions > 1, "nothing was explored");
+        assert_eq!(PASSED.load(Ordering::Relaxed), executions);
+    }
+
+    /// A waiting producer (the outbox forwarder) sends two frames while
+    /// another offers one without waiting, to a lane with room for one, and
+    /// the writer takes frames off the queue.
+    #[test]
+    fn a_waiting_send_numbers_its_frame_only_once_it_is_queued() {
+        static PASSED: Count = Count::new(0);
+        PASSED.store(0, Ordering::Relaxed);
+        let executions = run(|| {
+            let (lane, mut rx) = lane(1);
+            let forwarder = {
+                let lane = Arc::clone(&lane);
+                shuttle::thread::spawn(move || {
+                    for i in 0..2u8 {
+                        let outcome = shuttle::future::block_on(lane.enqueue(frame(0, i)));
+                        assert!(matches!(outcome, Enqueued::Admitted), "{outcome:?}");
+                    }
+                })
+            };
+            let pusher = {
+                let lane = Arc::clone(&lane);
+                shuttle::thread::spawn(move || lane.try_enqueue(frame(1, 0)))
+            };
+            // The writer: it takes frames until it has both of the
+            // forwarder's, which therefore were queued.
+            let mut written = Vec::new();
+            while written
+                .iter()
+                .filter(|out: &&Outgoing| out.frame.payload[0] == 0)
+                .count()
+                < 2
+            {
+                let out = shuttle::future::block_on(rx.recv()).expect("the queue closed");
+                written.push(out);
+            }
+            forwarder.join().unwrap();
+            let pushed = pusher.join().unwrap();
+            while let Ok(out) = rx.try_recv() {
+                written.push(out);
+            }
+            check_order(&written);
+            let pushed_queued = written.iter().any(|out| out.frame.payload[0] == 1);
+            assert_eq!(
+                matches!(pushed, Enqueued::Admitted),
+                pushed_queued,
+                "{pushed:?}"
+            );
+            PASSED.fetch_add(1, Ordering::Relaxed);
+        });
+        println!("{executions} interleavings");
+        assert!(executions > 1, "nothing was explored");
+        assert_eq!(PASSED.load(Ordering::Relaxed), executions);
     }
 }

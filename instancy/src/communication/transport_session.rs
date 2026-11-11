@@ -209,6 +209,9 @@ pub struct TransportSession {
     /// only then does a demuxer wait for its end-of-connection notice to be
     /// handed on.
     io_events_handled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Per-peer: the connection's read side failed (not a clean EOF), set
+    /// before the failure is reported. See [Self::read_failed].
+    read_failed: HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Shared state keeping background tasks alive (abort on drop).
     _state: std::sync::Arc<SessionState>,
 }
@@ -350,6 +353,7 @@ impl TransportSession {
         let mut control_senders = HashMap::new();
         let mut io_events = HashMap::new();
         let io_events_handled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut read_failed = HashMap::new();
         let mut bridge_handles = Vec::new();
         let mut demux_handles = Vec::new();
         let closed = tokio_util::sync::CancellationToken::new();
@@ -408,6 +412,8 @@ impl TransportSession {
 
             let demux_closed = closed.clone();
             let io_taken = std::sync::Arc::clone(&io_events_handled);
+            let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            read_failed.insert(peer_node_id.clone(), std::sync::Arc::clone(&failed));
             let demux_handle = runtime_handle.spawn(async move {
                 let mut demuxer = demuxer;
                 let event = match demuxer
@@ -418,6 +424,7 @@ impl TransportSession {
                     DemuxEnd::Failed(e) => {
                         #[cfg(feature = "tracing")]
                         tracing::error!("Demuxer error for peer {}: {e}", peer_node_id);
+                        failed.store(true, std::sync::atomic::Ordering::Release);
                         PeerIoEvent::ReadFailed(e)
                     }
                     // The session was released: nobody is listening any more.
@@ -452,6 +459,7 @@ impl TransportSession {
             control_senders,
             io_events: std::sync::Mutex::new(Some(io_events)),
             io_events_handled,
+            read_failed,
             _state: state,
         };
 
@@ -478,6 +486,17 @@ impl TransportSession {
     pub(crate) fn hold_channels_for_io_events(&self) {
         self.io_events_handled
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the connection to a peer failed on its read side (an I/O
+    /// error such as a reset, EOF mid-frame, a corrupt or oversize frame),
+    /// rather than ending cleanly. The writer may still accept frames, but
+    /// frames it already wrote may be lost with the connection. Set before
+    /// the failure is reported on the io events.
+    pub(crate) fn read_failed(&self, peer_node_id: &str) -> bool {
+        self.read_failed
+            .get(peer_node_id)
+            .is_some_and(|failed| failed.load(std::sync::atomic::Ordering::Acquire))
     }
 
     /// Get a data sender for a peer.
@@ -576,8 +595,10 @@ impl TransportSession {
                 Err(e) => {
                     #[cfg(feature = "tracing")]
                     tracing::error!("Bridge write error for peer {}: {e}", _peer_id);
-                    let _ = events.try_send(PeerIoNotice::new(PeerIoEvent::WriteFailed(e)));
+                    // Refuse frames first: once the failure is reported,
+                    // `outbound_failed` must already see it.
                     drop((control_rx, payload_rx));
+                    let _ = events.try_send(PeerIoNotice::new(PeerIoEvent::WriteFailed(e)));
                     session_closed.cancelled().await;
                     break;
                 }
@@ -1626,12 +1647,16 @@ mod tests {
     async fn session_reports_peer_eof() {
         let (local_read, remote_write) = tokio::io::duplex(1024);
         let (remote_read, local_write) = tokio::io::duplex(1024);
-        let (_session, mut events, _rx) = session_with(local_read, local_write);
+        let (session, mut events, _rx) = session_with(local_read, local_write);
         drop(remote_write);
         assert!(matches!(
             next_event(&mut events).await,
             Some(PeerIoEvent::Closed)
         ));
+        assert!(
+            !session.read_failed("b"),
+            "a clean EOF is not a read failure"
+        );
         drop(remote_read);
     }
 
@@ -1640,7 +1665,8 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         let (local_read, mut remote_write) = tokio::io::duplex(1024);
         let (_remote_read, local_write) = tokio::io::duplex(1024);
-        let (_session, mut events, _rx) = session_with(local_read, local_write);
+        let (session, mut events, _rx) = session_with(local_read, local_write);
+        assert!(!session.read_failed("b"));
         remote_write.write_all(&oversize_header()).await.unwrap();
         assert!(matches!(
             next_event(&mut events).await,
@@ -1648,6 +1674,10 @@ mod tests {
                 TransportError::PayloadTooLarge { .. }
             ))
         ));
+        assert!(
+            session.read_failed("b"),
+            "set before the failure is reported"
+        );
     }
 
     /// The peer's channels close only after the read-side event was handed

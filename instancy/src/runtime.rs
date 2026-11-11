@@ -737,15 +737,21 @@ impl Drop for SpawnAbortGuard {
                     }
                     SpawnAbortTarget::Nobody => {}
                 }
-                // The Cancel is queued on the managers' bridges: wait until
-                // each bridge has handed it to a connection writer before
-                // letting the managers go (the writers finish what they were
-                // handed, even once the managers are dropped). Bounded by the
-                // timeout below; if it expires, or the tokio runtime shuts
-                // down first, the Cancel may be lost and peers fall back to
-                // their own handshake timeout.
+                // The Cancel is queued on the managers' control routers: wait
+                // until each router has put it on a connection before letting
+                // the managers go (the writers send what they were handed,
+                // even once the managers are dropped). Bounded by the timeout
+                // below; if it expires, or the tokio runtime shuts down
+                // first, the Cancel may be lost and peers fall back to their
+                // own handshake timeout.
                 if let Some(managers) = &managers {
-                    join_all(managers.values().map(|manager| manager.flush()).collect()).await;
+                    join_all(
+                        managers
+                            .values()
+                            .map(|manager| manager.route_queued_control())
+                            .collect(),
+                    )
+                    .await;
                 }
             };
             let _ = tokio::time::timeout(timeout, notify).await;
@@ -891,6 +897,9 @@ pub(crate) struct PeerRegistry {
     next_id: std::sync::atomic::AtomicU64,
     /// Protected state: peer-to-registration map + set of known-down peers.
     state: Mutex<PeerRegistryState>,
+    /// Woken at every report of a node leaving (see
+    /// [`Self::down_reported`]).
+    down_reported: tokio::sync::Notify,
 }
 
 #[cfg(feature = "transport")]
@@ -903,6 +912,12 @@ struct PeerRegistryState {
     down_peers: std::collections::HashSet<String>,
     /// `down_peers` in the order they were reported.
     down_order: std::collections::VecDeque<String>,
+    /// How many leave reports there have been.
+    leaves: u64,
+    /// The number (in `leaves`) of each node's last leave report, kept
+    /// after it rejoins (see [`PeerRegistry::left_since`]). Bounded like
+    /// `down_peers`: the oldest are forgotten first.
+    left_at: std::collections::HashMap<String, u64>,
 }
 
 /// How many departed nodes a [`PeerRegistry`] remembers. A dataflow spawned
@@ -920,8 +935,33 @@ impl PeerRegistry {
                 entries: std::collections::HashMap::new(),
                 down_peers: std::collections::HashSet::new(),
                 down_order: std::collections::VecDeque::new(),
+                leaves: 0,
+                left_at: std::collections::HashMap::new(),
             }),
+            down_reported: tokio::sync::Notify::new(),
         }
+    }
+
+    /// A mark of the leave reports so far (see [`Self::left_since`]).
+    pub(crate) fn departure_mark(&self) -> u64 {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).leaves
+    }
+
+    /// Whether `peer_node_id` is reported as left, or was reported leaving
+    /// after `mark` (from [`Self::departure_mark`]) even if it has rejoined
+    /// since: a run that started before the report needs nothing more from
+    /// it.
+    pub(crate) fn left_since(&self, peer_node_id: &str, mark: u64) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.down_peers.contains(peer_node_id)
+            || state.left_at.get(peer_node_id).is_some_and(|&at| at > mark)
+    }
+
+    /// Notified at every later report of a node leaving. Enable the future
+    /// before checking [`Self::is_down`], so a report in between is not
+    /// missed.
+    pub(crate) fn down_reported(&self) -> tokio::sync::futures::Notified<'_> {
+        self.down_reported.notified()
     }
 
     /// Register a cluster dataflow for all its remote peer nodes.
@@ -1000,6 +1040,20 @@ impl PeerRegistry {
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
+            state.leaves += 1;
+            let at = state.leaves;
+            state.left_at.insert(peer_node_id.to_string(), at);
+            if state.left_at.len() > MAX_DOWN_PEERS {
+                let oldest = state
+                    .left_at
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(peer, _)| peer.clone());
+                if let Some(oldest) = oldest {
+                    state.left_at.remove(&oldest);
+                }
+            }
+
             // Mark peer as down so future registrations are rejected.
             if state.down_peers.insert(peer_node_id.to_string()) {
                 state.down_order.push_back(peer_node_id.to_string());
@@ -1047,6 +1101,8 @@ impl PeerRegistry {
         for handle in &to_cancel {
             handle.cancel_with_reason(reason.clone());
         }
+        // A dataflow tearing down stops waiting to hand frames to the node.
+        self.down_reported.notify_waiters();
 
         cancelled_count
     }
@@ -2674,13 +2730,10 @@ impl RuntimeHandle {
         // After this block: `transport`, `receivers`, `control_receivers` are set.
         // For dedicated mode, `dedicated_session` holds the raw session for handshake/barrier.
         let transport: Arc<ClusterTransport>;
-        let mut receivers: std::collections::HashMap<
-            String,
-            std::collections::HashMap<u64, tokio::sync::mpsc::Receiver<Vec<u8>>>,
-        >;
+        let mut receivers: crate::communication::cluster_transport::PeerReceivers;
         let mut control_receivers: std::collections::HashMap<
             String,
-            tokio::sync::mpsc::Receiver<Vec<u8>>,
+            crate::communication::cluster_transport::PeerChannelReceiver,
         > = std::collections::HashMap::new();
         let dedicated_session: Option<Arc<TransportSession>>;
         // Shared mode: the token of this spawn's registrations.
@@ -2787,7 +2840,7 @@ impl RuntimeHandle {
                     }
                 }
 
-                let (session, mut raw_receivers) = TransportSession::new(
+                let (session, raw_receivers) = TransportSession::new(
                     dataflow_id,
                     connections,
                     &data_regs,
@@ -2799,6 +2852,8 @@ impl RuntimeHandle {
                 peer_io_events = session.take_io_events();
                 let session = Arc::new(session);
                 transport = Arc::new(ClusterTransport::Dedicated(Arc::clone(&session)));
+                let mut raw_receivers =
+                    crate::communication::cluster_transport::peer_receivers(raw_receivers);
 
                 // Extract control receivers.
                 for (peer_id, peer_map) in raw_receivers.iter_mut() {
@@ -2933,11 +2988,13 @@ impl RuntimeHandle {
                     }
                 };
 
-                let mut raw_receivers = session.take_receivers().ok_or_else(|| {
+                let raw_receivers = session.take_receivers().ok_or_else(|| {
                     Error::Runtime(RuntimeError::AlreadyConsumed {
                         resource: "receivers".into(),
                     })
                 })?;
+                let mut raw_receivers =
+                    crate::communication::cluster_transport::peer_receivers(raw_receivers);
                 peer_io_events = session.take_io_events();
 
                 transport = Arc::new(ClusterTransport::Shared {
@@ -3033,10 +3090,8 @@ impl RuntimeHandle {
                 crate::progress::trace::describe_exchanges(dataflow_id, [(edge_order, edge_idx)]);
             }
             // Extract receivers for this specific exchange edge from the shared map.
-            let mut edge_receivers: std::collections::HashMap<
-                String,
-                std::collections::HashMap<u64, tokio::sync::mpsc::Receiver<Vec<u8>>>,
-            > = std::collections::HashMap::new();
+            let mut edge_receivers: crate::communication::cluster_transport::PeerReceivers =
+                std::collections::HashMap::new();
             for node in &topology.nodes {
                 if node.node_id == local_node_id {
                     continue;
@@ -3413,6 +3468,9 @@ impl RuntimeHandle {
             .map(|n| n.node_id.clone())
             .filter(|id| id != local_node_id)
             .collect();
+        // Leave reports from now on concern this run, even if the node
+        // rejoins before its teardown.
+        let departure_mark = self.peer_registry.departure_mark();
         let peer_reg_id = if !remote_peer_ids.is_empty() {
             let worker_tokens: Vec<CancellationToken> =
                 workers.iter().map(|w| w.cancel.clone()).collect();
@@ -3473,6 +3531,7 @@ impl RuntimeHandle {
                 dispatcher: Some(dispatcher),
                 peer_registry: Arc::clone(&self.peer_registry),
                 peer_registration: peer_reg_id,
+                departure_mark,
                 shared_managers: shared_managers_arc,
                 shared_registration,
                 transport,
@@ -5491,17 +5550,21 @@ impl<T: Timestamp> ClusterCompletion<T> {
                     .wait(),
             };
             teardown.wait();
-            merge_data_loss(result, teardown.data_loss())
+            merge_data_loss(result, teardown)
         })?
     }
 }
 
 /// Records lost on the way to this node fail an otherwise successful run;
-/// they also explain a cancellation they caused.
+/// they also explain a cancellation they caused. A loss held for workers
+/// whose results came after teardown fails only a successful run.
 #[cfg(feature = "transport")]
-fn merge_data_loss(result: Result<()>, loss: Option<cluster_lifecycle::DataLoss>) -> Result<()> {
-    match (result, loss) {
+fn merge_data_loss(result: Result<()>, teardown: &cluster_lifecycle::TeardownWaiter) -> Result<()> {
+    match (result, teardown.data_loss()) {
         (Ok(()), Some(loss)) | (Err(Error::Cancelled { .. }), Some(loss)) => Err(loss.into_error()),
+        (Ok(()), None) => teardown
+            .loss_if_ok()
+            .map_or(Ok(()), |loss| Err(loss.into_error())),
         (result, _) => result,
     }
 }
@@ -5531,7 +5594,7 @@ impl<T: Timestamp> Future for ClusterCompletion<T> {
         }
         match this.teardown.poll_done(cx) {
             Poll::Ready(()) => match this.result.take() {
-                Some(result) => Poll::Ready(merge_data_loss(result, this.teardown.data_loss())),
+                Some(result) => Poll::Ready(merge_data_loss(result, &this.teardown)),
                 None => Poll::Ready(Err(Error::Runtime(RuntimeError::AlreadyConsumed {
                     resource: "cluster completion".into(),
                 }))),

@@ -3,8 +3,11 @@
 //! A [`SharedPeerManager`](super::shared_transport::SharedPeerManager)
 //! periodically sends a probe on each pooled connection; the peer echoes it
 //! back, and the [`RttProber`] records the round-trip time in the
-//! connection's metrics. The measurements are diagnostics only: they never
-//! open, close or select connections.
+//! connection's metrics. The RTT measurements are diagnostics only: they never
+//! open, close or select connections. The probes themselves also keep each
+//! connection's bytes flowing, so that a connection that reads nothing for its
+//! silence timeout is known to have stopped delivering (see the
+//! [`shared_transport`](super::shared_transport) module documentation).
 //!
 //! # Probe Protocol
 //!

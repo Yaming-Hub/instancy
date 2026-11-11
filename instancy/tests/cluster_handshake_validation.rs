@@ -113,7 +113,6 @@ impl ConnectionFactory for PreEstablishedFactory {
 fn shared_config() -> SharedConnectionConfig {
     SharedConnectionConfig {
         connections: 1,
-        probe_interval: Duration::from_secs(3600),
         ..SharedConnectionConfig::default()
     }
 }
