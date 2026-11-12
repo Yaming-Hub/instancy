@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Cluster lifecycle, checked exhaustively
+
+- **Tests:** `runtime::cluster_lifecycle::exhaustive` drives the real
+  `LifecycleMachine` through every order in which its events can reach it,
+  for one peer, in twelve configurations (Shared mode on one connection or
+  two, Dedicated mode; one or two workers; one or two progress channels),
+  with a local cancellation, an abort from outside, workers that finish after
+  teardown and at most one fault. Termination and no data loss without a
+  failed send hold. Three properties do not: a failed send can be settled as
+  a failure too early, and a run can end `Ok` although a send had failed
+  before its workers succeeded. Each of these is pinned with its
+  counterexamples, so that a fix shows. The conformance job runs eight
+  configurations in release (`docs/testing/nextest.md`; design: §5.5.4 of
+  `docs/design/cluster.md`).
+
 ### SPSC wake
 
 - **Fixed: an SPSC consumer with a wake handle wakes a producer it unblocks.**

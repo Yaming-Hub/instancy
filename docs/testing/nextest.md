@@ -12,8 +12,8 @@ CI runs the unit and integration tests with
 | Model-checked tests (Loom) | See [Schedule tests](#schedule-tests-shuttle-and-loom) |
 | Multi-process harness | `cargo nextest run -p instancy-integration --profile ci --no-tests fail` (the job installs `protoc`, see below) |
 
-Doc tests, the full conformance matrix and the release flight-recorder check
-keep their own `cargo test` commands.
+Doc tests, the full conformance matrix, the release flight-recorder check and
+the exhaustive lifecycle check keep their own `cargo test` commands.
 
 ## The `ci` profile
 
@@ -83,6 +83,31 @@ RUSTFLAGS="-Dwarnings --cfg instancy_loom" \
   fails the test as a deadlock instead of waiting out a timeout.
 - A Shuttle failure prints the schedule that reproduces it (pass it to
   `shuttle::replay`).
+
+## The lifecycle machine, checked exhaustively
+
+`runtime::cluster_lifecycle::exhaustive` drives the cluster lifecycle machine
+through every order in which its events can reach it, for one peer (see
+`docs/design/cluster.md`, §5.5.4). Each configuration is a test: Shared mode
+on one connection or on two, or Dedicated mode; one or two local workers; one
+or two progress channels. A debug build is too slow for them, so they are
+ignored, and the conformance job runs eight of them in release, in a few
+minutes:
+
+```sh
+cargo test -p instancy --release --all-features --lib -- --include-ignored \
+  --nocapture --test-threads 2 cluster_lifecycle::exhaustive:: \
+  --skip dedicated_two_workers --skip shared_split_two_workers
+```
+
+To run the four largest too, by hand, drop the `--skip`s and run one test at
+a time (`--test-threads 1`): the largest, split Shared mode with two workers
+and two channels, visits 308 million states in about 9 minutes and needs
+about 23 GB. `--nocapture` prints, for each configuration, its counts and a
+shortest counterexample of every property it breaks. What each configuration
+breaks is pinned in `instancy/src/runtime/cluster_lifecycle/exhaustive.golden`;
+a test that finds anything else fails and prints the lines to put there
+instead.
 
 ## Differences from `cargo test`
 

@@ -185,6 +185,16 @@ jobs:
       # the other jobs.
       - name: Progress conformance matrix (full)
         run: cargo test -p instancy --all-features --test progress_conformance -- --ignored --exact --test-threads=1 full_conformance_matrix
+      # Every order in which the lifecycle machine's events can reach it
+      # (runtime::cluster_lifecycle::exhaustive), in release, where the eight
+      # configurations run here take a few minutes. Dedicated and split Shared
+      # mode with two workers are run by hand (docs/testing/nextest.md).
+      - name: Lifecycle machine, every order of events
+        run: |
+          cargo test -p instancy --release --all-features --lib -- \
+            --include-ignored --nocapture --test-threads 2 \
+            cluster_lifecycle::exhaustive:: \
+            --skip dedicated_two_workers --skip shared_split_two_workers
       - name: Upload progress traces
         if: always()
         uses: actions/upload-artifact@v4
