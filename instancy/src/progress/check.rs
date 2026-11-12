@@ -658,26 +658,50 @@ fn finished_stats() -> MutexGuard<'static, std::collections::VecDeque<OracleStat
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// Oracles created and not yet in [`finished_stats`]: an oracle being
+/// dropped (on a worker thread, say) can no longer be upgraded from the
+/// registry, and is not finished until its drop has drained it.
+fn unfinished() -> MutexGuard<'static, std::collections::BTreeSet<u64>> {
+    static UNFINISHED: OnceLock<Mutex<std::collections::BTreeSet<u64>>> = OnceLock::new();
+    UNFINISHED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Statistics of every oracle created at or after `mark`, live or finished.
+/// An oracle being dropped meanwhile is waited for.
 pub fn oracles_since(mark: u64) -> Vec<OracleStats> {
-    let _settled = settle();
-    let mut stats: Vec<OracleStats> = finished_stats()
-        .iter()
-        .filter(|s| s.seq >= mark)
-        .cloned()
-        .collect();
-    let live: Vec<Arc<dyn Sink>> = registry()
-        .values()
-        .filter_map(|w| w.sink.upgrade())
-        .collect();
-    for sink in live {
-        let s = sink.stats();
-        if s.seq >= mark && !stats.iter().any(|f| f.seq == s.seq) {
-            stats.push(s);
+    loop {
+        // Read before the finished list: an oracle leaves this set only
+        // after it is in that list.
+        let unfinished: Vec<u64> = unfinished().range(mark..).copied().collect();
+        let settled = settle();
+        let mut stats: Vec<OracleStats> = finished_stats()
+            .iter()
+            .filter(|s| s.seq >= mark)
+            .cloned()
+            .collect();
+        // Every oracle is watched, including one kept apart from the
+        // registry (same id, different shape).
+        let live: Vec<Arc<dyn Sink>> = live().iter().filter_map(|(_, w)| w.upgrade()).collect();
+        for sink in live {
+            let s = sink.stats();
+            if s.seq >= mark && !stats.iter().any(|f| f.seq == s.seq) {
+                stats.push(s);
+            }
         }
+        if unfinished
+            .iter()
+            .all(|seq| stats.iter().any(|s| s.seq == *seq))
+        {
+            stats.sort_by_key(|s| s.seq);
+            return stats;
+        }
+        // Being dropped: let its drop finish (it may need the pass).
+        drop(settled);
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    stats.sort_by_key(|s| s.seq);
-    stats
 }
 
 // ---------------------------------------------------------------------------
@@ -1438,6 +1462,7 @@ impl<T: Timestamp> Oracle<T> {
             total_workers,
             ..OracleStats::default()
         };
+        unfinished().insert(stats.seq);
         Self {
             id,
             total_workers,
@@ -2266,15 +2291,26 @@ impl<T: Timestamp> Sink for Oracle<T> {
 
 impl<T: Timestamp> Drop for Oracle<T> {
     fn drop(&mut self) {
-        if !std::thread::panicking() {
-            self.drain();
-        }
+        // Finished even if applying the queue panics (a violation in panic
+        // mode): `oracles_since` waits for every unfinished oracle.
+        let drained = if std::thread::panicking() {
+            Ok(())
+        } else {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.drain()))
+        };
         let stats = self.lock().stats.clone();
-        let mut finished = finished_stats();
-        if finished.len() >= LOG_CAPACITY {
-            finished.pop_front();
+        let seq = stats.seq;
+        {
+            let mut finished = finished_stats();
+            if finished.len() >= LOG_CAPACITY {
+                finished.pop_front();
+            }
+            finished.push_back(stats);
         }
-        finished.push_back(stats);
+        unfinished().remove(&seq);
+        if let Err(panic) = drained {
+            std::panic::resume_unwind(panic);
+        }
     }
 }
 
@@ -3056,25 +3092,33 @@ mod tests {
         (v.check, v.kind, v.worker, v.location.as_deref())
     }
 
-    /// Set in the child process that runs `panic_mode_panics_on_sealed_work`.
+    /// Set in a child process that runs one test in panic mode (see
+    /// [`run_in_panic_mode`]).
     const PANIC_CHILD: &str = "INSTANCY_CHECK_TEST_PANIC_CHILD";
-    const PANIC_TEST: &str = "progress::check::tests::panic_mode_panics_on_sealed_work";
 
     /// In panic mode a violation panics the thread whose hook finds it, once
     /// it is recorded: here worker 1 sealing while it holds work (V4).
     /// Worker 0 sealing first is no finding: that work is not its own.
     #[test]
     fn panic_mode_panics_on_sealed_work() {
+        run_in_panic_mode(
+            "progress::check::tests::panic_mode_panics_on_sealed_work",
+            sealing_with_work_held_panics,
+        );
+    }
+
+    /// Run `test` (this test's full name) alone in a child in panic mode,
+    /// where it runs `body`: `set_mode` is process-global and plain
+    /// `cargo test` runs tests on threads.
+    fn run_in_panic_mode(test: &str, body: fn()) {
         if std::env::var_os(PANIC_CHILD).is_some() {
-            sealing_with_work_held_panics();
+            body();
             println!("{PANIC_CHILD}: every assertion passed");
             return;
         }
-        // `set_mode` is process-global and plain `cargo test` runs tests on
-        // threads, so this test runs itself alone in a child in panic mode.
         use std::io::Read;
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", PANIC_TEST, "--nocapture", "--test-threads=1"])
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
             .env(PANIC_CHILD, "1")
             .env("INSTANCY_PROGRESS_CHECK", "panic")
             .stdout(std::process::Stdio::piped())
@@ -3179,6 +3223,92 @@ mod tests {
                 .contains("1 unit(s) of OutputSession at (1, 0)@0"),
             "{}",
             found[0].detail
+        );
+    }
+
+    /// An oracle whose last reference is being dropped can no longer be
+    /// upgraded, and is not finished until its drop has applied its queue:
+    /// `oracles_since` waits for it, then lists it once. An oracle that is
+    /// never watched looks the same to it, for as long as the test holds it.
+    #[test]
+    fn oracles_since_waits_for_an_oracle_being_dropped() {
+        let mark = mark();
+        let oracle = Oracle::<u64>::new(None, 1);
+        let seq = oracle.lock().stats.seq;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _ = tx.send(oracles_since(mark));
+        });
+        let early = rx.recv_timeout(std::time::Duration::from_millis(100));
+        assert!(
+            matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "returned before the oracle was finished: {early:?}"
+        );
+        drop(oracle);
+        // A liveness bound only.
+        let oracles = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("oracles_since returns once the oracle is finished");
+        assert_eq!(
+            oracles.iter().filter(|s| s.seq == seq).count(),
+            1,
+            "{oracles:?}"
+        );
+        reader.join().expect("the reader");
+    }
+
+    /// An oracle whose drop panics, on a violation it applies in panic mode,
+    /// is finished all the same: `oracles_since` lists it rather than wait
+    /// for it forever.
+    #[test]
+    fn an_oracle_whose_drop_panics_is_finished() {
+        run_in_panic_mode(
+            "progress::check::tests::an_oracle_whose_drop_panics_is_finished",
+            a_drop_that_panics_finishes_its_oracle,
+        );
+    }
+
+    /// The body of `an_oracle_whose_drop_panics_is_finished`, in its child.
+    fn a_drop_that_panics_finishes_its_oracle() {
+        assert_eq!(mode(), Mode::Panic, "the child checks in panic mode");
+        let mark = mark();
+        // Never watched: only its drop applies its queue.
+        let oracle = Oracle::<u64>::new(None, 1);
+        oracle.register_worker(0);
+        let seq = oracle.lock().stats.seq;
+        // Queued as in report mode, and left for the drop: a record leaving
+        // a store it never entered.
+        oracle.queue.lock().unwrap().push(Event::Count {
+            store: Store::Channel,
+            loc: (2, 0),
+            owner: None,
+            time: 0,
+            diff: -1,
+            worker: 0,
+        });
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(oracle)));
+        let payload = dropped.expect_err("the drop panics on the violation");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            message.starts_with("instancy progress check failed: [V7 negative-occupancy"),
+            "{message}"
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(oracles_since(mark));
+        });
+        // A liveness bound only.
+        let oracles = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("oracles_since returns: the oracle is finished");
+        assert_eq!(
+            oracles.iter().filter(|s| s.seq == seq).count(),
+            1,
+            "{oracles:?}"
         );
     }
 
