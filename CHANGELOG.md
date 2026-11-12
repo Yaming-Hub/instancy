@@ -27,6 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Test suite, docs and small fixes
 
+- **Fixed: `progress::check::oracles_since` no longer misses an oracle
+  being dropped.** An oracle whose last reference was dropped on a worker
+  thread while the call ran was in neither the live nor the finished list,
+  so a test could intermittently see no oracle for a dataflow that was
+  checked (`progress_conformance`'s
+  `staged_and_simple_workers_have_one_global_view_each`). The call now
+  waits for such an oracle to finish. An oracle whose drop panics (on a
+  violation it applies in panic mode) is finished all the same, so the call
+  never waits for it forever.
 - **Fixed: a `unary_async` operator whose Tokio runtime shuts down fails its
   dataflow.** The operator runs its tasks on the Tokio runtime that is
   current when `unary_async` is called. If that runtime shut down before or
