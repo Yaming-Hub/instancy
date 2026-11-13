@@ -596,20 +596,29 @@ connection is corrupt traffic, reported at once.
 #### 5.5.4 The coordinator, checked exhaustively
 
 `runtime::cluster_lifecycle::exhaustive` (a test module) drives the real
-`LifecycleMachine` through every order in which its events can reach it, for
-one peer, within small bounds. Only the environment is written by hand: the
-producers that feed the coordinator's event channel and how they interleave
-(the io forwarder, the control dispatcher, the progress bridges, the outbox
-forwarder and the workers), today's driver glue in `ClusterLifecycle::run`
-(kept in one module, `driver`), the transport in each mode (Shared with our
-lane and the peer's frames on one connection or on two, Dedicated; in both, a
+`LifecycleMachine`, with a copy of the decisions `ClusterLifecycle` makes
+around it, through every order in which its events can reach it, for one
+peer, within small bounds. Written by hand: the producers that feed the
+coordinator's event channel and how they interleave (the io forwarder, the
+control dispatcher, the progress bridges, the data bridge, the outbox
+forwarder and the workers), the driver's scheduling around its decisions
+(its biased `select!`, its awaits, its grace timer, teardown's phases), a copy
+of its decisions (`glue`), the transport in each mode (Shared with our lane
+and the peer's frames on one connection or on two, Dedicated; in both, a
 `Cancel` can overtake lane frames queued before it, and only the one frame
 the transport was already taking can overtake a `Cancel` queued before it,
 either way), the peer and our workers. Every configuration includes a local
 cancellation (a requested stop or a failure), the bridges cancelled from
-outside, workers that finish after teardown, and at most one fault (a write
-error or a reset). States are deduplicated exactly, and the search is breadth
-first, so every finding comes with a shortest trace.
+outside, workers that finish after teardown, and at most one fault: a write
+error or a reset (transport faults), or records lost on their way in and
+corrupt frames (inbound faults). The dataflow token holds its reasons as
+values, and it can change between any two of the coordinator's reads of it.
+The driver awaits its `Cancel` broadcasts while the environment moves, its
+`select!` can take an expired grace deadline with an event queued since it
+found none, and teardown lets the inbound bridges drain (when every worker
+is done) and waits for them for a bound, then applies the lost records and
+corrupt traffic it finds queued. States are deduplicated exactly, and the
+search is breadth first, so every finding comes with a shortest trace.
 
 The properties:
 
@@ -617,20 +626,24 @@ The properties:
    state is a dead end: the machine has finished, or something is bound to
    happen (faults, cancellations, the abort and the peer's goodbye, ack and
    `Cancel` may never happen).
-2. *NoLossWithoutFailedSend*: a run reports a data loss only if a send to
-   the peer failed.
+2. *NoLossWithoutCause*: a run reports a data loss only if a send to the
+   peer failed, records addressed to us were lost on their way in, or
+   corrupt traffic reached us.
 3. *NoFalseSettle*: a failed send is never settled as a failure while the
    peer's `Cancel`, goodbye or ack is still on its way to the coordinator,
-   nor by the grace period once the peer has said goodbye and the link has
-   closed fully.
+   nor by the grace period with one already queued, or once the peer has
+   said goodbye and the link has closed fully.
 4. *NoOkAfterFailedSend*: a run whose send had already failed when its
    workers succeeded (when the last one reported its success) ends `Ok` only
    if the peer retired the link or cancelled.
 5. *NoOkOverKnownLoss*: a run whose records never reached the peer ends `Ok`
    only if the peer cancelled, provided our side had already seen the
    connection that carries them fail when the workers succeeded.
+6. *NoOkOverInboundLoss*: a run never ends `Ok` if records addressed to us
+   were lost on their way in, or corrupt traffic reached us, before teardown
+   began.
 
-(1) and (2) hold in every configuration. (3) to (5) do not:
+(1) and (2) hold in every configuration. (3) to (6) do not:
 
 - (3), Shared: after a send fails, the peer's end-of-stream can be applied
   after its `ControlClosed`; nothing settles the send then (only
@@ -640,25 +653,34 @@ The properties:
   goodbye is a second `SendFailed`, which settles the first at once as a loss
   although the peer's `Cancel` is on its way. The grace period also holds a
   loss after the peer's goodbye, as in Shared mode.
+- (3), split Shared and Dedicated: `select!` finds no event, the peer's
+  `Cancel` is queued next, and it still takes the expired grace deadline,
+  which settles the failed send as a link failure with the `Cancel` waiting.
 - (4) and (5): a write fails before the last worker succeeds, but its
   `SendFailed` is applied after that success. Draining takes it for the
   failure of our goodbye, marks the link lost and ends `Ok`, although the
   records queued before it never reached the peer.
+- (6): teardown waits for the inbound data bridges only for a bound, and a
+  bridge that reports later is not heard; it cancels the progress bridges
+  first, and they never read a corrupt frame already queued for them; and
+  when the bridges are cancelled from outside before every worker has
+  finished, a loss held during a cancellation is dropped, and lost records
+  queued for teardown are ignored, so a worker's later success ends `Ok`.
 
-These are pinned (`KNOWN_FAILURES`, and `exhaustive.golden` for each
-configuration: the number of violations, of their distinct environment
-states, a digest of that set, and a shortest trace), so any change to them
-fails the check until the pins are updated. Not covered: several peers,
-corruption and lost inbound records, a write reported failed although its
-frame went out whole (a stream whose flush fails after sending everything;
-TCP's flush does nothing), a `Cancel` the peer sends after unregistering the
-dataflow in split Shared mode (it may take another connection), data pushes,
-the peer's own machine, a peer that never goes away, and two interleavings
-of today's driver (an expired grace deadline taken although an event arrived
-during the same `select!`, and the environment moving while the driver
-awaits an action). See the module's documentation for the details, and
-`docs/testing/nextest.md` for how to run it.
-
+These are pinned (`KNOWN_FAILURES`, and a pin file for each configuration:
+for each property the number of violations, the set of their identities,
+the environment's side of each violating state, and a shortest trace), so
+any change to them fails the check until the pins are updated, and a fix
+shows as identities removed and none added. Not covered: several peers, a
+data channel that ends without its close sentinel, an oversize frame, an
+encoding failure, a corrupt control message or corrupt framing, a write
+reported failed although its frame went out whole (a stream whose flush
+fails after sending everything; TCP's flush does nothing), a `Cancel`
+broadcast that times out (a stalled connection; the driver then counts it as
+sent), a `Cancel` the peer sends after unregistering the dataflow in split
+Shared mode (it may take another connection), data pushes, the peer's own
+machine and a peer that never goes away. See the module's documentation for
+the details, and `docs/testing/nextest.md` for how to run it.
 ### 12.5 Dynamic Cluster Scaling
 
 > **Status: Implemented.** The `ClusterMembership` trait and `ChannelMembership` convenience type are available in the `execute` module. Membership is attached to `ClusterTopology` and passed via `RuntimeConfig` at construction time. The runtime auto-starts a background listener that processes membership events to update the live topology, cancel affected dataflows, and make new nodes available. Mid-dataflow repartitioning (worker rebalancing) is not supported — existing dataflows keep their original topology.

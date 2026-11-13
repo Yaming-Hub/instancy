@@ -1,0 +1,3 @@
+# Written by the lifecycle check (INSTANCY_EXHAUSTIVE_PIN=1): collapsed in GitHub's
+# diffs. Git's own diffs and stats are unaffected.
+instancy/src/runtime/cluster_lifecycle/exhaustive/*.pins linguist-generated=true

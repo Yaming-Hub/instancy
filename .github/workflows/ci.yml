@@ -190,16 +190,6 @@ jobs:
       # the other jobs.
       - name: Progress conformance matrix (full)
         run: cargo test -p instancy --all-features --test progress_conformance -- --ignored --exact --test-threads=1 full_conformance_matrix
-      # Every order in which the lifecycle machine's events can reach it
-      # (runtime::cluster_lifecycle::exhaustive), in release, where the eight
-      # configurations run here take a few minutes. Dedicated and split Shared
-      # mode with two workers are run by hand (docs/testing/nextest.md).
-      - name: Lifecycle machine, every order of events
-        run: |
-          cargo test -p instancy --release --all-features --lib -- \
-            --include-ignored --nocapture --test-threads 2 \
-            cluster_lifecycle::exhaustive:: \
-            --skip dedicated_two_workers --skip shared_split_two_workers
       - name: Upload progress traces
         if: always()
         uses: actions/upload-artifact@v4
@@ -208,3 +198,83 @@ jobs:
           path: ${{ github.workspace }}/trace-dumps
           if-no-files-found: ignore
           retention-days: 14
+
+  # Every order in which the lifecycle coordinator's events can reach it
+  # (runtime::cluster_lifecycle::exhaustive), in release: eleven
+  # configurations, in two parts that run at the same time. A part runs two
+  # lanes at once, and a lane runs its configurations one after another, each
+  # in its own process, so that the log shows each one's time and peak memory.
+  # The lanes are balanced by time, and the largest configurations of a
+  # part's two lanes need about 10 GB together, of the runner's 16. The others
+  # are run by hand (docs/testing/nextest.md).
+  lifecycle:
+    name: Lifecycle coordinator, every order of events (${{ matrix.part }} of 2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2]
+    defaults:
+      run:
+        shell: bash
+    env:
+      PART: ${{ matrix.part }}
+      LANE_1A: shared_two_workers_two_channels shared_one_worker_two_channels
+      LANE_1B: >-
+        dedicated_one_worker_two_channels dedicated_one_worker_one_channel_inbound
+        shared_one_worker_one_channel
+      LANE_2A: >-
+        shared_split_one_worker_two_channels shared_two_workers_one_channel
+        dedicated_one_worker_one_channel
+      LANE_2B: >-
+        shared_split_one_worker_one_channel_inbound
+        shared_split_one_worker_one_channel shared_one_worker_one_channel_inbound
+      BY_HAND: >-
+        shared_one_worker_two_channels_inbound shared_two_workers_one_channel_inbound
+        shared_split_two_workers_one_channel shared_split_two_workers_two_channels
+        shared_split_one_worker_two_channels_inbound
+        shared_split_two_workers_one_channel_inbound
+        dedicated_two_workers_one_channel dedicated_two_workers_two_channels
+        dedicated_one_worker_two_channels_inbound
+        dedicated_two_workers_one_channel_inbound
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (release)
+        run: |
+          cargo test -p instancy --release --all-features --lib --no-run \
+            --message-format json-render-diagnostics \
+            | jq -r 'select(.executable != null and .target.kind == ["lib"]) | "TESTS=" + .executable' \
+            >> "$GITHUB_ENV"
+      # A configuration added to the check goes in a lane, or in BY_HAND.
+      - name: Every configuration in one lane, or run by hand
+        run: |
+          # Listed first: a failure inside diff's <(...) would go unnoticed.
+          listed=$("$TESTS" --list --ignored cluster_lifecycle::exhaustive:: \
+            | sed -n 's/^runtime::cluster_lifecycle::exhaustive::\(.*\): test$/\1/p' | sort)
+          diff <(printf '%s\n' $LANE_1A $LANE_1B $LANE_2A $LANE_2B $BY_HAND | sort) \
+            <(printf '%s\n' "$listed")
+      - name: Every order of events
+        run: |
+          lane() {
+            local status=0 config
+            for config in "$@"; do
+              if ! /usr/bin/time -f "%e s, at most %M KB resident" "$TESTS" \
+                --include-ignored --nocapture --exact \
+                "runtime::cluster_lifecycle::exhaustive::$config" 2>&1 \
+                | sed -u "s/^/$config: /"; then
+                status=1
+              fi
+            done
+            return "$status"
+          }
+          first=LANE_${PART}A second=LANE_${PART}B
+          lane ${!first} & a=$!
+          lane ${!second} & b=$!
+          status=0
+          wait "$a" || status=1
+          wait "$b" || status=1
+          exit "$status"
