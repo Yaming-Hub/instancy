@@ -1,0 +1,9 @@
+# The Rust toolchain for this repository, in CI and locally (rustup installs
+# it on first use). CI denies warnings, and a new release can bring new lints,
+# so moving to one is a change of its own: bump the version here and fix what
+# the new release reports.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+# rust-src is for rust-analyzer.
+components = ["clippy", "rustfmt", "rust-src"]
