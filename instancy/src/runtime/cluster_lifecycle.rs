@@ -3563,6 +3563,190 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A real coordinator on a node whose only peer is `node-b`, for
+    /// `machine`, for teardown with controlled timing: the caller posts its
+    /// events (the sender), registers its inbound bridges, and watches the
+    /// bridges' cancellation. Its flight recorder dumps to `dir`.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn teardown_rig(
+        machine: LifecycleMachine,
+        dir: &std::path::Path,
+    ) -> (
+        ClusterLifecycle,
+        tokio_mpsc::UnboundedSender<LifecycleEvent>,
+        InboundBridges,
+        tokio_util::sync::CancellationToken,
+        TeardownWaiter,
+    ) {
+        let id = DataflowId::new();
+        let ring = crate::progress::trace::recorder_for_test(id, "node-a", None, "node-b", 2, dir);
+        let (mut lifecycle, _node_b, waiter) =
+            coordinator(id, machine, "node-b", Vec::new(), &ring);
+        let (events, rx) = tokio_mpsc::unbounded_channel();
+        lifecycle.events = rx;
+        lifecycle.inbound = InboundBridges::default();
+        let bridges = lifecycle.inbound.clone();
+        let bridge_cancel = lifecycle.bridge_cancel.clone();
+        (lifecycle, events, bridges, bridge_cancel, waiter)
+    }
+
+    /// A machine whose only worker succeeded: draining, its goodbye sent to
+    /// `node-b`, whose ack retires the link and tears down (gracefully, the
+    /// worker done, so teardown lets the inbound bridges drain).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn drained_machine() -> LifecycleMachine {
+        let (mut m, _) = machine(1, &[("node-b", 1)]);
+        let _ = m.on_event(done(true));
+        assert_eq!(m.phase(), Phase::Draining);
+        m
+    }
+
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn temp_dir(what: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("instancy-{what}-{}", DataflowId::new().as_uuid()))
+    }
+
+    /// Teardown cancels the bridges, then lets the inbound bridges drain and
+    /// waits for them (bounded): a loss one reports meanwhile is applied,
+    /// and the completion reports it. `exhaustive` models teardown so: a
+    /// report queued before its bounded waits are over counts.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[tokio::test(start_paused = true)]
+    async fn teardown_applies_a_loss_reported_while_it_waits_for_the_bridges() {
+        let dir = temp_dir("teardown-wait");
+        let (lifecycle, events, bridges, bridge_cancel, waiter) =
+            teardown_rig(drained_machine(), &dir);
+        let bridge = bridges.register();
+        let drain = bridges.drain_token();
+        events
+            .send(link_event("node-b", LinkEvent::AckReceived))
+            .unwrap();
+        let coordinator = tokio::spawn(lifecycle.run());
+        drain.cancelled().await;
+        assert!(
+            bridge_cancel.is_cancelled(),
+            "the bridges are cancelled before teardown waits"
+        );
+        events.send(lost("node-b")).unwrap();
+        drop(bridge);
+        tokio::time::timeout(Duration::from_secs(60), coordinator)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            waiter.data_loss().map(|loss| loss.detail),
+            Some("channel 7: late".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Teardown waits for the inbound bridges only for a bound: it applies
+    /// what is queued when that wait is over (its last `try_recv` loop is
+    /// the cut), so a bridge that reports later is not heard, and the result
+    /// is `Ok`. Today's behaviour, as `exhaustive` models it: a known failure
+    /// there (NoOkOverInboundLoss).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[tokio::test(start_paused = true)]
+    async fn teardown_does_not_hear_a_loss_reported_after_its_bounded_wait() {
+        let dir = temp_dir("teardown-bound");
+        let (lifecycle, events, bridges, _, waiter) = teardown_rig(drained_machine(), &dir);
+        let bound = lifecycle.cancel_broadcast_timeout;
+        let bridge = bridges.register();
+        events
+            .send(link_event("node-b", LinkEvent::AckReceived))
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(60), lifecycle.run())
+            .await
+            .unwrap();
+        // It waited for the bridge, as long as the bound and no longer (the
+        // flush before it took no time).
+        assert_eq!(started.elapsed(), bound);
+        assert!(waiter.data_loss().is_none());
+        assert!(
+            events.send(lost("node-b")).is_err(),
+            "nobody hears a report once teardown is done"
+        );
+        drop(bridge);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cut is teardown's last drain of the events, not the deadline of
+    /// its wait: a loss queued once the deadline has passed, but before
+    /// teardown runs again, is heard. The driver is polled by hand into its
+    /// wait for the bridge; the clock then passes the deadline, the loss is
+    /// queued, and the driver resumes.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[tokio::test(start_paused = true)]
+    async fn teardown_hears_a_loss_queued_after_its_deadline_but_before_it_drains() {
+        let dir = temp_dir("teardown-cut");
+        let (mut lifecycle, events, bridges, _, waiter) = teardown_rig(drained_machine(), &dir);
+        // Nothing to flush: teardown goes straight to its wait for the bridge.
+        lifecycle.forwarders.clear();
+        let bound = lifecycle.cancel_broadcast_timeout;
+        let bridge = bridges.register();
+        let drain = bridges.drain_token();
+        events
+            .send(link_event("node-b", LinkEvent::AckReceived))
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let mut run = std::pin::pin!(lifecycle.run());
+        let polled = std::future::poll_fn(|cx| Poll::Ready(run.as_mut().poll(cx))).await;
+        assert!(
+            polled.is_pending() && drain.is_cancelled(),
+            "teardown waits for the bridge"
+        );
+        tokio::time::advance(bound + Duration::from_millis(1)).await;
+        events
+            .send(lost("node-b"))
+            .expect("teardown has not drained its events yet");
+        run.await;
+        assert!(started.elapsed() > bound);
+        assert_eq!(
+            waiter.data_loss().map(|loss| loss.detail),
+            Some("channel 7: late".to_string())
+        );
+        drop(bridge);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Teardown that begins before every worker has finished (the bridges
+    /// were cancelled from outside while they ran) does not drain the
+    /// inbound bridges: of what it finds queued it applies corrupt traffic,
+    /// and ignores lost records.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[tokio::test(start_paused = true)]
+    async fn teardown_with_a_worker_running_applies_corruption_but_not_lost_records() {
+        for corrupt in [false, true] {
+            let dir = temp_dir("teardown-running");
+            let (m, _) = machine(1, &[("node-b", 1)]);
+            let (lifecycle, events, _, bridge_cancel, waiter) = teardown_rig(m, &dir);
+            bridge_cancel.cancel();
+            events.send(lost("node-b")).unwrap();
+            if corrupt {
+                events
+                    .send(link_event(
+                        "node-b",
+                        LinkEvent::ProgressChannelEnded(LinkFailure::Decode("bad crc".into())),
+                    ))
+                    .unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(60), lifecycle.run())
+                .await
+                .unwrap();
+            let detail = waiter.data_loss().map(|loss| loss.detail);
+            if corrupt {
+                assert_eq!(
+                    detail.as_deref(),
+                    Some("corrupt traffic from the peer: undecodable frame: bad crc")
+                );
+            } else {
+                assert_eq!(detail, None);
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     #[test]
     fn peer_closing_without_goodbye_or_ack_is_lost_after_all_channels_close() {
         let (mut m, links) = machine(1, &[("b", 2)]);

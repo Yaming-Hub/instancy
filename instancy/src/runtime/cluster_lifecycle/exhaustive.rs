@@ -1,25 +1,33 @@
-//! The lifecycle machine checked exhaustively: the real [`LifecycleMachine`]
-//! driven through every order in which its events can reach it, for one
-//! peer, within small bounds.
+//! The lifecycle coordinator checked exhaustively: the real
+//! [`LifecycleMachine`], with today's driver glue around it, driven through
+//! every order in which events can reach it, for one peer, within small
+//! bounds.
 //!
-//! Only the machine's environment is written here, never one of its
-//! decisions: the producers that feed the coordinator's event channel and how
-//! their sends interleave, today's driver glue around the machine (the
-//! [`driver`] module), the transport in each mode, the peer and our workers.
-//! Every state reachable from the start is visited once, breadth first. A
-//! state is deduplicated on an exact copy of it (every field of the machine
-//! included, see [`Key`]), so nothing is pruned by a hash collision, and
-//! whatever is found comes with a shortest trace that leads to it.
+//! Only the machine's environment is written here, and a copy of the
+//! driver's decisions: the producers that feed the coordinator's event
+//! channel and how their sends interleave, the driver's scheduling around its
+//! decisions (the [`driver`] module: its biased `select!`, its awaits, its
+//! timers and teardown's phases), the driver's decisions themselves (the
+//! [`glue`] module, copied from `ClusterLifecycle` and called through the
+//! [`Decide`] interface), the transport in each mode, the peer and our
+//! workers. Every state reachable from the start is visited once, breadth
+//! first. A state is deduplicated on an exact copy of it (every field of the
+//! machine included, see [`Key`]), so nothing is pruned by a hash collision,
+//! and whatever is found comes with a shortest trace that leads to it.
 //!
 //! # Properties
 //!
 //! 1. **Termination**: once the peer has gone, the machine always finishes.
-//! 2. **NoLossWithoutFailedSend**: a run reports a data loss only if a send
-//!    to the peer failed (the transport failed our writer or lane).
+//! 2. **NoLossWithoutCause**: a run reports a data loss only if a send to the
+//!    peer failed (the transport failed our writer or lane), records
+//!    addressed to us were lost on their way in, or corrupt traffic reached
+//!    us.
 //! 3. **NoFalseSettle**: a failed send is never settled as a failure (a link
-//!    failure, or a loss recorded or held) while the peer's `Cancel`, goodbye
-//!    or ack is still on its way to the coordinator, nor by the grace period
-//!    once the peer has said goodbye and the link has closed fully.
+//!    failure, or the loss of its frames recorded or held) while the peer's
+//!    `Cancel`, goodbye or ack is still on its way to the coordinator; nor by
+//!    the grace period with one already queued for the coordinator, or once
+//!    the peer has said goodbye and the link has closed fully. Corrupt
+//!    traffic, and another loss, are failures of their own.
 //! 4. **NoOkAfterFailedSend**: a run whose send had already failed when its
 //!    workers succeeded ends `Ok` only if the peer retired the link or
 //!    cancelled.
@@ -27,6 +35,9 @@
 //!    `Ok` only if the peer cancelled, provided our side had already seen the
 //!    connection that carries them fail (a write error, or a failed read)
 //!    when the workers succeeded.
+//! 6. **NoOkOverInboundLoss**: a run never ends `Ok` if records addressed to
+//!    us were lost on their way in (they reached an operator that had
+//!    finished), or corrupt traffic reached us, before teardown began.
 //!
 //! Termination is checked as the absence of dead ends: states where the
 //! machine has not finished and nothing more is bound to happen
@@ -40,10 +51,11 @@
 //! frames and the grace timer by the machine's one-way decisions, never by
 //! the timer's own expiry). A step that changes nothing fails the check.
 //!
-//! A run ends once the machine has torn down and every worker has finished.
-//! Its result is what the completion makes of it (`merge_data_loss`): `Ok` if
-//! every worker succeeded and the machine recorded no data loss. For (2) a
-//! recorded loss counts whatever the workers' result. For (4) and (5):
+//! A run ends once teardown has published its result and every worker has
+//! finished. Its result is what the completion makes of it
+//! (`merge_data_loss`): `Ok` if every worker succeeded and teardown published
+//! no data loss. For (2) a recorded loss counts whatever the workers'
+//! result. For (4) and (5):
 //! - The workers succeeded when the last of them reported its success, not
 //!   when the machine applied it: a send that fails in between does not
 //!   count, so in every counterexample the failure came first, and the
@@ -57,20 +69,32 @@
 //!   carries both ways), so they never will. In a split wiring, a failure of
 //!   the connection the peer's frames arrive on says nothing about our
 //!   records.
-//! - After teardown only our workers move: a run is judged as one in which
-//!   nothing more happens on the network, as when the peer goes away at once
-//!   (which it may). What the peer did by then is all it did.
+//! - From teardown on, nothing more happens on the network: a run is judged
+//!   as one in which the peer goes away at once (which it may). What the
+//!   peer did by then is all it did, and what reached whom (the ghosts) is
+//!   all that is kept of the network, which is forgotten.
 //!
-//! (1) and (2) hold. (3) to (5) do not: [`KNOWN_FAILURES`] says why, one line
-//! each, and `exhaustive.golden` pins every way each configuration breaks
-//! them (see [`GOLDEN`]): how many violations, how many distinct identities
-//! (the environment's side of a violating state, [`World::identity`]), a
-//! digest of that set, and a shortest trace. Each test prints a shortest
-//! counterexample for every property it finds broken, and fails if what it
-//! finds and the list or the pins disagree, so a change to any counterexample
-//! has to update them. The identity leaves out the coordinator's channel and
-//! the driver's state, so it is coarser than a state: a pin can miss a new
-//! counterexample whose identity and count match an old one's.
+//! (1) and (2) hold. (3) to (6) do not: [`KNOWN_FAILURES`] says why, one line
+//! each, and each configuration's pin file (see [`PINS`]) lists every way it
+//! breaks them: how many violations, the set of their identities (the
+//! environment's side of a violating state, [`World::identity`]), and a
+//! shortest trace. Each test prints a shortest counterexample for every
+//! way it finds a property broken, and fails if what it finds and the list
+//! or the pins disagree: an identity that is not pinned is a new
+//! counterexample, so a fix has to show that it only removes identities.
+//! The identity leaves out the coordinator's channel and the driver's state,
+//! so it is coarser than a state: a new counterexample whose identity matches
+//! a pinned one goes unnoticed.
+//!
+//! # Configurations
+//!
+//! A configuration is a wiring, one or two local workers, one or two
+//! progress channels, and the family of faults it explores (at most one per
+//! run): transport faults (a local write error, or a reset), or inbound
+//! faults (records that reach an operator that had finished, a frame for
+//! one that does not decode, or a corrupt progress frame from the peer). A
+//! run never has a fault of each family, so splitting them over
+//! configurations loses nothing.
 //!
 //! The configurations with two local workers and one progress channel are
 //! abstract: the runtime gives each local worker a progress channel from each
@@ -78,6 +102,14 @@
 //! two local workers always get at least two. They exercise two worker
 //! results against a one-marker goodbye, at a fraction of the cost of the
 //! real two-worker configurations.
+//!
+//! The peer's second `Cancel` (see "The environment") is explored with one
+//! local worker only. What it can change is the token's escalation, which
+//! our broadcasts read (the last worker's result is what asks for
+//! `AnnounceUnfinished`; an earlier one only records its error, which one
+//! worker's failure records too), and the peer's stop, which only closes its
+//! progress lanes. A second worker multiplies its interleavings beyond what
+//! the largest configurations can hold.
 //!
 //! # The environment
 //!
@@ -89,17 +121,68 @@
 //!   - the control dispatcher: for each `Cancel`, the token escalated, then
 //!     the event, as two steps; then the channel's close;
 //!   - one progress bridge per channel: an end-of-stream or an ack, then the
-//!     channel's close, reported only when no end-of-stream came;
+//!     channel's close, reported only when no end-of-stream came; a frame
+//!     that does not decode ends the channel before its end-of-stream (the
+//!     bridge exits, and the transport drops what still comes for it), and is
+//!     reported once (and the bridge goes on) after it. Once the bridges are
+//!     cancelled (from outside, or by teardown) they report nothing more:
+//!     they take the cancellation ahead of what is queued for them. A bridge
+//!     still reports, after the cancellation, a frame it had taken before it,
+//!     and every frame it drains once its lane closes (`close_peer`), which
+//!     it does without looking at the cancellation. Here such a report comes
+//!     before the cancellation instead: the cancellation moves after it, past
+//!     the coordinator's steps in between, none of which looks at it but the
+//!     abort's own branch, so the report keeps its place among them (one that
+//!     comes after the abort's branch comes here just before it, which reads
+//!     nothing queued; teardown applies what it finds). The exception is a
+//!     report after a token branch that itself began teardown, which applied
+//!     what was queued before it: such a report can only tell teardown about
+//!     corrupt traffic (teardown ignores the rest), which fails the run, as
+//!     corrupt traffic the data bridge reports does here;
+//!   - the data bridge: records that reached an operator that had finished
+//!     (`InboundDataLost`), or a frame for one that does not decode, reported
+//!     when the bridge gets to that frame: at any point after it arrived
+//!     (also after the connection's end), or not before teardown, if at all.
+//!     It does not stop with the other bridges;
 //!   - the outbox forwarder: a frame the transport refused, unless the link
 //!     has retired;
-//!   - our workers' results.
-//! - Today's driver glue (`ClusterLifecycle::run`), in [`driver`]: its biased
-//!   `select!` (the dataflow token, the bridges' cancellation, the next
-//!   event, the grace timer), the token branch applying what is queued
-//!   first, and how actions are taken. The token keeps its first reason,
-//!   which says whether the cancellation is a failure; a failure escalated
-//!   after a requested stop decides what our `Cancel` says, and so whether
-//!   `AnnounceUnfinished` sends one.
+//!   - our workers' results: a success, a failure (with its error), or (once
+//!     the dataflow is cancelled) a cancellation.
+//! - The dataflow token holds its reasons as values: a local stop or failure,
+//!   the peer's `Cancel` as the dispatcher escalates the token with it, and
+//!   the coordinator's own escalations. It keeps its first reason, and the
+//!   first failure escalated after a requested stop. Once no broadcast can
+//!   read them again, only whether its first reason is a failure and whether
+//!   it was escalated are kept.
+//! - The token changes between the coordinator's reads of it: before each
+//!   read whose value it could change, the environment may cancel it (a
+//!   local stop or failure, or the dispatcher with the peer's `Cancel` it
+//!   holds) or escalate it (the dispatcher, with the peer's failure), and the
+//!   search explores each choice ([`Script`]). Every read the copied glue
+//!   makes goes through [`TokenRead`], in today's order: `apply`'s
+//!   `is_cancelled`, the token branch's `reason`, and `cancel_broadcast_reason`
+//!   and `unfinished_reason`, which reads the escalation twice.
+//! - Today's driver (`ClusterLifecycle::run`), in [`driver`]:
+//!   - its biased `select!`: the dataflow token (once), the bridges'
+//!     cancellation, the next event, the grace timer. The branches are polled
+//!     in turn, so once it has found no event and the grace deadline has
+//!     passed it takes the timer's branch, with an event queued meanwhile
+//!     (the timer race);
+//!   - the token branch applying what is queued first, one event at a time;
+//!   - each action prepared just before it is taken. A `Cancel` broadcast is
+//!     awaited: the actions after it wait while the environment moves (events
+//!     are posted, the token escalated, the transport fails). Our `Cancel`
+//!     then is a frame in the transport's control queue like any other;
+//!   - after the actions, the progress lanes of the peers that stopped close
+//!     (the workers read them; nothing here does);
+//!   - teardown: whether it lets the inbound bridges drain (every worker
+//!     done), then its bounded waits, during which only the data bridge and
+//!     our workers move, then the events it finds queued (lost records only
+//!     if it drained, corrupt traffic always), the `Cancel` announcing a loss
+//!     nobody was told of, and its result. What the network does during the
+//!     waits cannot change that: teardown applies only lost records and
+//!     corrupt traffic, and here, with the progress bridges cancelled, only
+//!     the data bridge reports them.
 //! - The transport:
 //!   - Control frames go first: each transport's `bridge_task` polls its
 //!     control queue, then its lane (a biased `select!`). So a `Cancel`
@@ -131,69 +214,63 @@
 //! - The peer: says goodbye (only once it has our records, which it needs,
 //!   and not after cancelling for a failure), acks our goodbye, cancels (a
 //!   requested stop, or a failure; no requested stop after its goodbye),
-//!   closes its side and goes away (while any connection links us), after
-//!   which our writes fail.
+//!   after a requested stop and before any goodbye announces that its part
+//!   is unfinished, with its failure, in a second `Cancel` (its
+//!   `AnnounceUnfinished`, as its machine finishes: no goodbye or ack after
+//!   it; explored with one local worker, see "Configurations"), closes its
+//!   side and goes away (while any connection links us), after which our
+//!   writes fail. A
+//!   second `Cancel` that marks its stop unfinished without a failure is
+//!   left out: the token ignores it (it cancels only a token that is not
+//!   cancelled, and escalates only with a failure), and the machine does no
+//!   more for it than for this one (the peer stopped, so its progress lanes
+//!   close).
 //! - Our side: workers that succeed or fail at any time, also after a
 //!   cancellation or teardown (what they need from the peer travels on
 //!   channels the coordinator does not watch, and may have arrived at any
 //!   point before); a local cancellation (a requested stop or a failure);
 //!   the bridges cancelled from outside, which happens only with the token
 //!   cancelled first (`ClusterCancelHandle::cancel_with_reason`).
-//! - At most one fault: a local write error, or a reset.
-//! - The grace period ends only once nothing is on its way to the
-//!   coordinator: the model's timing assumption, stronger than what today's
-//!   driver guarantees (see the timer race below).
+//! - The grace deadline passes only once nothing is on its way to the
+//!   coordinator: the model's timing assumption, which the timer race above
+//!   relaxes for the moment the driver takes it.
 //!
 //! # Not covered
 //!
-//! Several peers; corruption, records that reach a finished operator, a data
-//! channel that ends without its close sentinel, a frame the transport
-//! rejects (oversize) and an encoding failure: no event here reports them.
-//! A write reported failed although its frame went out whole, which only a
-//! stream whose flush can fail after sending everything does (not TCP): the
-//! peer would have the frame, and our side a `WriteFailed`. A `Cancel` the
-//! peer sends after unregistering the dataflow in split Shared mode:
-//! `send_control` then takes any pooled connection, where it can arrive
-//! apart from the peer's other frames, or be dropped after their connection
-//! has ended; here the peer's `Cancel` always travels with its lane. Data
-//! pushes (`push_blocked` stays false), so a second `Cancel` from the peer
-//! would change nothing. The peer's own machine. A peer that never goes away
-//! (a shared manager whose connections stay up). What teardown does with
-//! events queued behind the one that finished the machine: it applies only
-//! lost records and corruption, which do not occur here.
-//!
-//! Two interleavings of today's driver are not covered either:
-//! - The timer race: `select!` can find no event (`events.recv()` pending),
-//!   an event can be queued next, and the expired grace deadline is then taken
-//!   with that event already queued. Here the grace period ends only once
-//!   nothing is on its way.
-//! - The environment moving while the driver takes a step's actions: it
-//!   awaits some of them (a `Cancel` broadcast, teardown's flush), and in the
-//!   meantime other tasks post events, escalate the token and fail the
-//!   transport. Here a step's actions are taken at once. The machine does not
-//!   run in between, and the token's first reason is settled before a
-//!   broadcast is awaited. A teardown fixes the run's result, and what the
-//!   network does after it is left out on purpose (see above).
-//!
-//! Both belong to today's driver: a check of another driver has to cover them.
+//! Several peers. A data channel that ends without its close sentinel, a
+//! frame the transport rejects (oversize), an encoding failure, a corrupt
+//! control message and corrupt framing (a checksum or sequence error the
+//! transport reports): no event here reports them. A write reported failed
+//! although its frame went out whole, which only a stream whose flush can
+//! fail after sending everything does (not TCP): the peer would have the
+//! frame, and our side a `WriteFailed`. A `Cancel` broadcast that times out:
+//! it needs a control queue that stays full for the whole bound (a stalled
+//! connection), and the driver then counts a `Cancel` that was never queued
+//! as sent, which also keeps `AnnounceUnfinished` from sending. A `Cancel`
+//! the peer sends after unregistering the dataflow in split Shared mode:
+//! `send_control` then takes any pooled connection, where it can arrive apart
+//! from the peer's other frames, or be dropped after their connection has
+//! ended; here the peer's `Cancel` always travels with its lane. Data pushes
+//! (`push_blocked` stays false): a peer that stops unfinished never stops our
+//! drain here (`abort_drain_without`). The peer's own machine. A peer that
+//! never goes away (a shared manager whose connections stay up). The control
+//! dispatcher stopping on the bridges' cancellation: here it goes on.
 //!
 //! # Running
 //!
 //! Each configuration is a test, ignored because a debug build takes too
-//! long. CI runs them in release, except the largest ones (see
-//! `docs/testing/nextest.md`); `--nocapture` prints each configuration's
-//! counts and counterexamples. To run all twelve, one at a time (the largest,
-//! split Shared mode with two workers and two channels, visits 308 million
-//! states in about 9 minutes and needs about 23 GB):
+//! long. CI runs eleven of them in release, and the others are run by hand
+//! (see `docs/testing/nextest.md`); `--nocapture` prints each configuration's
+//! counts and counterexamples. To run all twenty-one, one at a time (the
+//! largest, split Shared mode with two workers and two channels and transport
+//! faults, needs about 20 GB and 16 minutes for its 423 million states):
 //!
 //! ```text
 //! cargo test -p instancy --release --all-features --lib -- --include-ignored \
 //!     --nocapture --test-threads 1 cluster_lifecycle::exhaustive::
 //! ```
-
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::{self, Write as _};
-use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::time::Instant;
 
 use super::*;
@@ -217,6 +294,18 @@ enum Wiring {
     Dedicated,
 }
 
+/// The faults a configuration explores, at most one per run. A run with
+/// one fault of each family is never explored, so splitting them over
+/// configurations loses nothing.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Faults {
+    /// A local write error, or a reset.
+    Transport,
+    /// What the peer sends us is lost on its way in (records that reach an
+    /// operator that had finished), or corrupt.
+    Inbound,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Config {
     wiring: Wiring,
@@ -225,6 +314,7 @@ struct Config {
     /// Progress channels from the peer: the end-of-stream markers its
     /// goodbye takes.
     channels: u8,
+    faults: Faults,
 }
 
 impl Config {
@@ -244,8 +334,12 @@ impl Config {
             2 => format!("two_{what}s"),
             _ => unreachable!("{n} {what}s"),
         };
+        let faults = match self.faults {
+            Faults::Transport => "",
+            Faults::Inbound => "_inbound",
+        };
         format!(
-            "{wiring}_{}_{}",
+            "{wiring}_{}_{}{faults}",
             count(self.workers, "worker"),
             count(self.channels, "channel")
         )
@@ -262,11 +356,15 @@ impl fmt::Display for Config {
         let plural = |n: u8| if n == 1 { "" } else { "s" };
         write!(
             f,
-            "{wiring}, {} worker{}, {} channel{}",
+            "{wiring}, {} worker{}, {} channel{}, {} faults",
             self.workers,
             plural(self.workers),
             self.channels,
-            plural(self.channels)
+            plural(self.channels),
+            match self.faults {
+                Faults::Transport => "transport",
+                Faults::Inbound => "inbound",
+            }
         )
     }
 }
@@ -283,14 +381,17 @@ trait Code: Copy {
     fn from_code(code: u64) -> Self;
 }
 
+/// The 64-bit words a state packs into.
+const WORDS: usize = 4;
+
 /// Bits written, or read, in order.
 struct Bits {
-    words: [u64; 3],
+    words: [u64; WORDS],
     at: u32,
 }
 
 impl Bits {
-    fn new(words: [u64; 3]) -> Self {
+    fn new(words: [u64; WORDS]) -> Self {
         Self { words, at: 0 }
     }
 
@@ -458,11 +559,165 @@ impl fmt::Display for Kind {
     }
 }
 
+/// How a local worker finished.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Outcome {
+    Ok,
+    /// With an error other than a cancellation (`WorkerFinished::failure`).
+    Failed,
+    /// Cancelled: only once the dataflow token is.
+    Cancelled,
+}
+
+impl fmt::Display for Outcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Ok => "success",
+            Self::Failed => "failure",
+            Self::Cancelled => "cancelled",
+        })
+    }
+}
+
+/// The error a local worker that fails reports (`WorkerFinished::failure`).
+const WORKER_ERROR: &str = "the local worker's error";
+
+/// A cancellation reason, as the code of its value in [`Tables`]. Codes are
+/// nonzero.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Why(u8);
+
+impl Why {
+    /// A requested stop on this node: `UserRequested`.
+    const LOCAL_STOP: Self = Self(1);
+    /// A failure on this node: `WorkerFailed`.
+    const LOCAL_FAILURE: Self = Self(2);
+    /// The peer's `Cancel` for a requested stop, as the control dispatcher
+    /// escalates the token with it: `PeerCancelled`.
+    const PEER_STOP: Self = Self(3);
+    /// The peer's `Cancel` for a failure: `PeerCancelled`, whose detail
+    /// describes a failure.
+    const PEER_FAILURE: Self = Self(4);
+
+    fn local(kind: Kind) -> Self {
+        match kind {
+            Kind::Stop => Self::LOCAL_STOP,
+            Kind::Fail => Self::LOCAL_FAILURE,
+        }
+    }
+
+    fn peer(kind: Kind) -> Self {
+        match kind {
+            Kind::Stop => Self::PEER_STOP,
+            Kind::Fail => Self::PEER_FAILURE,
+        }
+    }
+}
+
+impl Code for Why {
+    const BITS: u32 = 4;
+
+    fn code(self) -> u64 {
+        u64::from(self.0)
+    }
+
+    fn from_code(code: u64) -> Self {
+        Self(u8::try_from(code).expect("4 bits"))
+    }
+}
+
+/// The values a state holds by code: the data losses and the cancellation
+/// reasons seen so far. A loss is held as 1 + its index here (0 for none), a
+/// reason as a [`Why`]. The first reasons are the environment's, so their
+/// codes are fixed; the coordinator's own escalations follow as they appear.
+struct Tables {
+    losses: Vec<DataLoss>,
+    reasons: Vec<CancellationReason>,
+}
+
+impl Tables {
+    fn new() -> Self {
+        let peer = |kind: Kind| CancellationReason::PeerCancelled {
+            peer_id: PEER.to_string(),
+            detail: match kind {
+                Kind::Stop => CancellationReason::UserRequested.to_string(),
+                Kind::Fail => CancellationReason::WorkerFailed {
+                    detail: "the peer's worker failed".into(),
+                }
+                .to_string(),
+            },
+        };
+        let tables = Self {
+            losses: Vec::new(),
+            reasons: vec![
+                CancellationReason::UserRequested,
+                CancellationReason::WorkerFailed {
+                    detail: "a local worker failed".into(),
+                },
+                peer(Kind::Stop),
+                peer(Kind::Fail),
+            ],
+        };
+        for (why, failure) in [
+            (Why::LOCAL_STOP, false),
+            (Why::LOCAL_FAILURE, true),
+            (Why::PEER_STOP, false),
+            (Why::PEER_FAILURE, true),
+        ] {
+            assert_eq!(tables.reason(why).is_failure(), failure, "{why:?}");
+        }
+        tables
+    }
+
+    fn loss_code(&mut self, loss: &Option<DataLoss>) -> u8 {
+        let Some(loss) = loss else {
+            return 0;
+        };
+        let index = match self.losses.iter().position(|known| known == loss) {
+            Some(index) => index,
+            None => {
+                self.losses.push(loss.clone());
+                self.losses.len() - 1
+            }
+        };
+        u8::try_from(index + 1).expect("few losses")
+    }
+
+    fn loss(&self, code: u8) -> Option<DataLoss> {
+        code.checked_sub(1)
+            .map(|index| self.losses[usize::from(index)].clone())
+    }
+
+    fn why(&mut self, reason: &CancellationReason) -> Why {
+        let index = match self.reasons.iter().position(|known| known == reason) {
+            Some(index) => index,
+            None => {
+                self.reasons.push(reason.clone());
+                self.reasons.len() - 1
+            }
+        };
+        let why = Why(u8::try_from(index + 1).expect("few reasons"));
+        assert!(
+            why.0 < 1 << Why::BITS,
+            "more reasons than codes: raise Why::BITS"
+        );
+        why
+    }
+
+    fn reason(&self, why: Why) -> CancellationReason {
+        self.reasons[usize::from(why.0 - 1)].clone()
+    }
+
+    fn is_failure(&self, why: Why) -> bool {
+        self.reasons[usize::from(why.0 - 1)].is_failure()
+    }
+}
+
 /// An event on the coordinator's channel.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Ev {
-    /// A worker finished: `true` for success.
-    Done(bool),
+    /// A worker finished.
+    Done(Outcome),
     SendFailed,
     /// The connection the peer's frames arrive on (or, split, our lane's)
     /// ended: cleanly, or reset.
@@ -474,12 +729,35 @@ enum Ev {
     EndOfStream,
     Ack,
     ChannelClosed,
+    /// The data bridge: records reached an operator that had finished.
+    Lost,
+    /// The data bridge: a frame for an operator that will never decode it
+    /// does not decode.
+    DataCorrupt,
+    /// The progress bridge of channel 0: a frame that does not decode, before
+    /// its end-of-stream (it ends the channel) or after it (out of protocol).
+    ProgressCorrupt {
+        after_end_of_stream: bool,
+    },
 }
+
+/// The detail of the data bridge's reports.
+const INBOUND_LOSS: &str = "channel 9: records arrived after the receiving operator finished";
+const DATA_DECODE: &str = "data channel 9: undecodable frame";
+/// The detail of the progress bridge's report of a frame that does not
+/// decode, before and after its end-of-stream.
+const PROGRESS_DECODE: &str = "progress frame checksum mismatch";
+const PROGRESS_VIOLATION: &str = "undecodable frame on progress channel 0 after its end-of-stream: progress frame checksum mismatch";
 
 impl Ev {
     /// The peer's `Cancel`, goodbye or ack: it needs nothing more from us.
     fn excuses(self) -> bool {
         matches!(self, Self::Cancel | Self::EndOfStream | Self::Ack)
+    }
+
+    /// Reports corrupt traffic.
+    fn corrupt(self) -> bool {
+        matches!(self, Self::DataCorrupt | Self::ProgressCorrupt { .. })
     }
 
     fn event(self) -> LifecycleEvent {
@@ -488,9 +766,9 @@ impl Ev {
             event,
         };
         match self {
-            Self::Done(success) => LifecycleEvent::WorkerFinished {
-                success,
-                failure: None,
+            Self::Done(outcome) => LifecycleEvent::WorkerFinished {
+                success: outcome == Outcome::Ok,
+                failure: (outcome == Outcome::Failed).then(|| WORKER_ERROR.to_string()),
             },
             Self::SendFailed => link(LinkEvent::OutboundFailed(LinkFailure::SendFailed)),
             Self::ConnectionEnded { clean: true } => link(LinkEvent::ConnectionFailed(
@@ -504,6 +782,17 @@ impl Ev {
             Self::ChannelClosed => {
                 link(LinkEvent::ProgressChannelEnded(LinkFailure::ChannelClosed))
             }
+            Self::Lost => link(LinkEvent::InboundDataLost(INBOUND_LOSS.into())),
+            Self::DataCorrupt => link(LinkEvent::DataChannelEnded(LinkFailure::Decode(
+                DATA_DECODE.into(),
+            ))),
+            Self::ProgressCorrupt {
+                after_end_of_stream,
+            } => link(LinkEvent::ProgressChannelEnded(if after_end_of_stream {
+                LinkFailure::ProtocolViolation(PROGRESS_VIOLATION.into())
+            } else {
+                LinkFailure::Decode(PROGRESS_DECODE.into())
+            })),
         }
     }
 }
@@ -513,31 +802,49 @@ impl Code for Ev {
 
     fn code(self) -> u64 {
         match self {
-            Self::Done(true) => 1,
-            Self::Done(false) => 2,
-            Self::SendFailed => 3,
-            Self::ConnectionEnded { clean: true } => 4,
-            Self::ConnectionEnded { clean: false } => 5,
-            Self::Cancel => 6,
-            Self::ControlClosed => 7,
-            Self::EndOfStream => 8,
-            Self::Ack => 9,
-            Self::ChannelClosed => 10,
+            Self::Done(Outcome::Ok) => 1,
+            Self::Done(Outcome::Failed) => 2,
+            Self::Done(Outcome::Cancelled) => 3,
+            Self::SendFailed => 4,
+            Self::ConnectionEnded { clean: true } => 5,
+            Self::ConnectionEnded { clean: false } => 6,
+            Self::Cancel => 7,
+            Self::ControlClosed => 8,
+            Self::EndOfStream => 9,
+            Self::Ack => 10,
+            Self::ChannelClosed => 11,
+            Self::Lost => 12,
+            Self::DataCorrupt => 13,
+            Self::ProgressCorrupt {
+                after_end_of_stream: false,
+            } => 14,
+            Self::ProgressCorrupt {
+                after_end_of_stream: true,
+            } => 15,
         }
     }
 
     fn from_code(code: u64) -> Self {
         match code {
-            1 => Self::Done(true),
-            2 => Self::Done(false),
-            3 => Self::SendFailed,
-            4 => Self::ConnectionEnded { clean: true },
-            5 => Self::ConnectionEnded { clean: false },
-            6 => Self::Cancel,
-            7 => Self::ControlClosed,
-            8 => Self::EndOfStream,
-            9 => Self::Ack,
-            10 => Self::ChannelClosed,
+            1 => Self::Done(Outcome::Ok),
+            2 => Self::Done(Outcome::Failed),
+            3 => Self::Done(Outcome::Cancelled),
+            4 => Self::SendFailed,
+            5 => Self::ConnectionEnded { clean: true },
+            6 => Self::ConnectionEnded { clean: false },
+            7 => Self::Cancel,
+            8 => Self::ControlClosed,
+            9 => Self::EndOfStream,
+            10 => Self::Ack,
+            11 => Self::ChannelClosed,
+            12 => Self::Lost,
+            13 => Self::DataCorrupt,
+            14 => Self::ProgressCorrupt {
+                after_end_of_stream: false,
+            },
+            15 => Self::ProgressCorrupt {
+                after_end_of_stream: true,
+            },
             _ => unreachable!("event {code}"),
         }
     }
@@ -546,8 +853,9 @@ impl Code for Ev {
 impl fmt::Display for Ev {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Done(true) => "WorkerFinished(success)",
-            Self::Done(false) => "WorkerFinished(failure)",
+            Self::Done(Outcome::Ok) => "WorkerFinished(success)",
+            Self::Done(Outcome::Failed) => "WorkerFinished(failure)",
+            Self::Done(Outcome::Cancelled) => "WorkerFinished(cancelled)",
             Self::SendFailed => "OutboundFailed(SendFailed)",
             Self::ConnectionEnded { clean: true } => "ConnectionFailed(closed)",
             Self::ConnectionEnded { clean: false } => "ConnectionFailed(reset)",
@@ -556,6 +864,14 @@ impl fmt::Display for Ev {
             Self::EndOfStream => "ProgressEndOfStream",
             Self::Ack => "AckReceived",
             Self::ChannelClosed => "ProgressChannelEnded(ChannelClosed)",
+            Self::Lost => "InboundDataLost",
+            Self::DataCorrupt => "DataChannelEnded(Decode)",
+            Self::ProgressCorrupt {
+                after_end_of_stream: false,
+            } => "ProgressChannelEnded(Decode)",
+            Self::ProgressCorrupt {
+                after_end_of_stream: true,
+            } => "ProgressChannelEnded(ProtocolViolation)",
         })
     }
 }
@@ -667,6 +983,9 @@ enum In {
     EndOfStream(u8),
     /// Its ack of our goodbye, on its first progress channel to us.
     Ack,
+    /// A frame on its first progress channel to us that does not decode
+    /// (corrupt on the way, say).
+    Corrupt,
 }
 
 impl Code for In {
@@ -680,6 +999,7 @@ impl Code for In {
             Self::EndOfStream(1) => 4,
             Self::EndOfStream(ch) => unreachable!("channel {ch}"),
             Self::Ack => 5,
+            Self::Corrupt => 6,
         }
     }
 
@@ -690,6 +1010,7 @@ impl Code for In {
             3 => Self::EndOfStream(0),
             4 => Self::EndOfStream(1),
             5 => Self::Ack,
+            6 => Self::Corrupt,
             _ => unreachable!("frame {code}"),
         }
     }
@@ -701,7 +1022,55 @@ impl fmt::Display for In {
             Self::Cancel(kind) => write!(f, "Cancel ({kind})"),
             Self::EndOfStream(ch) => write!(f, "end-of-stream on channel {ch}"),
             Self::Ack => f.write_str("ack"),
+            Self::Corrupt => f.write_str("corrupt frame on channel 0"),
         }
+    }
+}
+
+/// What the data bridge has to report.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Late {
+    /// Records that reached an operator that had finished.
+    Lost,
+    /// A frame for an operator that had finished, which does not decode.
+    Corrupt,
+}
+
+impl Late {
+    /// What the data bridge reports.
+    fn event(self) -> Ev {
+        match self {
+            Self::Lost => Ev::Lost,
+            Self::Corrupt => Ev::DataCorrupt,
+        }
+    }
+}
+
+impl Code for Late {
+    const BITS: u32 = 2;
+
+    fn code(self) -> u64 {
+        match self {
+            Self::Lost => 1,
+            Self::Corrupt => 2,
+        }
+    }
+
+    fn from_code(code: u64) -> Self {
+        match code {
+            1 => Self::Lost,
+            2 => Self::Corrupt,
+            _ => unreachable!("late {code}"),
+        }
+    }
+}
+
+impl fmt::Display for Late {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Lost => "records that reached an operator that had finished",
+            Self::Corrupt => "a frame that does not decode, for an operator that had finished",
+        })
     }
 }
 
@@ -747,20 +1116,33 @@ struct World {
     queue: Fifo<Ev, 12>,
     /// The dataflow token's first reason (`cancel_with_reason` and
     /// `escalate` keep it).
-    token: Option<Kind>,
-    /// A failure was escalated on a token cancelled for a requested stop.
-    escalated: bool,
+    token: Option<Why>,
+    /// The failure escalated on a token cancelled for a requested stop
+    /// (`CancellationToken::escalation`; the first one stays).
+    escalation: Option<Why>,
     /// The driver has taken the token's branch.
     cancel_seen: bool,
     /// The bridges were cancelled from outside.
     aborted: bool,
     /// A grace deadline is armed.
     timer: bool,
-    /// Torn down.
+    /// `select!` found no event, and the grace deadline it polls next has
+    /// passed: it takes that branch, whatever is queued meanwhile.
+    polled: bool,
+    /// The actions the driver takes once the `Cancel` broadcast it awaits is
+    /// done.
+    pending: Fifo<Act, 3>,
+    /// Teardown has begun: its bounded waits are not over. Whether it
+    /// drains the inbound bridges (`drain_inbound`).
+    tearing_down: bool,
+    drain_inbound: bool,
+    /// Torn down: teardown published its result.
     finished: bool,
     /// The driver's `failure_announced` and `unfinished_announced`.
     failure_announced: bool,
     unfinished_announced: bool,
+    /// The driver's `worker_failure` holds a local worker's error.
+    worker_failure: bool,
     // Our workers.
     workers_left: u8,
     /// A worker failed (or was cancelled).
@@ -795,7 +1177,7 @@ struct World {
     /// Frames on their way from the peer, in the order it queued them (see
     /// `Step::ReadCancel` and `Step::ReadPastCancel` for the order they come
     /// in).
-    wire: Fifo<In, 4>,
+    wire: Fifo<In, 5>,
     /// A lane frame of the peer passed its `Cancel` (`Step::ReadPastCancel`),
     /// which waited in its control queue: the `Cancel` comes next.
     peer_locked: bool,
@@ -816,7 +1198,7 @@ struct World {
     dispatching: bool,
     ctrl_close_reported: bool,
     /// Frames read, not yet taken by each progress bridge.
-    prog: [Fifo<In, 2>; 2],
+    prog: [Fifo<In, 3>; 2],
     end_of_stream: [bool; 2],
     prog_close_reported: [bool; 2],
     // The connection.
@@ -832,8 +1214,22 @@ struct World {
     peer_goodbye: bool,
     peer_ack: bool,
     peer_cancel: Option<Kind>,
+    /// The peer sent a second `Cancel`, with its failure (its
+    /// `AnnounceUnfinished`): its workers did not complete after its
+    /// requested stop.
+    peer_announced: bool,
     peer_fin: bool,
     peer_gone: bool,
+    /// The data bridge holds a report for the coordinator.
+    late: Option<Late>,
+    // Ghosts. Records addressed to us were lost on their way in; corrupt
+    // traffic reached us (both before teardown began, as nothing reaches us
+    // later).
+    inbound_lost: bool,
+    corrupt_in: bool,
+    /// Corrupt traffic waited for a progress bridge when teardown began:
+    /// cancelled, the bridge never reads it.
+    corrupt_unheard: bool,
     // Ghosts, latched when the last worker succeeded (if every one did): the
     // send had failed; our records had not reached the peer, and our side had
     // seen the connection that carries them fail (a write error, or a failed
@@ -849,13 +1245,18 @@ impl World {
         Self {
             queue: Fifo::EMPTY,
             token: None,
-            escalated: false,
+            escalation: None,
             cancel_seen: false,
             aborted: false,
             timer: false,
+            polled: false,
+            pending: Fifo::EMPTY,
+            tearing_down: false,
+            drain_inbound: false,
             finished: false,
             failure_announced: false,
             unfinished_announced: false,
+            worker_failure: false,
             workers_left: cfg.workers,
             workers_failed: false,
             outbound,
@@ -887,8 +1288,13 @@ impl World {
             peer_goodbye: false,
             peer_ack: false,
             peer_cancel: None,
+            peer_announced: false,
             peer_fin: false,
             peer_gone: false,
+            late: None,
+            inbound_lost: false,
+            corrupt_in: false,
+            corrupt_unheard: false,
             failed_at_finish: false,
             lost_at_finish: false,
         }
@@ -896,26 +1302,20 @@ impl World {
 
     /// Cancel the dataflow token (`cancel_with_reason`): its first reason
     /// stays.
-    fn cancel(&mut self, kind: Kind) {
+    fn cancel(&mut self, why: Why) {
         if self.token.is_none() {
-            self.token = Some(kind);
+            self.token = Some(why);
         }
     }
 
     /// `escalate`: cancel, and record a failure that follows a requested
-    /// stop.
-    fn escalate(&mut self, kind: Kind) {
-        if self.token == Some(Kind::Stop) && kind == Kind::Fail {
-            self.escalated = true;
+    /// stop (the first one stays).
+    fn escalate(&mut self, why: Why, tables: &Tables) {
+        self.cancel(why);
+        let first = self.token.expect("cancelled");
+        if tables.is_failure(why) && !tables.is_failure(first) && self.escalation.is_none() {
+            self.escalation = Some(why);
         }
-        self.cancel(kind);
-    }
-
-    /// The `Cancel` the driver broadcasts describes a failure
-    /// (`cancel_broadcast_reason`): an escalation, the token's first reason,
-    /// or, with the token not cancelled, the bridges stopped from outside.
-    fn broadcast_is_failure(&self) -> bool {
-        self.escalated || self.token != Some(Kind::Stop)
     }
 
     /// The driver broadcasts our `Cancel` (`broadcast_cancel_with_transport`:
@@ -978,8 +1378,24 @@ impl World {
                 self.peer_locked = false;
                 self.ctrl.push_back(kind);
             }
-            In::EndOfStream(ch) => self.prog[usize::from(ch)].push_back(frame),
-            In::Ack => self.prog[0].push_back(frame),
+            In::EndOfStream(ch) => self.queue_for_bridge(usize::from(ch), frame),
+            In::Ack => self.queue_for_bridge(0, frame),
+            // It reached us.
+            In::Corrupt => {
+                self.corrupt_in = true;
+                self.queue_for_bridge(0, frame);
+            }
+        }
+    }
+
+    /// Queue `frame` for the progress bridge of channel `ch`, unless that
+    /// bridge has exited: it reported the end of its channel (a close, or a
+    /// frame that does not decode before its end-of-stream). Its receiver
+    /// is gone, and the transport drops what it routes there (the demuxer
+    /// removes the channel, `shared_transport` ignores the failed send).
+    fn queue_for_bridge(&mut self, ch: usize, frame: In) {
+        if !self.prog_close_reported[ch] {
+            self.prog[ch].push_back(frame);
         }
     }
 
@@ -1085,15 +1501,48 @@ impl World {
             || (self.reader_up && (!self.wire.is_empty() || self.peer_fin))
             || self.read_fails
             || (self.lane_reader_up && self.peer_fin)
+            || self.late.is_some()
     }
 
-    /// The peer's `Cancel`, goodbye or ack is on its way to the coordinator.
+    /// The peer's `Cancel`, goodbye or ack is on its way to the coordinator:
+    /// it will reach it unless a fault intervenes. A frame that does not
+    /// decode excuses nothing, and before its channel's end-of-stream it
+    /// ends its bridge, so nothing behind it on that channel comes through.
+    /// Once the bridges are cancelled from outside they report nothing more
+    /// (see the module docs for a report already under way).
     fn excuse_on_its_way(&self) -> bool {
-        self.queue.iter().any(Ev::excuses)
+        if self.queue.iter().any(Ev::excuses)
             || !self.ctrl.is_empty()
             || self.dispatching
-            || self.prog.iter().any(|queue| !queue.is_empty())
-            || (self.reader_up && !self.wire.is_empty())
+            || (self.reader_up && self.wire.iter().any(|frame| matches!(frame, In::Cancel(_))))
+        {
+            return true;
+        }
+        if self.aborted {
+            return false;
+        }
+        (0..2).any(|ch| {
+            if self.prog_close_reported[ch] {
+                return false;
+            }
+            // In the order the bridge takes them: queued, then on the wire.
+            let on_wire = self.wire.iter().filter(move |&frame| {
+                self.reader_up
+                    && match frame {
+                        In::EndOfStream(c) => usize::from(c) == ch,
+                        In::Ack | In::Corrupt => ch == 0,
+                        In::Cancel(_) => false,
+                    }
+            });
+            for frame in self.prog[ch].iter().chain(on_wire) {
+                match frame {
+                    In::EndOfStream(_) | In::Ack => return true,
+                    In::Corrupt if !self.end_of_stream[ch] => return false,
+                    In::Corrupt | In::Cancel(_) => {}
+                }
+            }
+            false
+        })
     }
 
     /// The peer has gone, or can no longer be reached either way.
@@ -1112,6 +1561,88 @@ impl World {
         self.lost_at_finish = !self.records_delivered && (self.writer_dead || self.read_failed);
     }
 
+    /// Forget what can no longer matter, so that states that differ only in
+    /// it are one. `AnnounceUnfinished` sends nothing once a failure was
+    /// announced, or it was sent, so its reason (the worker's error) is never
+    /// chosen again. From teardown on the network is still and nothing reads
+    /// it: what the peer did and what reached whom (the ghosts) is all that
+    /// counts. After teardown only the workers move.
+    fn forget(&mut self) {
+        if self.failure_announced {
+            self.unfinished_announced = false;
+        }
+        if self.failure_announced || self.unfinished_announced {
+            self.worker_failure = false;
+        }
+        if self.tearing_down || self.finished {
+            self.corrupt_unheard |= self
+                .prog
+                .iter()
+                .any(|queue| queue.iter().any(|frame| frame == In::Corrupt));
+            self.io = Fifo::EMPTY;
+            self.ctrl = Fifo::EMPTY;
+            self.dispatching = false;
+            self.prog = [Fifo::EMPTY; 2];
+            self.lose_inbound();
+            self.lose_outbound();
+            self.forwarder = Forwarder::Idle;
+            self.refusing = false;
+            self.unsure = false;
+            self.write_fails = false;
+            self.read_fails = false;
+            self.reader_up = false;
+            self.lane_reader_up = false;
+            self.channels_closed = false;
+            self.ctrl_close_reported = false;
+            self.end_of_stream = [false; 2];
+            self.prog_close_reported = [false; 2];
+            self.to_peer = false;
+            self.from_peer = false;
+        }
+        if self.finished {
+            self.drain_inbound = false;
+            self.cancel_seen = false;
+            self.timer = false;
+            self.failure_announced = false;
+            self.unfinished_announced = false;
+            self.worker_failure = false;
+        }
+    }
+
+    /// Forget the token's reasons down to whether its first is a failure
+    /// and whether it was escalated, once no broadcast can read them (see
+    /// [`Self::reasons_readable`]).
+    fn forget_reasons(&mut self, cancel_broadcast: bool, tables: &Tables) {
+        if self.reasons_readable(cancel_broadcast) {
+            return;
+        }
+        self.token = self.token.map(|why| {
+            if tables.is_failure(why) {
+                Why::LOCAL_FAILURE
+            } else {
+                Why::LOCAL_STOP
+            }
+        });
+        if self.escalation.is_some() {
+            self.escalation = Some(Why::LOCAL_FAILURE);
+        }
+    }
+
+    /// Whether a broadcast can still read the token's reasons. Not once the
+    /// machine has asked for its `Cancel` (`cancel_broadcast`, only once),
+    /// none is pending, and `AnnounceUnfinished` sends nothing any more (a
+    /// failure, or the unfinished stop, was announced): stable from then on,
+    /// as nothing else reads the escalation, and the other reads of the
+    /// token (whether it is cancelled, its first reason) do not change.
+    fn reasons_readable(&self, cancel_broadcast: bool) -> bool {
+        !cancel_broadcast
+            || !(self.failure_announced || self.unfinished_announced)
+            || self
+                .pending
+                .iter()
+                .any(|act| matches!(act, Act::BroadcastCancel | Act::AnnounceUnfinished))
+    }
+
     /// The identity of a violation found in this state: the environment's
     /// side of it, without the coordinator's channel and the driver's state,
     /// and nothing of the machine, whose representation may change.
@@ -1120,10 +1651,15 @@ impl World {
         env.queue = Fifo::EMPTY;
         env.cancel_seen = false;
         env.timer = false;
+        env.polled = false;
+        env.pending = Fifo::EMPTY;
+        env.tearing_down = false;
+        env.drain_inbound = false;
         env.finished = false;
         env.failure_announced = false;
         env.unfinished_announced = false;
-        let mut bits = Bits::new([0; 3]);
+        env.worker_failure = false;
+        let mut bits = Bits::new([0; WORDS]);
         env.pack(&mut bits);
         mix(bits.words)
     }
@@ -1132,13 +1668,18 @@ impl World {
         let Self {
             queue,
             token,
-            escalated,
+            escalation,
             cancel_seen,
             aborted,
             timer,
+            polled,
+            pending,
+            tearing_down,
+            drain_inbound,
             finished,
             failure_announced,
             unfinished_announced,
+            worker_failure,
             workers_left,
             workers_failed,
             outbound,
@@ -1170,20 +1711,30 @@ impl World {
             peer_goodbye,
             peer_ack,
             peer_cancel,
+            peer_announced,
             peer_fin,
             peer_gone,
+            late,
+            inbound_lost,
+            corrupt_in,
+            corrupt_unheard,
             failed_at_finish,
             lost_at_finish,
         } = self;
         queue.pack(bits);
         bits.put_item(*token);
-        bits.put_flag(*escalated);
+        bits.put_item(*escalation);
         bits.put_flag(*cancel_seen);
         bits.put_flag(*aborted);
         bits.put_flag(*timer);
+        bits.put_flag(*polled);
+        pending.pack(bits);
+        bits.put_flag(*tearing_down);
+        bits.put_flag(*drain_inbound);
         bits.put_flag(*finished);
         bits.put_flag(*failure_announced);
         bits.put_flag(*unfinished_announced);
+        bits.put_flag(*worker_failure);
         bits.put_small(*workers_left, 2);
         bits.put_flag(*workers_failed);
         outbound.pack(bits);
@@ -1218,8 +1769,13 @@ impl World {
         bits.put_flag(*peer_goodbye);
         bits.put_flag(*peer_ack);
         bits.put_item(*peer_cancel);
+        bits.put_flag(*peer_announced);
         bits.put_flag(*peer_fin);
         bits.put_flag(*peer_gone);
+        bits.put_item(*late);
+        bits.put_flag(*inbound_lost);
+        bits.put_flag(*corrupt_in);
+        bits.put_flag(*corrupt_unheard);
         bits.put_flag(*failed_at_finish);
         bits.put_flag(*lost_at_finish);
     }
@@ -1229,13 +1785,18 @@ impl World {
         Self {
             queue: Fifo::unpack(bits),
             token: bits.item(),
-            escalated: bits.flag(),
+            escalation: bits.item(),
             cancel_seen: bits.flag(),
             aborted: bits.flag(),
             timer: bits.flag(),
+            polled: bits.flag(),
+            pending: Fifo::unpack(bits),
+            tearing_down: bits.flag(),
+            drain_inbound: bits.flag(),
             finished: bits.flag(),
             failure_announced: bits.flag(),
             unfinished_announced: bits.flag(),
+            worker_failure: bits.flag(),
             workers_left: bits.small(2),
             workers_failed: bits.flag(),
             outbound: Fifo::unpack(bits),
@@ -1267,8 +1828,13 @@ impl World {
             peer_goodbye: bits.flag(),
             peer_ack: bits.flag(),
             peer_cancel: bits.item(),
+            peer_announced: bits.flag(),
             peer_fin: bits.flag(),
             peer_gone: bits.flag(),
+            late: bits.item(),
+            inbound_lost: bits.flag(),
+            corrupt_in: bits.flag(),
+            corrupt_unheard: bits.flag(),
             failed_at_finish: bits.flag(),
             lost_at_finish: bits.flag(),
         }
@@ -1279,13 +1845,19 @@ impl World {
 // The machine's state
 // ---------------------------------------------------------------------------
 
-/// A failure the machine can hold as a soft failure here.
+/// A failure an event here carries, which the machine may hold as a soft
+/// failure or act on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Failure {
     SendFailed,
     ChannelClosed,
     ConnectionClosed,
     ConnectionReset,
+    /// The data bridge's frame that does not decode.
+    DataDecode,
+    /// The progress bridge's, before its end-of-stream and after it.
+    ProgressDecode,
+    ProgressViolation,
 }
 
 impl Failure {
@@ -1299,6 +1871,11 @@ impl Failure {
             {
                 Self::ConnectionReset
             }
+            LinkFailure::Decode(detail) if detail == DATA_DECODE => Self::DataDecode,
+            LinkFailure::Decode(detail) if detail == PROGRESS_DECODE => Self::ProgressDecode,
+            LinkFailure::ProtocolViolation(detail) if detail == PROGRESS_VIOLATION => {
+                Self::ProgressViolation
+            }
             other => panic!("no event here carries this failure: {other}"),
         }
     }
@@ -1309,6 +1886,9 @@ impl Failure {
             Self::ChannelClosed => LinkFailure::ChannelClosed,
             Self::ConnectionClosed => LinkFailure::Transport(TransportError::ConnectionClosed),
             Self::ConnectionReset => LinkFailure::Transport(reset()),
+            Self::DataDecode => LinkFailure::Decode(DATA_DECODE.into()),
+            Self::ProgressDecode => LinkFailure::Decode(PROGRESS_DECODE.into()),
+            Self::ProgressViolation => LinkFailure::ProtocolViolation(PROGRESS_VIOLATION.into()),
         }
     }
 }
@@ -1322,6 +1902,9 @@ impl Code for Failure {
             Self::ChannelClosed => 2,
             Self::ConnectionClosed => 3,
             Self::ConnectionReset => 4,
+            Self::DataDecode => 5,
+            Self::ProgressDecode => 6,
+            Self::ProgressViolation => 7,
         }
     }
 
@@ -1331,34 +1914,98 @@ impl Code for Failure {
             2 => Self::ChannelClosed,
             3 => Self::ConnectionClosed,
             4 => Self::ConnectionReset,
+            5 => Self::DataDecode,
+            6 => Self::ProgressDecode,
+            7 => Self::ProgressViolation,
             _ => unreachable!("failure {code}"),
         }
     }
 }
 
-/// The data losses seen so far. A [`Mach`] holds a loss as 1 + its index
-/// here, 0 for none.
-#[derive(Default)]
-struct Losses(Vec<DataLoss>);
+/// An action the driver has still to take, small: its peer is [`PEER`], and
+/// its reason a [`Why`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Act {
+    SendAck,
+    BroadcastCancel,
+    SendGoodbye,
+    LinkFailed(Failure),
+    ArmSoftFailureTimer,
+    CancelDataflow(Why),
+    AbortDrain(Why),
+    AnnounceUnfinished,
+    Teardown { graceful: bool },
+}
 
-impl Losses {
-    fn code(&mut self, loss: &Option<DataLoss>) -> u8 {
-        let Some(loss) = loss else {
-            return 0;
-        };
-        let index = match self.0.iter().position(|known| known == loss) {
-            Some(index) => index,
-            None => {
-                self.0.push(loss.clone());
-                self.0.len() - 1
-            }
-        };
-        u8::try_from(index + 1).expect("few losses")
+impl Act {
+    fn of(action: &Action, tables: &mut Tables) -> Self {
+        match action {
+            Action::SendAck(_) => Self::SendAck,
+            Action::BroadcastCancel => Self::BroadcastCancel,
+            Action::SendGoodbye => Self::SendGoodbye,
+            Action::LinkFailed { failure, .. } => Self::LinkFailed(Failure::of(failure)),
+            Action::ArmSoftFailureTimer(_) => Self::ArmSoftFailureTimer,
+            Action::CancelDataflow(reason) => Self::CancelDataflow(tables.why(reason)),
+            Action::AbortDrain(reason) => Self::AbortDrain(tables.why(reason)),
+            Action::AnnounceUnfinished => Self::AnnounceUnfinished,
+            Action::Teardown { graceful } => Self::Teardown {
+                graceful: *graceful,
+            },
+        }
     }
 
-    fn get(&self, code: u8) -> Option<DataLoss> {
-        code.checked_sub(1)
-            .map(|index| self.0[usize::from(index)].clone())
+    fn action(self, tables: &Tables) -> Action {
+        match self {
+            Self::SendAck => Action::SendAck(PEER.to_string()),
+            Self::BroadcastCancel => Action::BroadcastCancel,
+            Self::SendGoodbye => Action::SendGoodbye,
+            Self::LinkFailed(failure) => Action::LinkFailed {
+                peer: PEER.to_string(),
+                failure: failure.link_failure(),
+            },
+            Self::ArmSoftFailureTimer => Action::ArmSoftFailureTimer(PEER.to_string()),
+            Self::CancelDataflow(why) => Action::CancelDataflow(tables.reason(why)),
+            Self::AbortDrain(why) => Action::AbortDrain(tables.reason(why)),
+            Self::AnnounceUnfinished => Action::AnnounceUnfinished,
+            Self::Teardown { graceful } => Action::Teardown { graceful },
+        }
+    }
+}
+
+impl Code for Act {
+    const BITS: u32 = 8;
+
+    fn code(self) -> u64 {
+        let (kind, payload) = match self {
+            Self::SendAck => (1, 0),
+            Self::BroadcastCancel => (2, 0),
+            Self::SendGoodbye => (3, 0),
+            Self::LinkFailed(failure) => (4, failure.code()),
+            Self::ArmSoftFailureTimer => (5, 0),
+            Self::CancelDataflow(why) => (6, why.code()),
+            Self::AbortDrain(why) => (7, why.code()),
+            Self::AnnounceUnfinished => (8, 0),
+            Self::Teardown { graceful } => (9, u64::from(graceful)),
+        };
+        kind << 4 | payload
+    }
+
+    fn from_code(code: u64) -> Self {
+        let payload = code & 15;
+        match code >> 4 {
+            1 => Self::SendAck,
+            2 => Self::BroadcastCancel,
+            3 => Self::SendGoodbye,
+            4 => Self::LinkFailed(Failure::from_code(payload)),
+            5 => Self::ArmSoftFailureTimer,
+            6 => Self::CancelDataflow(Why::from_code(payload)),
+            7 => Self::AbortDrain(Why::from_code(payload)),
+            8 => Self::AnnounceUnfinished,
+            9 => Self::Teardown {
+                graceful: payload == 1,
+            },
+            kind => unreachable!("action {kind}"),
+        }
     }
 }
 
@@ -1400,7 +2047,7 @@ struct Mach {
 
 impl Mach {
     /// The destructuring lists every field, so a new one is not left out.
-    fn of(m: &LifecycleMachine, losses: &mut Losses) -> Self {
+    fn of(m: &LifecycleMachine, tables: &mut Tables) -> Self {
         let LifecycleMachine {
             phase,
             workers_remaining,
@@ -1438,9 +2085,9 @@ impl Mach {
             cancel_broadcast: *cancel_broadcast,
             requested_stop: *requested_stop,
             drain_aborted: *drain_aborted,
-            data_loss: losses.code(data_loss),
-            pending_loss: losses.code(pending_loss),
-            deferred_loss: losses.code(deferred_loss),
+            data_loss: tables.loss_code(data_loss),
+            pending_loss: tables.loss_code(pending_loss),
+            deferred_loss: tables.loss_code(deferred_loss),
             workers_succeeded: small(*workers_succeeded),
             expected_end_of_stream: small(*expected_end_of_stream),
             end_of_stream: small(*end_of_stream),
@@ -1459,7 +2106,7 @@ impl Mach {
     }
 
     /// The machine, with a link of its own.
-    fn machine(&self, losses: &Losses) -> LifecycleMachine {
+    fn machine(&self, tables: &Tables) -> LifecycleMachine {
         let link = Arc::new(PeerLinkState::default());
         if self.retired {
             link.retire();
@@ -1489,9 +2136,9 @@ impl Mach {
             cancel_broadcast: self.cancel_broadcast,
             requested_stop: self.requested_stop,
             drain_aborted: self.drain_aborted,
-            data_loss: losses.get(self.data_loss),
-            pending_loss: losses.get(self.pending_loss),
-            deferred_loss: losses.get(self.deferred_loss),
+            data_loss: tables.loss(self.data_loss),
+            pending_loss: tables.loss(self.pending_loss),
+            deferred_loss: tables.loss(self.deferred_loss),
             workers_succeeded: usize::from(self.workers_succeeded),
             peers: BTreeMap::from([(PEER.to_string(), peer)]),
         }
@@ -1543,7 +2190,7 @@ impl Mach {
             bits.put_flag(*flag);
         }
         for loss in [data_loss, pending_loss, deferred_loss] {
-            bits.put_small(*loss, 2);
+            bits.put_small(*loss, 3);
         }
         for count in [
             workers_succeeded,
@@ -1583,9 +2230,9 @@ impl Mach {
             cancel_broadcast: bits.flag(),
             requested_stop: bits.flag(),
             drain_aborted: bits.flag(),
-            data_loss: bits.small(2),
-            pending_loss: bits.small(2),
-            deferred_loss: bits.small(2),
+            data_loss: bits.small(3),
+            pending_loss: bits.small(3),
+            deferred_loss: bits.small(3),
             workers_succeeded: bits.small(2),
             expected_end_of_stream: bits.small(2),
             end_of_stream: bits.small(2),
@@ -1606,11 +2253,11 @@ impl Mach {
 
 /// A state, packed exactly: the world and every field of the machine.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Key([u64; 3]);
+struct Key([u64; WORDS]);
 
 impl Key {
     fn pack(w: &World, m: &Mach) -> Self {
-        let mut bits = Bits::new([0; 3]);
+        let mut bits = Bits::new([0; WORDS]);
         w.pack(&mut bits);
         m.pack(&mut bits);
         Self(bits.words)
@@ -1623,14 +2270,8 @@ impl Key {
     }
 }
 
-impl Hash for Key {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u64(mix(self.0));
-    }
-}
-
-/// A well-mixed 64-bit hash of three words.
-fn mix(words: [u64; 3]) -> u64 {
+/// A well-mixed 64-bit hash of a state's words.
+fn mix(words: [u64; WORDS]) -> u64 {
     let mut h = 0x9e37_79b9_7f4a_7c15_u64;
     for word in words {
         h = (h ^ word).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -1639,21 +2280,108 @@ fn mix(words: [u64; 3]) -> u64 {
     h.wrapping_mul(0x94d0_49bb_1331_11eb) ^ (h >> 29)
 }
 
-/// The hasher of the visited set: a [`Key`] hashes itself.
-#[derive(Default)]
-struct KeyHasher(u64);
+/// Items in chunks of a fixed size, so that a push never moves (or copies)
+/// what is stored.
+struct Chunked<T> {
+    chunks: Vec<Vec<T>>,
+    len: usize,
+}
 
-impl Hasher for KeyHasher {
-    fn finish(&self) -> u64 {
-        self.0
+impl<T: Copy> Chunked<T> {
+    const CHUNK: usize = 1 << 20;
+
+    fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            len: 0,
+        }
     }
 
-    fn write(&mut self, _: &[u8]) {
-        unreachable!("a key hashes itself")
+    fn push(&mut self, item: T) {
+        if self.len % Self::CHUNK == 0 {
+            self.chunks.push(Vec::with_capacity(Self::CHUNK));
+        }
+        self.chunks.last_mut().expect("a chunk").push(item);
+        self.len += 1;
     }
 
-    fn write_u64(&mut self, hash: u64) {
-        self.0 = hash;
+    fn get(&self, at: usize) -> T {
+        self.chunks[at / Self::CHUNK][at % Self::CHUNK]
+    }
+
+    fn bytes(&self) -> usize {
+        self.chunks.len() * Self::CHUNK * size_of::<T>()
+    }
+}
+
+/// Every state the search reached, each once, exactly, in the order it
+/// reached them, so that a level of the search is a range of them. With
+/// each, the state it was first reached from and the step that took it
+/// there. `index` finds a state by its key: open addressing, probing
+/// linearly, of 1 + the state's number (0 marks an empty slot), never more
+/// than half full. Each key is held once, here.
+struct States {
+    keys: Chunked<Key>,
+    trail: Chunked<(u32, Step)>,
+    index: Vec<u32>,
+}
+
+impl States {
+    fn new() -> Self {
+        Self {
+            keys: Chunked::new(),
+            trail: Chunked::new(),
+            index: vec![0; 1 << 16],
+        }
+    }
+
+    fn len(&self) -> u32 {
+        u32::try_from(self.keys.len).expect("fewer than 2^32 states")
+    }
+
+    fn key(&self, at: u32) -> Key {
+        self.keys.get(at as usize)
+    }
+
+    fn trail(&self, at: u32) -> (u32, Step) {
+        self.trail.get(at as usize)
+    }
+
+    /// The slot of `key`: where it is, or the empty one it goes in.
+    fn slot(index: &[u32], keys: &Chunked<Key>, key: Key) -> usize {
+        let mask = index.len() - 1;
+        let mut slot = usize::try_from(mix(key.0)).expect("64-bit") & mask;
+        while index[slot] != 0 && keys.get(index[slot] as usize - 1) != key {
+            slot = (slot + 1) & mask;
+        }
+        slot
+    }
+
+    /// Add `key`, reached from state `from` by `step`, unless it was
+    /// reached before: its number if it is new.
+    fn insert(&mut self, key: Key, from: u32, step: Step) -> Option<u32> {
+        let slot = Self::slot(&self.index, &self.keys, key);
+        if self.index[slot] != 0 {
+            return None;
+        }
+        let at = self.len();
+        self.index[slot] = at.checked_add(1).expect("fewer than 2^32 states");
+        self.keys.push(key);
+        self.trail.push((from, step));
+        if self.keys.len * 2 > self.index.len() {
+            let mut index = vec![0; self.index.len() * 2];
+            for n in 0..self.keys.len {
+                let slot = Self::slot(&index, &self.keys, self.keys.get(n));
+                index[slot] = u32::try_from(n + 1).expect("fewer than 2^32 states");
+            }
+            self.index = index;
+        }
+        Some(at)
+    }
+
+    /// Roughly the bytes held.
+    fn bytes(&self) -> usize {
+        self.keys.bytes() + self.trail.bytes() + self.index.len() * size_of::<u32>()
     }
 }
 
@@ -1661,15 +2389,96 @@ impl Hasher for KeyHasher {
 // Steps
 // ---------------------------------------------------------------------------
 
+/// What a coordinator step's environment does where the dataflow token may
+/// change before one of its reads: a choice at each such read, 2 bits each,
+/// in order. Past its last choice a script changes nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct Script(u16);
+
+impl Script {
+    const NONE: Self = Self(0);
+    const SLOTS: u32 = 8;
+
+    fn choice(self, slot: u32) -> u8 {
+        u8::try_from((self.0 >> (2 * slot)) & 3).expect("2 bits")
+    }
+
+    fn with(self, slot: u32, choice: u8) -> Self {
+        assert!(
+            slot < Self::SLOTS && choice < 4,
+            "slot {slot}, choice {choice}"
+        );
+        Self(self.0 | u16::from(choice) << (2 * slot))
+    }
+
+    /// The slots up to its last choice.
+    fn len(self) -> u32 {
+        (u16::BITS - self.0.leading_zeros()).div_ceil(2)
+    }
+}
+
+impl fmt::Debug for Script {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let choices: Vec<u8> = (0..self.len()).map(|slot| self.choice(slot)).collect();
+        write!(f, "{choices:?}")
+    }
+}
+
+/// A coordinator step running a script: the choice at each read, and the
+/// scripts that choose otherwise at a read past the script's last choice.
+/// Running each script once, from the empty one, runs every combination of
+/// choices exactly once.
+struct Cursor {
+    script: Script,
+    slot: u32,
+    others: Vec<Script>,
+}
+
+impl Cursor {
+    fn new(script: Script) -> Self {
+        Self {
+            script,
+            slot: 0,
+            others: Vec::new(),
+        }
+    }
+
+    /// Choose among `n` options (0 changes nothing).
+    fn choose(&mut self, n: usize) -> usize {
+        let slot = self.slot;
+        assert!(
+            slot < Script::SLOTS,
+            "more choices than slots: raise Script::SLOTS"
+        );
+        self.slot += 1;
+        if slot >= self.script.len() {
+            for choice in 1..n {
+                let choice = u8::try_from(choice).expect("few options");
+                self.others.push(self.script.with(slot, choice));
+            }
+        }
+        usize::from(self.script.choice(slot))
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Step {
     // The coordinator: the only steps that change the machine.
-    TokenSeen,
-    AbortSeen,
-    Apply,
-    GraceEnds,
+    TokenSeen(Script),
+    AbortSeen(Script),
+    Apply(Script),
+    GraceEnds(Script),
+    /// The `Cancel` broadcast the driver awaits is done: it takes the
+    /// actions left.
+    Resume(Script),
+    /// `select!` finds no event, and polls the grace deadline next, which
+    /// has passed.
+    Poll,
+    /// Teardown's bounded waits are over: it applies what is queued and
+    /// publishes its result.
+    TeardownEnds(Script),
     // Our side.
-    Finish(bool),
+    Finish(Outcome),
     LocalCancel(Kind),
     ExternalAbort,
     // Our frames to the peer.
@@ -1707,6 +2516,9 @@ enum Step {
     PeerGoodbye,
     PeerAck,
     PeerCancel(Kind),
+    /// After its requested stop, and before its goodbye, the peer announces
+    /// that its part is unfinished, with its failure: a second `Cancel`.
+    PeerAnnounces,
     PeerFin,
     PeerGone,
     // Faults.
@@ -1716,14 +2528,56 @@ enum Step {
     },
     /// Split: the connection the peer's frames arrive on is reset.
     ResetInbound,
+    /// A frame from the peer reaches the data bridge for an operator that
+    /// had finished: records, or a frame that does not decode. The bridge
+    /// reports it later (`ReportLate`): it takes the frames it buffered in
+    /// turn, so its report can come after anything that happened since,
+    /// such as the connection's end, or not before teardown.
+    LateRecord {
+        late: Late,
+    },
+    /// The peer's next frame to us, on its first progress channel, is
+    /// corrupt.
+    CorruptFrame,
+    /// The data bridge reports what it holds.
+    ReportLate,
 }
 
 impl Step {
-    fn coordinator(self) -> bool {
-        matches!(
-            self,
-            Self::TokenSeen | Self::AbortSeen | Self::Apply | Self::GraceEnds
-        )
+    /// The coordinator's step, with its script.
+    fn script(self) -> Option<(&'static str, Script)> {
+        match self {
+            Self::TokenSeen(script) => Some(("TokenSeen", script)),
+            Self::AbortSeen(script) => Some(("AbortSeen", script)),
+            Self::Apply(script) => Some(("Apply", script)),
+            Self::GraceEnds(script) => Some(("GraceEnds", script)),
+            Self::Resume(script) => Some(("Resume", script)),
+            Self::TeardownEnds(script) => Some(("TeardownEnds", script)),
+            _ => None,
+        }
+    }
+
+    /// The coordinator's step with another script.
+    fn with_script(self, script: Script) -> Self {
+        match self {
+            Self::TokenSeen(_) => Self::TokenSeen(script),
+            Self::AbortSeen(_) => Self::AbortSeen(script),
+            Self::Apply(_) => Self::Apply(script),
+            Self::GraceEnds(_) => Self::GraceEnds(script),
+            Self::Resume(_) => Self::Resume(script),
+            Self::TeardownEnds(_) => Self::TeardownEnds(script),
+            _ => unreachable!("not the coordinator's: {self:?}"),
+        }
+    }
+
+    /// The step as traces and pins name it: a coordinator step's script only
+    /// if it makes a choice.
+    fn text(self) -> String {
+        match self.script() {
+            Some((name, Script::NONE)) => name.to_string(),
+            Some((name, script)) => format!("{name}{script:?}"),
+            None => format!("{self:?}"),
+        }
     }
 
     /// Bound to happen once it can. The rest may never happen: faults, a
@@ -1737,28 +2591,39 @@ impl Step {
                 | Self::PeerGoodbye
                 | Self::PeerAck
                 | Self::PeerCancel(_)
+                | Self::PeerAnnounces
                 | Self::WriteError
                 | Self::Reset { .. }
                 | Self::ResetInbound
+                | Self::LateRecord { .. }
+                | Self::CorruptFrame
         )
     }
 }
 
 /// Every step that can happen in `w`, the coordinator's first.
-fn steps(w: &World, cfg: Config, out: &mut Vec<Step>) {
+fn steps(w: &World, m: &Mach, cfg: Config, tables: &Tables, out: &mut Vec<Step>) {
     out.clear();
     if w.finished {
         // Torn down: our workers may still finish, and nothing else matters.
-        if w.workers_left > 0 {
-            out.extend([Step::Finish(true), Step::Finish(false)]);
+        finish_steps(w, m, tables, out);
+        return;
+    }
+    if w.tearing_down {
+        // From teardown on, the network is still (see the module docs): only
+        // the data bridge reports what it holds, and the workers finish.
+        out.extend(driver::next(w, cfg));
+        if w.late.is_some() {
+            out.push(Step::ReportLate);
         }
+        finish_steps(w, m, tables, out);
         return;
     }
     out.extend(driver::next(w, cfg));
-    // Our workers. One may succeed although the dataflow was cancelled (it
-    // drained, or it finished first), and may fail at any time.
-    if w.workers_left > 0 {
-        out.extend([Step::Finish(true), Step::Finish(false)]);
+    finish_steps(w, m, tables, out);
+    // The data bridge's report: it is not cancelled with the other bridges.
+    if w.late.is_some() {
+        out.push(Step::ReportLate);
     }
     // Our frames to the peer.
     let writing = w.writing();
@@ -1797,7 +2662,10 @@ fn steps(w: &World, cfg: Config, out: &mut Vec<Step>) {
             {
                 out.push(Step::ReadCancel);
             }
-            if matches!(front, In::Cancel(_)) && !w.peer_locked && w.wire.len() > 1 {
+            if matches!(front, In::Cancel(_))
+                && !w.peer_locked
+                && w.wire.iter().any(|frame| !matches!(frame, In::Cancel(_)))
+            {
                 out.push(Step::ReadPastCancel);
             }
         } else if w.peer_fin {
@@ -1820,7 +2688,9 @@ fn steps(w: &World, cfg: Config, out: &mut Vec<Step>) {
     } else if w.channels_closed && !w.ctrl_close_reported {
         out.push(Step::DispatchClosed);
     }
-    for ch in 0..cfg.channels {
+    // The progress bridges, until the bridges are cancelled (from outside,
+    // or by teardown): they take the cancellation ahead of what is queued.
+    for ch in (0..cfg.channels).filter(|_| !w.aborted) {
         let i = usize::from(ch);
         if !w.prog[i].is_empty() {
             out.push(Step::Bridge(ch));
@@ -1831,10 +2701,15 @@ fn steps(w: &World, cfg: Config, out: &mut Vec<Step>) {
     // The peer. Its frames need the connection they arrive on; it can close
     // its side, and go away, as long as any connection still links us.
     if w.from_peer && !w.peer_fin {
-        if w.records_delivered && !w.peer_goodbye && w.peer_cancel != Some(Kind::Fail) {
+        if w.records_delivered
+            && !w.peer_goodbye
+            && w.peer_cancel != Some(Kind::Fail)
+            && !w.peer_announced
+        {
             out.push(Step::PeerGoodbye);
         }
-        if w.goodbye_delivered && !w.peer_ack {
+        // Its machine finishes as it announces its part unfinished.
+        if w.goodbye_delivered && !w.peer_ack && !w.peer_announced {
             out.push(Step::PeerAck);
         }
         if w.peer_cancel.is_none() {
@@ -1842,6 +2717,12 @@ fn steps(w: &World, cfg: Config, out: &mut Vec<Step>) {
             if !w.peer_goodbye {
                 out.push(Step::PeerCancel(Kind::Stop));
             }
+        } else if w.peer_cancel == Some(Kind::Stop)
+            && !w.peer_announced
+            && !w.peer_goodbye
+            && cfg.workers == 1
+        {
+            out.push(Step::PeerAnnounces);
         }
     }
     if !w.peer_fin && (w.from_peer || w.to_peer) {
@@ -1851,7 +2732,7 @@ fn steps(w: &World, cfg: Config, out: &mut Vec<Step>) {
         out.push(Step::PeerGone);
     }
     // At most one fault.
-    if !w.fault {
+    if !w.fault && cfg.faults == Faults::Transport {
         if writing && w.to_peer && !w.write_fails {
             out.push(Step::WriteError);
         }
@@ -1873,6 +2754,13 @@ fn steps(w: &World, cfg: Config, out: &mut Vec<Step>) {
             _ => {}
         }
     }
+    // What the peer sends us is lost on its way in, or corrupt.
+    if !w.fault && cfg.faults == Faults::Inbound && w.from_peer && !w.peer_fin {
+        if w.reader_up {
+            out.extend([Late::Lost, Late::Corrupt].map(|late| Step::LateRecord { late }));
+        }
+        out.push(Step::CorruptFrame);
+    }
     // A local cancellation, and the abort from outside, which comes with the
     // token cancelled. Last, so that of equally short traces the search finds
     // one without them first.
@@ -1883,21 +2771,54 @@ fn steps(w: &World, cfg: Config, out: &mut Vec<Step>) {
     }
 }
 
-/// A step other than the coordinator's: the machine is only read.
-fn take_env(w: &mut World, m: &Mach, step: Step, cfg: Config) {
+/// Our workers. One may succeed although the dataflow was cancelled (it
+/// drained, or it finished first), and may fail at any time. It reports a
+/// cancellation (no error) only once the dataflow is cancelled. That differs
+/// from a failure only in the reason `AnnounceUnfinished` may give, so it is
+/// explored only while that can still depend on it: `AnnounceUnfinished`
+/// can still send, no worker's error is recorded or queued ahead of it, the
+/// coordinator will apply it (not teardown), and a requested stop is the
+/// token's first reason, or a broadcast already went out without
+/// announcing its failure (it found no reason, and the token was cancelled
+/// before its next read). Otherwise every broadcast to come announces a
+/// failure, and `AnnounceUnfinished` then sends nothing.
+fn finish_steps(w: &World, m: &Mach, tables: &Tables, out: &mut Vec<Step>) {
+    if w.workers_left == 0 {
+        return;
+    }
+    out.extend([Step::Finish(Outcome::Ok), Step::Finish(Outcome::Failed)]);
+    let Some(first) = w.token else {
+        return;
+    };
+    let broadcast_done =
+        m.cancel_broadcast && !w.pending.iter().any(|act| act == Act::BroadcastCancel);
+    if !(w.failure_announced || w.unfinished_announced || w.worker_failure)
+        && !w.queue.iter().any(|ev| ev == Ev::Done(Outcome::Failed))
+        && !(w.tearing_down || w.finished)
+        && (!tables.is_failure(first) || broadcast_done)
+    {
+        out.push(Step::Finish(Outcome::Cancelled));
+    }
+}
+
+/// A step other than the coordinator's. It reads only whether the machine
+/// retired the link (`retired`).
+fn take_env(w: &mut World, retired: bool, step: Step, cfg: Config, tables: &Tables) {
     match step {
-        Step::Finish(success) => {
+        Step::Finish(outcome) => {
             w.workers_left -= 1;
-            w.workers_failed |= !success;
-            // After teardown the result goes to the completion only.
-            if !w.finished {
-                w.queue.push_back(Ev::Done(success));
+            w.workers_failed |= outcome != Outcome::Ok;
+            // From teardown on the result goes to the completion only:
+            // teardown's loop applies no worker's result (see those queued
+            // before it began).
+            if !(w.tearing_down || w.finished) {
+                w.queue.push_back(Ev::Done(outcome));
             }
             if w.workers_left == 0 && !w.workers_failed {
                 w.latch();
             }
         }
-        Step::LocalCancel(kind) => w.cancel(kind),
+        Step::LocalCancel(kind) => w.cancel(Why::local(kind)),
         Step::ExternalAbort => w.aborted = true,
         Step::Deliver => {
             // Ahead of the `Cancel`s it passes, which wait in the control
@@ -1931,7 +2852,7 @@ fn take_env(w: &mut World, m: &Mach, step: Step, cfg: Config) {
         Step::ForwarderRefused => {
             w.forwarder = Forwarder::Exited;
             // `run_forwarder` stays silent on a retired link.
-            if !m.retired {
+            if !retired {
                 w.queue.push_back(Ev::SendFailed);
             }
         }
@@ -1980,7 +2901,7 @@ fn take_env(w: &mut World, m: &Mach, step: Step, cfg: Config) {
         }
         Step::Dispatch => {
             let kind = w.ctrl.pop_front().expect("read");
-            w.escalate(kind);
+            w.escalate(Why::peer(kind), tables);
             w.dispatching = true;
         }
         Step::DispatchReport => {
@@ -1997,6 +2918,18 @@ fn take_env(w: &mut World, m: &Mach, step: Step, cfg: Config) {
                 w.queue.push_back(Ev::EndOfStream);
             }
             In::Ack => w.queue.push_back(Ev::Ack),
+            // After its end-of-stream the bridge reports it once and keeps
+            // reading (`watch_after_end_of_stream`); before, it ends.
+            In::Corrupt => {
+                let i = usize::from(ch);
+                w.queue.push_back(Ev::ProgressCorrupt {
+                    after_end_of_stream: w.end_of_stream[i],
+                });
+                if !w.end_of_stream[i] {
+                    w.prog_close_reported[i] = true;
+                    w.prog[i].clear();
+                }
+            }
             In::Cancel(_) => unreachable!("on the control channel"),
         },
         Step::BridgeClosed(ch) => {
@@ -2016,6 +2949,10 @@ fn take_env(w: &mut World, m: &Mach, step: Step, cfg: Config) {
         Step::PeerCancel(kind) => {
             w.peer_cancel = Some(kind);
             w.wire.push_back(In::Cancel(kind));
+        }
+        Step::PeerAnnounces => {
+            w.peer_announced = true;
+            w.wire.push_back(In::Cancel(Kind::Fail));
         }
         Step::PeerFin => w.peer_fin = true,
         Step::PeerGone => {
@@ -2040,9 +2977,26 @@ fn take_env(w: &mut World, m: &Mach, step: Step, cfg: Config) {
                 w.io.push_back(Notice::InboundEnded { clean: false });
             }
         }
-        Step::TokenSeen | Step::AbortSeen | Step::Apply | Step::GraceEnds => {
-            unreachable!("the coordinator's: {step:?}")
+        Step::LateRecord { late } => {
+            w.fault = true;
+            match late {
+                Late::Lost => w.inbound_lost = true,
+                Late::Corrupt => w.corrupt_in = true,
+            }
+            w.late = Some(late);
         }
+        Step::CorruptFrame => {
+            w.fault = true;
+            w.wire.push_back(In::Corrupt);
+        }
+        Step::ReportLate => w.queue.push_back(w.late.take().expect("held").event()),
+        Step::TokenSeen(_)
+        | Step::AbortSeen(_)
+        | Step::Apply(_)
+        | Step::GraceEnds(_)
+        | Step::Resume(_)
+        | Step::Poll
+        | Step::TeardownEnds(_) => unreachable!("the coordinator's: {step:?}"),
     }
 }
 
@@ -2051,11 +3005,13 @@ fn take_env(w: &mut World, m: &Mach, step: Step, cfg: Config) {
 // ---------------------------------------------------------------------------
 
 /// What the checks saw during a step and, when narrating a trace, what the
-/// machine did. Its counts are the premises' witnesses.
+/// machine did and the effects the driver took. Its counts are the premises'
+/// witnesses.
 #[derive(Default)]
 struct Observer {
     narrate: bool,
     notes: Vec<String>,
+    effects: Vec<Effect>,
     /// NoFalseSettle broke in this step.
     false_settle: Option<&'static str>,
     /// Failed sends settled as a failure, and settled excused.
@@ -2073,6 +3029,15 @@ impl Observer {
             self.notes.push(note());
         }
     }
+
+    fn effect(&mut self, effect: &Effect) {
+        if self.narrate {
+            if let Some(text) = effect_text(effect) {
+                self.notes.push(text);
+            }
+            self.effects.push(effect.clone());
+        }
+    }
 }
 
 /// Which losses the machine holds: recorded, pending and deferred.
@@ -2085,8 +3050,26 @@ fn losses_held(m: &LifecycleMachine) -> [bool; 3] {
 }
 
 /// A link failure, or a loss recorded or held that was not before.
+/// Which losses the machine holds (recorded, pending and deferred) are
+/// the frames a failed send dropped.
+fn outbound_held(m: &LifecycleMachine) -> [bool; 3] {
+    let outbound = |loss: &Option<DataLoss>| {
+        loss.as_ref()
+            .is_some_and(|loss| loss.detail == outbound_loss_detail(&LinkFailure::SendFailed))
+    };
+    [
+        outbound(&m.data_loss),
+        outbound(&m.pending_loss),
+        outbound(&m.deferred_loss),
+    ]
+}
+
+/// The failed send was settled as a failure: a link failure, or the loss of
+/// the frames it dropped, recorded or held, that was not before (`before`,
+/// see [`outbound_held`]). Another loss (records lost on their way in, say)
+/// is a failure of its own.
 fn settled_as_failure(m: &LifecycleMachine, before: [bool; 3], actions: &[Action]) -> bool {
-    losses_held(m)
+    outbound_held(m)
         .into_iter()
         .zip(before)
         .any(|(now, was)| now && !was)
@@ -2134,19 +3117,27 @@ fn actions_text(actions: &[Action]) -> String {
     }
 }
 
-/// An event reaches the machine. Checks NoFalseSettle.
-fn machine_applies(
-    w: &World,
-    m: &mut LifecycleMachine,
+/// An event reaches the coordinator. Checks NoFalseSettle.
+fn applies(
+    w: &mut World,
+    d: &mut impl Decide,
     ev: Ev,
+    cfg: Config,
+    tables: &Tables,
+    cursor: &mut Cursor,
     seen: &mut Observer,
 ) -> Vec<Action> {
-    let owed = m.peers[PEER].unsent();
-    let before = losses_held(m);
-    let actions = m.on_event(ev.event());
+    let owed = d.machine().peers[PEER].unsent();
+    let before = losses_held(d.machine());
+    let outbound = outbound_held(d.machine());
+    let actions = decide(w, tables, cfg, cursor, seen, |token| {
+        d.on_event(ev.event(), token)
+    });
+    let m = d.machine();
     // A send owed before, or one this event reports, that is no longer owed.
-    if (owed || ev == Ev::SendFailed) && !m.peers[PEER].unsent() {
-        if settled_as_failure(m, before, &actions) {
+    // Corrupt traffic is a failure of its own.
+    if (owed || ev == Ev::SendFailed) && !m.peers[PEER].unsent() && !ev.corrupt() {
+        if settled_as_failure(m, outbound, &actions) {
             seen.settled_failed += 1;
             if w.excuse_on_its_way() {
                 seen.false_settle = Some(
@@ -2169,21 +3160,30 @@ fn machine_applies(
 }
 
 /// The grace period of a soft failure ends. Checks NoFalseSettle.
-fn grace_expires(m: &mut LifecycleMachine, seen: &mut Observer) -> Vec<Action> {
-    let peer = &m.peers[PEER];
+fn grace_expires(w: &World, d: &mut impl Decide, seen: &mut Observer) -> Vec<Action> {
+    let peer = &d.machine().peers[PEER];
     let owed = peer.unsent();
     let finished_peer = owed && peer.retired() && peer.fully_closed();
-    let before = losses_held(m);
-    let actions = m.on_soft_failure_expired(PEER.to_string());
+    let before = losses_held(d.machine());
+    let outbound = outbound_held(d.machine());
+    let actions = d.on_soft_failure_expired(PEER.to_string());
+    let m = d.machine();
     if owed {
         seen.grace_owed += 1;
         seen.grace_finished_peer += u64::from(finished_peer);
     }
-    if finished_peer && settled_as_failure(m, before, &actions) {
-        seen.false_settle = Some(
-            "the grace period settled the failed send as a failure although the peer had said \
-             goodbye and its link had closed fully",
-        );
+    if owed && settled_as_failure(m, outbound, &actions) {
+        if finished_peer {
+            seen.false_settle = Some(
+                "the grace period settled the failed send as a failure although the peer had \
+                 said goodbye and its link had closed fully",
+            );
+        } else if w.queue.iter().any(Ev::excuses) {
+            seen.false_settle = Some(
+                "the grace period settled the failed send as a failure although the peer's \
+                 Cancel, goodbye or ack was already queued for the coordinator",
+            );
+        }
     }
     seen.note(|| {
         format!(
@@ -2195,140 +3195,682 @@ fn grace_expires(m: &mut LifecycleMachine, seen: &mut Observer) -> Vec<Action> {
     actions
 }
 
-/// Today's driver glue: what `ClusterLifecycle::run` does around the
-/// machine. Everything outside this module is the environment, which another
-/// driver keeps.
+/// What the coordinator reads of the dataflow token
+/// ([`CancellationToken`]'s accessors).
+trait TokenRead {
+    fn is_cancelled(&self) -> bool;
+    fn reason(&self) -> Option<CancellationReason>;
+    fn escalation(&self) -> Option<CancellationReason>;
+}
+
+/// A change the environment makes to the dataflow token while a coordinator
+/// step runs, just before one of its reads, whose value it changes. Each
+/// takes the environment's own steps, in their own order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Change {
+    /// The dataflow is cancelled locally.
+    LocalCancel(Kind),
+    /// The control dispatcher takes the peer's next `Cancel`, and cancels the
+    /// token with it.
+    DispatcherCancels,
+    /// The control dispatcher reports the `Cancel` it holds, and takes the
+    /// peer's `Cancel`s up to a failure, which it escalates the token with.
+    DispatcherEscalates,
+}
+
+/// What the coordinator reads of the token.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Read {
+    Cancelled,
+    Reason,
+    Escalation,
+}
+
+/// The changes the environment can make to the token before `read`, each
+/// one changing the value it returns. A cancellation changes whether the
+/// token is cancelled and its reason; an escalation needs a requested stop
+/// first and a failure from the peer.
+fn changes(w: &World, tables: &Tables, read: Read) -> Vec<&'static [Change]> {
+    let failure_queued = |skip: usize| w.ctrl.iter().skip(skip).any(|kind| kind == Kind::Fail);
+    match (w.token, w.escalation, read) {
+        (None, _, Read::Cancelled | Read::Reason) => {
+            let mut options: Vec<&'static [Change]> = vec![
+                &[Change::LocalCancel(Kind::Stop)],
+                &[Change::LocalCancel(Kind::Fail)],
+            ];
+            if !w.ctrl.is_empty() {
+                options.push(&[Change::DispatcherCancels]);
+            }
+            options
+        }
+        (None, _, Read::Escalation) => {
+            let mut options: Vec<&'static [Change]> = Vec::new();
+            if failure_queued(0) {
+                options.push(&[Change::LocalCancel(Kind::Stop), Change::DispatcherEscalates]);
+            }
+            if w.ctrl.front() == Some(Kind::Stop) && failure_queued(1) {
+                options.push(&[Change::DispatcherCancels, Change::DispatcherEscalates]);
+            }
+            options
+        }
+        (Some(first), None, Read::Escalation) if !tables.is_failure(first) && failure_queued(0) => {
+            vec![&[Change::DispatcherEscalates]]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The dataflow token as a coordinator step reads it, in the state the step
+/// runs in. Before each read whose value the environment could change, the
+/// step's script chooses whether it does, and how ([`changes`]).
+struct ModelToken<'a> {
+    ctx: std::cell::RefCell<TokenCtx<'a>>,
+}
+
+struct TokenCtx<'a> {
+    w: &'a mut World,
+    tables: &'a Tables,
+    cfg: Config,
+    cursor: &'a mut Cursor,
+    /// What the environment did, for a trace.
+    notes: Option<Vec<String>>,
+}
+
+impl TokenCtx<'_> {
+    fn before(&mut self, read: Read) {
+        let options = changes(self.w, self.tables, read);
+        if options.is_empty() {
+            return;
+        }
+        let choice = self.cursor.choose(options.len() + 1);
+        let Some(changes) = choice.checked_sub(1).map(|option| options[option]) else {
+            return;
+        };
+        for &change in changes {
+            let note = match change {
+                Change::LocalCancel(kind) => {
+                    take_env(
+                        self.w,
+                        false,
+                        Step::LocalCancel(kind),
+                        self.cfg,
+                        self.tables,
+                    );
+                    format!("meanwhile the dataflow is cancelled locally ({kind})")
+                }
+                Change::DispatcherCancels => {
+                    let kind = self.w.ctrl.front().expect("queued");
+                    take_env(self.w, false, Step::Dispatch, self.cfg, self.tables);
+                    format!(
+                        "meanwhile the control dispatcher takes the peer's Cancel ({kind}) and \
+                         cancels the token"
+                    )
+                }
+                Change::DispatcherEscalates => {
+                    loop {
+                        if self.w.dispatching {
+                            take_env(self.w, false, Step::DispatchReport, self.cfg, self.tables);
+                        }
+                        let kind = self.w.ctrl.front().expect("a failure queued");
+                        take_env(self.w, false, Step::Dispatch, self.cfg, self.tables);
+                        if kind == Kind::Fail {
+                            break;
+                        }
+                    }
+                    "meanwhile the control dispatcher takes the peer's Cancel (a failure) and \
+                     escalates the token"
+                        .to_string()
+                }
+            };
+            if let Some(notes) = &mut self.notes {
+                notes.push(note);
+            }
+        }
+    }
+}
+
+impl<'a> ModelToken<'a> {
+    fn new(
+        w: &'a mut World,
+        tables: &'a Tables,
+        cfg: Config,
+        cursor: &'a mut Cursor,
+        narrate: bool,
+    ) -> Self {
+        Self {
+            ctx: std::cell::RefCell::new(TokenCtx {
+                w,
+                tables,
+                cfg,
+                cursor,
+                notes: narrate.then(Vec::new),
+            }),
+        }
+    }
+
+    fn notes(self) -> Vec<String> {
+        self.ctx.into_inner().notes.unwrap_or_default()
+    }
+}
+
+impl TokenRead for ModelToken<'_> {
+    fn is_cancelled(&self) -> bool {
+        let mut ctx = self.ctx.borrow_mut();
+        ctx.before(Read::Cancelled);
+        ctx.w.token.is_some()
+    }
+
+    fn reason(&self) -> Option<CancellationReason> {
+        let mut ctx = self.ctx.borrow_mut();
+        ctx.before(Read::Reason);
+        ctx.w.token.map(|why| ctx.tables.reason(why))
+    }
+
+    fn escalation(&self) -> Option<CancellationReason> {
+        let mut ctx = self.ctx.borrow_mut();
+        ctx.before(Read::Escalation);
+        ctx.w.escalation.map(|why| ctx.tables.reason(why))
+    }
+}
+
+/// Run one of the coordinator's decisions, `decision`, in state `w`: the
+/// token it reads may change before each read, as `cursor` chooses.
+fn decide<T>(
+    w: &mut World,
+    tables: &Tables,
+    cfg: Config,
+    cursor: &mut Cursor,
+    seen: &mut Observer,
+    decision: impl FnOnce(&dyn TokenRead) -> T,
+) -> T {
+    let token = ModelToken::new(w, tables, cfg, cursor, seen.narrate);
+    let decided = decision(&token);
+    for note in token.notes() {
+        seen.note(|| note);
+    }
+    decided
+}
+/// What the driver does for one action: its I/O, decided by the
+/// coordinator just before the driver takes it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Effect {
+    /// Queue our ack of the peer's goodbye.
+    SendAck(String),
+    /// Broadcast `Cancel` with this reason, bounded.
+    Broadcast(String),
+    /// An `AnnounceUnfinished` that sends nothing.
+    Silent,
+    /// Escalate the dataflow token with this reason.
+    Escalate(CancellationReason),
+    /// Queue our goodbye.
+    SendGoodbye,
+    /// Arm the peer's grace deadline, unless it is armed.
+    ArmGrace(String),
+    Teardown {
+        graceful: bool,
+    },
+}
+
+/// The coordinator's decisions: what the driver asks of it at each of its
+/// decision points. The driver keeps the order in which it asks, and every
+/// await and every I/O step.
+trait Decide {
+    fn machine(&self) -> &LifecycleMachine;
+    /// The token's branch of `select!` is taken.
+    fn begin_token_noticed(&mut self);
+    /// One event from the channel (in the token's branch, or the events').
+    fn on_event(&mut self, event: LifecycleEvent, token: &dyn TokenRead) -> Vec<Action>;
+    /// The token's branch, after the events queued before it.
+    fn finish_token_noticed(&mut self, token: &dyn TokenRead) -> Vec<Action>;
+    fn on_external_abort(&mut self) -> Vec<Action>;
+    fn on_soft_failure_expired(&mut self, peer: String) -> Vec<Action>;
+    /// An action, just before the driver takes it.
+    fn prepare(&mut self, action: Action, token: &dyn TokenRead) -> Effect;
+    /// The peers whose progress lanes close after the actions.
+    fn stopped_peers(&self) -> Vec<String>;
+    /// Teardown begins: whether it lets the inbound bridges drain.
+    fn teardown_drains_inbound(&self) -> bool;
+    /// An event teardown finds queued once its bounded waits are over.
+    fn on_late_event(&mut self, event: LifecycleEvent, drain_inbound: bool);
+    /// The reason of the `Cancel` that announces a loss nobody was told of,
+    /// teardown's last broadcast, if it sends one.
+    fn unannounced_loss(&mut self) -> Option<String>;
+}
+
+/// Today's driver glue's decisions, copied from `ClusterLifecycle` (`run`,
+/// `apply`, `perform`, `cancel_broadcast_reason` and `unfinished_reason`),
+/// with every read of the token through [`TokenRead`], in the same order.
+mod glue {
+    use super::*;
+
+    pub(super) struct Glue {
+        machine: LifecycleMachine,
+        cancel_seen: bool,
+        worker_failure: Option<String>,
+        failure_announced: bool,
+        unfinished_announced: bool,
+    }
+
+    impl Glue {
+        /// The glue in state `w`, around `machine`.
+        pub(super) fn new(w: &World, machine: LifecycleMachine) -> Self {
+            Self {
+                machine,
+                cancel_seen: w.cancel_seen,
+                worker_failure: w.worker_failure.then(|| WORKER_ERROR.to_string()),
+                failure_announced: w.failure_announced,
+                unfinished_announced: w.unfinished_announced,
+            }
+        }
+
+        /// Store the driver's state in `w`.
+        pub(super) fn store(&self, w: &mut World) {
+            w.cancel_seen = self.cancel_seen;
+            w.worker_failure = match &self.worker_failure {
+                Some(failure) => {
+                    assert_eq!(failure, WORKER_ERROR, "a worker's error");
+                    true
+                }
+                None => false,
+            };
+            w.failure_announced = self.failure_announced;
+            w.unfinished_announced = self.unfinished_announced;
+        }
+
+        /// `broadcast_cancel`, up to its I/O: remembered before the broadcast
+        /// is awaited.
+        fn broadcast(&mut self, reason: String) -> Effect {
+            self.failure_announced |= CancellationReason::describes_failure(&reason);
+            Effect::Broadcast(reason)
+        }
+
+        /// `ClusterLifecycle::unfinished_reason`.
+        fn unfinished_reason(&self, token: &dyn TokenRead) -> String {
+            if let Some(detail) = &self.worker_failure {
+                return CancellationReason::WorkerFailed {
+                    detail: detail.clone(),
+                }
+                .to_string();
+            }
+            if let Some(reason) = token.escalation() {
+                return reason.to_string();
+            }
+            format!(
+                "{} (the node stopped before finishing its part of the dataflow)",
+                cancel_broadcast_reason(token)
+            )
+        }
+    }
+
+    /// `cancel_broadcast_reason`.
+    fn cancel_broadcast_reason(token: &dyn TokenRead) -> String {
+        if let Some(failure) = token.escalation() {
+            return failure.to_string();
+        }
+        match token.reason() {
+            Some(reason) => reason.to_string(),
+            None if token.is_cancelled() => "cancelled".to_string(),
+            None => CancellationReason::NetworkError {
+                detail: "the node stopped its network bridges while its workers were running"
+                    .into(),
+            }
+            .to_string(),
+        }
+    }
+
+    impl Decide for Glue {
+        fn machine(&self) -> &LifecycleMachine {
+            &self.machine
+        }
+
+        fn begin_token_noticed(&mut self) {
+            self.cancel_seen = true;
+        }
+
+        /// `ClusterLifecycle::apply`.
+        fn on_event(&mut self, event: LifecycleEvent, token: &dyn TokenRead) -> Vec<Action> {
+            match event {
+                LifecycleEvent::Link {
+                    peer,
+                    event: LinkEvent::InboundDataLost(detail),
+                } => {
+                    let cancelled = token.is_cancelled();
+                    self.machine.on_inbound_data_lost(peer, detail, cancelled)
+                }
+                LifecycleEvent::WorkerFinished { success, failure } => {
+                    if let Some(failure) = failure {
+                        self.worker_failure.get_or_insert(failure);
+                    }
+                    self.machine.on_event(LifecycleEvent::WorkerFinished {
+                        success,
+                        failure: None,
+                    })
+                }
+                event => self.machine.on_event(event),
+            }
+        }
+
+        fn finish_token_noticed(&mut self, token: &dyn TokenRead) -> Vec<Action> {
+            let failure = token.reason().is_some_and(|reason| reason.is_failure());
+            self.machine.on_dataflow_cancelled(failure)
+        }
+
+        fn on_external_abort(&mut self) -> Vec<Action> {
+            self.machine.on_external_abort()
+        }
+
+        fn on_soft_failure_expired(&mut self, peer: String) -> Vec<Action> {
+            self.machine.on_soft_failure_expired(peer)
+        }
+
+        /// `ClusterLifecycle::perform`, up to its I/O; `run` arms the timer.
+        fn prepare(&mut self, action: Action, token: &dyn TokenRead) -> Effect {
+            match action {
+                Action::SendAck(peer) => Effect::SendAck(peer),
+                Action::BroadcastCancel => {
+                    let reason = cancel_broadcast_reason(token);
+                    self.broadcast(reason)
+                }
+                Action::AnnounceUnfinished => {
+                    if !self.failure_announced && !self.unfinished_announced {
+                        self.unfinished_announced = true;
+                        let reason = self.unfinished_reason(token);
+                        self.broadcast(reason)
+                    } else {
+                        Effect::Silent
+                    }
+                }
+                Action::AbortDrain(reason) | Action::CancelDataflow(reason) => {
+                    Effect::Escalate(reason)
+                }
+                Action::SendGoodbye => Effect::SendGoodbye,
+                Action::LinkFailed { peer, failure } => {
+                    let poisoned = matches!(
+                        failure,
+                        LinkFailure::LockPoisoned
+                            | LinkFailure::Transport(TransportError::LockPoisoned { .. })
+                    );
+                    let reason = if poisoned {
+                        CancellationReason::InternalError {
+                            detail: format!("lock poisoned on the link to peer {peer}"),
+                        }
+                    } else {
+                        CancellationReason::NetworkError {
+                            detail: format!("link to peer {peer} failed: {failure}"),
+                        }
+                    };
+                    Effect::Escalate(reason)
+                }
+                Action::ArmSoftFailureTimer(peer) => Effect::ArmGrace(peer),
+                Action::Teardown { graceful } => Effect::Teardown { graceful },
+            }
+        }
+
+        /// `ClusterLifecycle::run`: the peers whose lanes close.
+        fn stopped_peers(&self) -> Vec<String> {
+            self.machine.stopped_peers().map(String::from).collect()
+        }
+
+        /// `ClusterLifecycle::teardown`: `drain_inbound`.
+        fn teardown_drains_inbound(&self) -> bool {
+            self.machine.workers_done()
+        }
+
+        /// `ClusterLifecycle::teardown`: the events drained once its
+        /// bounded waits are over.
+        fn on_late_event(&mut self, event: LifecycleEvent, drain_inbound: bool) {
+            if let LifecycleEvent::Link { event: link, .. } = &event {
+                let lost = drain_inbound && matches!(link, LinkEvent::InboundDataLost(_));
+                if lost || is_corruption_event(link) {
+                    let _ = self.machine.on_event(event);
+                }
+            }
+        }
+
+        /// `ClusterLifecycle::teardown`: the unannounced loss, broadcast
+        /// with `broadcast_cancel`.
+        fn unannounced_loss(&mut self) -> Option<String> {
+            let unannounced = match self.machine.take_unannounced_loss() {
+                Some(loss) => Some(loss),
+                None if !self.failure_announced => self.machine.data_loss().cloned(),
+                None => None,
+            };
+            let loss = unannounced?;
+            let reason = CancellationReason::NetworkError {
+                detail: loss.to_string(),
+            }
+            .to_string();
+            let Effect::Broadcast(reason) = self.broadcast(reason) else {
+                unreachable!("a broadcast")
+            };
+            Some(reason)
+        }
+    }
+}
+
+/// An effect, for a trace: what is not already in the action's name.
+fn effect_text(effect: &Effect) -> Option<String> {
+    match effect {
+        Effect::Broadcast(reason) => Some(format!("broadcasts Cancel({reason:?})")),
+        Effect::Silent => Some("AnnounceUnfinished sends nothing".into()),
+        Effect::Escalate(reason) => Some(format!("escalates the token ({reason})")),
+        _ => None,
+    }
+}
+
+/// Today's driver, around the coordinator's decisions: what
+/// `ClusterLifecycle::run` does and in which order (its biased `select!`, its
+/// timers and its I/O). Everything outside this module and [`glue`] is the
+/// environment.
 mod driver {
     use super::*;
 
     /// The coordinator's next step, if it has one. `run`'s biased `select!`
     /// takes the dataflow token (once), then the bridges' cancellation, then
-    /// the next event, then the grace timer.
+    /// the next event, then the grace timer. Its branches are polled one
+    /// after another: once it has found no event and the deadline passed, it
+    /// takes the timer's branch, also with an event queued since.
     pub(super) fn next(w: &World, cfg: Config) -> Option<Step> {
-        if w.token.is_some() && !w.cancel_seen {
-            Some(Step::TokenSeen)
+        if w.tearing_down {
+            Some(Step::TeardownEnds(Script::NONE))
+        } else if !w.pending.is_empty() {
+            Some(Step::Resume(Script::NONE))
+        } else if w.polled {
+            Some(Step::GraceEnds(Script::NONE))
+        } else if w.token.is_some() && !w.cancel_seen {
+            Some(Step::TokenSeen(Script::NONE))
         } else if w.aborted {
-            Some(Step::AbortSeen)
+            Some(Step::AbortSeen(Script::NONE))
         } else if !w.queue.is_empty() {
-            Some(Step::Apply)
+            Some(Step::Apply(Script::NONE))
         } else if w.timer && !w.busy(cfg) {
-            Some(Step::GraceEnds)
+            Some(Step::Poll)
         } else {
             None
         }
     }
 
-    /// Take the coordinator's step.
+    /// Take the coordinator's step, the token changing as `cursor` chooses.
     pub(super) fn take(
         w: &mut World,
-        m: &mut LifecycleMachine,
+        d: &mut impl Decide,
         step: Step,
         cfg: Config,
+        tables: &mut Tables,
+        cursor: &mut Cursor,
         seen: &mut Observer,
     ) {
         let actions = match step {
-            // Worker results already queued are applied first (and so is
-            // everything else queued), then the cancellation, which counts
-            // as a failure if its first reason is one.
-            Step::TokenSeen => {
-                w.cancel_seen = true;
+            // Every event already queued is applied first, then the
+            // cancellation.
+            Step::TokenSeen(_) => {
+                d.begin_token_noticed();
                 let mut actions = Vec::new();
                 while let Some(ev) = w.queue.pop_front() {
-                    actions.extend(machine_applies(w, m, ev, seen));
+                    actions.extend(applies(w, d, ev, cfg, tables, cursor, seen));
                 }
-                let failure = w.token == Some(Kind::Fail);
-                let cancelled = m.on_dataflow_cancelled(failure);
-                seen.note(|| {
-                    format!(
-                        "on_dataflow_cancelled({failure}): {}",
-                        actions_text(&cancelled)
-                    )
+                let cancelled = decide(w, tables, cfg, cursor, seen, |token| {
+                    d.finish_token_noticed(token)
                 });
+                seen.note(|| format!("on_dataflow_cancelled: {}", actions_text(&cancelled)));
                 actions.extend(cancelled);
                 actions
             }
             // At once, ahead of what is queued.
-            Step::AbortSeen => {
-                let actions = m.on_external_abort();
+            Step::AbortSeen(_) => {
+                let actions = d.on_external_abort();
                 seen.note(|| format!("on_external_abort: {}", actions_text(&actions)));
                 actions
             }
-            // A worker's result goes straight to the machine
-            // (`ClusterLifecycle::apply`), like every other event here.
-            Step::Apply => {
+            Step::Apply(_) => {
                 let ev = w.queue.pop_front().expect("queued");
-                machine_applies(w, m, ev, seen)
+                applies(w, d, ev, cfg, tables, cursor, seen)
             }
             // The deadline of the first soft failure armed; it stays armed
             // after the failure resolves.
-            Step::GraceEnds => {
+            Step::GraceEnds(_) => {
                 w.timer = false;
-                grace_expires(m, seen)
+                w.polled = false;
+                grace_expires(w, d, seen)
+            }
+            Step::Resume(_) => {
+                let mut actions = Vec::new();
+                while let Some(act) = w.pending.pop_front() {
+                    actions.push(act.action(tables));
+                }
+                actions
+            }
+            Step::TeardownEnds(_) => {
+                // Reports queued behind the event that finished the
+                // machine, and since.
+                while let Some(ev) = w.queue.pop_front() {
+                    let before = losses_held(d.machine());
+                    d.on_late_event(ev.event(), w.drain_inbound);
+                    seen.note(|| {
+                        format!("teardown finds {ev}{}", losses_taken(d.machine(), before))
+                    });
+                }
+                if let Some(reason) = d.unannounced_loss() {
+                    let effect = Effect::Broadcast(reason);
+                    seen.effect(&effect);
+                    w.send_cancel();
+                }
+                w.tearing_down = false;
+                w.finished = true;
+                return;
             }
             _ => unreachable!("not the coordinator's: {step:?}"),
         };
-        perform(w, actions, cfg);
+        perform(w, d, actions, cfg, tables, cursor, seen);
     }
 
-    /// Take the machine's actions as `ClusterLifecycle::perform` does, up to
-    /// teardown.
-    fn perform(w: &mut World, actions: Vec<Action>, cfg: Config) {
-        for action in actions {
-            match action {
-                Action::SendAck(_) => w.send(Out::Ack, cfg),
-                Action::SendGoodbye => w.send(Out::Goodbye, cfg),
-                Action::BroadcastCancel => {
-                    w.failure_announced |= w.broadcast_is_failure();
+    /// Take the actions as `run` does: each prepared just before it is
+    /// taken, up to teardown. A broadcast is awaited: the rest waits in
+    /// `pending` while the environment moves.
+    fn perform(
+        w: &mut World,
+        d: &mut impl Decide,
+        actions: Vec<Action>,
+        cfg: Config,
+        tables: &mut Tables,
+        cursor: &mut Cursor,
+        seen: &mut Observer,
+    ) {
+        let mut actions = actions.into_iter();
+        while let Some(action) = actions.next() {
+            let effect = decide(w, tables, cfg, cursor, seen, |token| {
+                d.prepare(action, token)
+            });
+            seen.effect(&effect);
+            match effect {
+                Effect::SendAck(_) => w.send(Out::Ack, cfg),
+                Effect::SendGoodbye => w.send(Out::Goodbye, cfg),
+                // Awaited: the environment moves until it is done.
+                Effect::Broadcast(_) => {
                     w.send_cancel();
-                }
-                // Sent at most once, and only if no `Cancel` so far told the
-                // peers about a failure.
-                Action::AnnounceUnfinished => {
-                    if !w.failure_announced && !w.unfinished_announced {
-                        w.unfinished_announced = true;
-                        w.send_cancel();
+                    for action in actions.by_ref() {
+                        w.pending.push_back(Act::of(&action, tables));
+                    }
+                    if !w.pending.is_empty() {
+                        return;
                     }
                 }
-                // `escalate`, with a failure.
-                Action::LinkFailed { .. } | Action::CancelDataflow(_) | Action::AbortDrain(_) => {
-                    w.escalate(Kind::Fail);
+                Effect::Silent => {}
+                Effect::Escalate(reason) => {
+                    let why = tables.why(&reason);
+                    w.escalate(why, tables);
                 }
                 // A deadline already armed stays.
-                Action::ArmSoftFailureTimer(_) => w.timer = true,
-                Action::Teardown { .. } => {
-                    w.finished = true;
+                Effect::ArmGrace(_) => w.timer = true,
+                // Its bounded waits: the step ends.
+                Effect::Teardown { .. } => {
+                    w.tearing_down = true;
+                    w.drain_inbound = d.teardown_drains_inbound();
+                    seen.note(|| {
+                        format!(
+                            "teardown begins{}",
+                            if w.drain_inbound {
+                                ", draining the inbound bridges"
+                            } else {
+                                ""
+                            }
+                        )
+                    });
                     return;
                 }
             }
         }
+        // After the actions, unless teardown returned: the progress lanes of
+        // the peers that stopped without finishing their part close. The
+        // workers read them; nothing here does.
+        let stopped = d.stopped_peers();
+        if !stopped.is_empty() {
+            seen.note(|| format!("closes the progress lanes of {}", stopped.join(", ")));
+        }
     }
 }
 
-/// Take one step from `(w, m)`.
+/// Take one step from `(w, m)`. A coordinator step runs its script, and
+/// adds the scripts that choose otherwise to `others`.
 fn take(
     w: &World,
     m: Mach,
     step: Step,
     cfg: Config,
-    losses: &mut Losses,
+    tables: &mut Tables,
     seen: &mut Observer,
+    others: &mut Vec<Script>,
 ) -> (World, Mach) {
     let mut w = *w;
-    if !step.coordinator() {
-        take_env(&mut w, &m, step, cfg);
+    if step == Step::Poll {
+        w.polled = true;
         return (w, m);
     }
-    let mut machine = m.machine(losses);
-    driver::take(&mut w, &mut machine, step, cfg, seen);
-    let m = Mach::of(&machine, losses);
+    let Some((_, script)) = step.script() else {
+        take_env(&mut w, m.retired, step, cfg, tables);
+        w.forget_reasons(m.cancel_broadcast, tables);
+        return (w, m);
+    };
+    let mut cursor = Cursor::new(script);
+    let mut glue = glue::Glue::new(&w, m.machine(tables));
+    driver::take(&mut w, &mut glue, step, cfg, tables, &mut cursor, seen);
+    glue.store(&mut w);
+    w.forget();
+    others.extend(cursor.others);
+    let m = Mach::of(glue.machine(), tables);
+    w.forget_reasons(m.cancel_broadcast, tables);
+    let tearing_down = w.finished
+        || w.tearing_down
+        || w.pending
+            .iter()
+            .any(|act| matches!(act, Act::Teardown { .. }));
     assert_eq!(
-        w.finished,
+        tearing_down,
         m.phase == Phase::Finished,
         "torn down exactly when the machine finished"
     );
     (w, m)
 }
-
 // ---------------------------------------------------------------------------
 // The search
 // ---------------------------------------------------------------------------
@@ -2336,16 +3878,17 @@ fn take(
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Property {
     Termination,
-    NoLossWithoutFailedSend,
+    NoLossWithoutCause,
     NoFalseSettle,
     NoOkAfterFailedSend,
     NoOkOverKnownLoss,
+    NoOkOverInboundLoss,
 }
 
 impl Property {
     /// Must hold. The others are pinned by [`KNOWN_FAILURES`].
     fn asserted(self) -> bool {
-        matches!(self, Self::Termination | Self::NoLossWithoutFailedSend)
+        matches!(self, Self::Termination | Self::NoLossWithoutCause)
     }
 }
 
@@ -2369,6 +3912,9 @@ struct Stats {
     loss_runs: u64,
     ok_after_failed_send: u64,
     ok_over_known_loss: u64,
+    /// Runs in which records addressed to us were lost on their way in, or
+    /// corrupt traffic reached us.
+    inbound_loss_runs: u64,
     /// States where nothing more is bound to happen.
     quiescent: u64,
     /// States where the peer has gone and the machine still runs.
@@ -2376,16 +3922,20 @@ struct Stats {
 }
 
 struct Search {
-    losses: Losses,
-    visited: HashSet<Key, BuildHasherDefault<KeyHasher>>,
-    /// Each state's predecessor and the step from it, by the index the state
-    /// was first reached under. The start is index 0.
-    trail: Vec<(u32, Step)>,
+    tables: Tables,
+    /// Every state reached. The start is state 0.
+    states: States,
     stats: Stats,
     seen: Observer,
     /// The first finding of each way to break a property.
     found: Vec<Finding>,
     violations: BTreeMap<Property, Violations>,
+    /// The identities pinned for this configuration, by property, if they
+    /// are checked; and the first finding of each property whose identity
+    /// is not among them (a new counterexample), breadth first, so a
+    /// shortest one.
+    pinned: Option<BTreeMap<String, BTreeSet<u64>>>,
+    unpinned: Vec<Finding>,
     /// The first new states whose packing, and machine encoding, are checked
     /// both ways.
     round_trips: u32,
@@ -2400,15 +3950,6 @@ struct Violations {
     identities: HashSet<u64>,
 }
 
-impl Violations {
-    /// A digest of the set of identities, whatever their order.
-    fn digest(&self) -> u64 {
-        self.identities
-            .iter()
-            .fold(0, |digest: u64, &identity| digest.wrapping_add(identity))
-    }
-}
-
 /// FNV-1a: a clause's text, as part of an identity.
 fn text_hash(text: &str) -> u64 {
     text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
@@ -2416,11 +3957,20 @@ fn text_hash(text: &str) -> u64 {
     })
 }
 
+/// What an identity is hashed from: the environment's side of a violating
+/// state, and the clause it broke.
+fn identity_words(env: u64, what: &str) -> [u64; WORDS] {
+    let mut words = [0; WORDS];
+    words[0] = env;
+    words[1] = text_hash(what);
+    words
+}
+
 impl Search {
     fn trace(&self, mut at: u32, last: Option<Step>) -> Vec<Step> {
         let mut trace: Vec<Step> = last.into_iter().collect();
         while at != 0 {
-            let (from, step) = self.trail[at as usize];
+            let (from, step) = self.states.trail(at);
             trace.push(step);
             at = from;
         }
@@ -2429,8 +3979,8 @@ impl Search {
     }
 
     /// Count a violation, found in `w` (or on a step from it). Keep the first
-    /// finding of each way to break a property: breadth first, a shortest
-    /// one.
+    /// finding of each way to break a property, and of each property's
+    /// identities that are not pinned: breadth first, a shortest one.
     fn record(
         &mut self,
         property: Property,
@@ -2439,14 +3989,31 @@ impl Search {
         at: u32,
         last: Option<Step>,
     ) {
+        let identity = mix(identity_words(w.identity(), what));
         let violations = self.violations.entry(property).or_default();
         violations.count += 1;
-        violations
-            .identities
-            .insert(mix([w.identity(), text_hash(what), 0]));
+        violations.identities.insert(identity);
         if !self.found.iter().any(|finding| finding.what == what) {
             let trace = self.trace(at, last);
             self.found.push(Finding {
+                property,
+                what,
+                trace,
+            });
+        }
+        let unpinned = self.pinned.as_ref().is_some_and(|pinned| {
+            !pinned
+                .get(&format!("{property:?}"))
+                .is_some_and(|identities| identities.contains(&pinned_identity(identity)))
+        });
+        if unpinned
+            && !self
+                .unpinned
+                .iter()
+                .any(|finding| finding.property == property)
+        {
+            let trace = self.trace(at, last);
+            self.unpinned.push(Finding {
                 property,
                 what,
                 trace,
@@ -2481,13 +4048,15 @@ impl Search {
     /// cancelled (it needs nothing from us).
     fn judge(&mut self, w: &World, m: &Mach, at: u32) {
         self.stats.runs += 1;
+        self.stats.inbound_loss_runs += u64::from(w.inbound_lost || w.corrupt_in);
         let loss = m.data_loss != 0;
         if loss {
             self.stats.loss_runs += 1;
-            if !w.writer_dead {
+            if !(w.writer_dead || w.inbound_lost || w.corrupt_in) {
                 self.record(
-                    Property::NoLossWithoutFailedSend,
-                    "the run reports a data loss although no send to the peer failed",
+                    Property::NoLossWithoutCause,
+                    "the run reports a data loss although no send to the peer failed, no \
+                     records were lost on their way in and no corrupt traffic reached us",
                     w,
                     at,
                     None,
@@ -2526,13 +4095,25 @@ impl Search {
                 );
             }
         }
+        if w.inbound_lost || w.corrupt_in {
+            let what = if w.late.is_some() {
+                "the run ends Ok although records addressed to us were lost on their way in, or \
+                 corrupt traffic reached us, before teardown began, and the data bridge had \
+                 still not reported it when teardown published its result"
+            } else if w.corrupt_unheard {
+                "the run ends Ok although corrupt traffic reached us before teardown began: the \
+                 progress bridge that held it was cancelled before it read it"
+            } else {
+                "the run ends Ok although records addressed to us were lost on their way in, or \
+                 corrupt traffic reached us, before teardown began, and the coordinator was told"
+            };
+            self.record(Property::NoOkOverInboundLoss, what, w, at, None);
+        }
     }
 
     /// Roughly the bytes the search's tables hold.
-    fn memory(&self, level: &[(Key, u32)], next: &[(Key, u32)]) -> usize {
-        self.visited.capacity() / 7 * 8 * (size_of::<Key>() + 1)
-            + self.trail.capacity() * size_of::<(u32, Step)>()
-            + (level.len() + next.len()) * size_of::<(Key, u32)>()
+    fn memory(&self) -> usize {
+        self.states.bytes()
     }
 }
 
@@ -2548,58 +4129,74 @@ fn initial(cfg: Config) -> LifecycleMachine {
 }
 
 /// Visit every state reachable from the start, breadth first. Stops early
-/// once a property that must hold is broken.
-fn explore(cfg: Config) -> Report {
+/// once a property that must hold is broken. With `pinned`, the identities
+/// pinned by property, also keeps a shortest trace to a violation of each
+/// property whose identity is not pinned.
+fn explore(cfg: Config, pinned: Option<BTreeMap<String, BTreeSet<u64>>>) -> Report {
     let started = Instant::now();
     let mut search = Search {
-        losses: Losses::default(),
-        visited: HashSet::default(),
-        trail: vec![(0, Step::Apply)],
+        tables: Tables::new(),
+        states: States::new(),
         stats: Stats::default(),
         seen: Observer::default(),
         found: Vec::new(),
         violations: BTreeMap::new(),
+        pinned,
+        unpinned: Vec::new(),
         round_trips: 1 << 20,
     };
     let start = Key::pack(
         &World::new(cfg),
-        &Mach::of(&initial(cfg), &mut search.losses),
+        &Mach::of(&initial(cfg), &mut search.tables),
     );
-    search.visited.insert(start);
-    let mut level = vec![(start, 0_u32)];
-    let mut next = Vec::new();
+    search.states.insert(start, 0, Step::Apply(Script::NONE));
+    // A level of the search: the states it reached first in as many steps.
+    let mut level = 0..search.states.len();
     let mut enabled = Vec::new();
+    let mut scripted = Vec::new();
+    let mut others = Vec::new();
     let mut memory = 0;
     while !level.is_empty() {
         search.stats.widest_level = search.stats.widest_level.max(level.len());
-        for &(key, at) in &level {
+        for at in level.clone() {
+            let key = search.states.key(at);
             let (w, m) = key.unpack();
             search.stats.states += 1;
-            steps(&w, cfg, &mut enabled);
+            steps(&w, &m, cfg, &search.tables, &mut enabled);
             search.check_state(&w, &m, &enabled, at);
-            for &step in &enabled {
-                search.stats.steps += 1;
-                let (w2, m2) = take(&w, m, step, cfg, &mut search.losses, &mut search.seen);
-                if let Some(what) = search.seen.false_settle.take() {
-                    search.record(Property::NoFalseSettle, what, &w, at, Some(step));
+            for &first in &enabled {
+                // A coordinator step once for each script it can run.
+                scripted.push(first);
+                while let Some(step) = scripted.pop() {
+                    search.stats.steps += 1;
+                    let (w2, m2) = take(
+                        &w,
+                        m,
+                        step,
+                        cfg,
+                        &mut search.tables,
+                        &mut search.seen,
+                        &mut others,
+                    );
+                    scripted.extend(others.drain(..).map(|script| step.with_script(script)));
+                    if let Some(what) = search.seen.false_settle.take() {
+                        search.record(Property::NoFalseSettle, what, &w, at, Some(step));
+                    }
+                    let key2 = Key::pack(&w2, &m2);
+                    assert_ne!(key2, key, "{cfg}: {} changed nothing", step.text());
+                    if search.states.insert(key2, at, step).is_none() {
+                        continue;
+                    }
+                    if search.round_trips > 0 {
+                        search.round_trips -= 1;
+                        assert_eq!(key2.unpack(), (w2, m2), "{cfg}: packing lost something");
+                        let again = Mach::of(&m2.machine(&search.tables), &mut search.tables);
+                        assert_eq!(again, m2, "{cfg}: rebuilding the machine lost something");
+                    }
                 }
-                let key2 = Key::pack(&w2, &m2);
-                assert_ne!(key2, key, "{cfg}: {step:?} changed nothing");
-                if !search.visited.insert(key2) {
-                    continue;
-                }
-                if search.round_trips > 0 {
-                    search.round_trips -= 1;
-                    assert_eq!(key2.unpack(), (w2, m2), "{cfg}: packing lost something");
-                    let again = Mach::of(&m2.machine(&search.losses), &mut search.losses);
-                    assert_eq!(again, m2, "{cfg}: rebuilding the machine lost something");
-                }
-                let index = u32::try_from(search.trail.len()).expect("fewer than 2^32 states");
-                search.trail.push((at, step));
-                next.push((key2, index));
             }
         }
-        memory = memory.max(search.memory(&level, &next));
+        memory = memory.max(search.memory());
         if search
             .found
             .iter()
@@ -2607,8 +4204,7 @@ fn explore(cfg: Config) -> Report {
         {
             break;
         }
-        std::mem::swap(&mut level, &mut next);
-        next.clear();
+        level = level.end..search.states.len();
         if !level.is_empty() {
             search.stats.depth += 1;
         }
@@ -2619,6 +4215,7 @@ fn explore(cfg: Config) -> Report {
         seen: search.seen,
         found: search.found,
         violations: search.violations,
+        unpinned: search.unpinned,
         seconds: started.elapsed().as_secs_f64(),
         memory,
     }
@@ -2630,6 +4227,8 @@ struct Report {
     seen: Observer,
     found: Vec<Finding>,
     violations: BTreeMap<Property, Violations>,
+    /// A shortest violation of each property whose identity is not pinned.
+    unpinned: Vec<Finding>,
     seconds: f64,
     /// Roughly the most bytes the search's tables held.
     memory: usize,
@@ -2665,7 +4264,8 @@ impl fmt::Display for Report {
             "  premises: {} states with nothing bound to happen, {} with the peer gone and the \
              machine running; {} failed sends settled as a failure, {} excused; {} grace periods \
              ended with a send owed, {} of them with the peer finished; {} Ok runs after a failed \
-             send, {} over a known loss",
+             send, {} over a known loss; {} runs with records lost on their way in or corrupt \
+             traffic",
             s.quiescent,
             s.peer_gone_running,
             o.settled_failed,
@@ -2673,15 +4273,15 @@ impl fmt::Display for Report {
             o.grace_owed,
             o.grace_finished_peer,
             s.ok_after_failed_send,
-            s.ok_over_known_loss
+            s.ok_over_known_loss,
+            s.inbound_loss_runs
         )?;
         for (property, violations) in &self.violations {
             writeln!(
                 f,
-                "  {property:?}: {} violations, {} identities, digest {:016x}",
+                "  {property:?}: {} violations, {} identities",
                 violations.count,
-                violations.identities.len(),
-                violations.digest()
+                violations.identities.len()
             )?;
         }
         for finding in &self.found {
@@ -2706,18 +4306,30 @@ impl fmt::Display for Report {
 
 /// A trace replayed from the start, one line per step.
 fn narrate(cfg: Config, trace: &[Step]) -> Vec<String> {
-    let mut losses = Losses::default();
+    let mut tables = Tables::new();
     let mut seen = Observer {
         narrate: true,
         ..Observer::default()
     };
     let mut w = World::new(cfg);
-    let mut m = Mach::of(&initial(cfg), &mut losses);
+    let mut m = Mach::of(&initial(cfg), &mut tables);
     let mut lines = Vec::new();
     for (i, &step) in trace.iter().enumerate() {
         let before = w;
-        (w, m) = take(&before, m, step, cfg, &mut losses, &mut seen);
-        let mut line = format!("{:>2}. {}", i + 1, describe(step, &before, &w, cfg));
+        (w, m) = take(
+            &before,
+            m,
+            step,
+            cfg,
+            &mut tables,
+            &mut seen,
+            &mut Vec::new(),
+        );
+        let mut line = format!(
+            "{:>2}. {}",
+            i + 1,
+            describe(step, &before, &w, cfg, &tables)
+        );
         for note in seen.notes.drain(..) {
             let _ = write!(line, "; {note}");
         }
@@ -2752,19 +4364,41 @@ fn narrate(cfg: Config, trace: &[Step]) -> Vec<String> {
     lines
 }
 
-fn describe(step: Step, before: &World, after: &World, cfg: Config) -> String {
+fn describe(step: Step, before: &World, after: &World, cfg: Config, tables: &Tables) -> String {
     match step {
-        Step::TokenSeen => format!(
+        Step::TokenSeen(_) => format!(
             "the coordinator sees the dataflow token cancelled ({}) and applies what is queued \
              first",
-            before.token.expect("cancelled")
+            if tables.is_failure(before.token.expect("cancelled")) {
+                Kind::Fail
+            } else {
+                Kind::Stop
+            }
         ),
-        Step::AbortSeen => "the coordinator sees the bridges cancelled from outside".into(),
-        Step::Apply => "the coordinator takes the next event".into(),
-        Step::GraceEnds => "the grace period ends".into(),
-        Step::Finish(success) => format!(
+        Step::AbortSeen(_) => "the coordinator sees the bridges cancelled from outside".into(),
+        Step::Apply(_) => "the coordinator takes the next event".into(),
+        Step::GraceEnds(_) => "the grace period ends".into(),
+        Step::Poll => {
+            "the coordinator finds no event and polls the grace deadline, which has passed".into()
+        }
+        Step::TeardownEnds(_) => "teardown's bounded waits are over".into(),
+        Step::Resume(_) => format!(
+            "the driver's broadcast is done; it takes the actions left ({})",
+            actions_text(
+                &before
+                    .pending
+                    .iter()
+                    .map(|act| act.action(tables))
+                    .collect::<Vec<_>>()
+            )
+        ),
+        Step::Finish(outcome) => format!(
             "a worker {}{}",
-            if success { "succeeds" } else { "fails" },
+            match outcome {
+                Outcome::Ok => "succeeds",
+                Outcome::Failed => "fails",
+                Outcome::Cancelled => "reports a cancellation",
+            },
             if before.finished {
                 " after teardown"
             } else {
@@ -2875,6 +4509,9 @@ fn describe(step: Step, before: &World, after: &World, cfg: Config) -> String {
         Step::PeerGoodbye => "the peer says goodbye (an end-of-stream on each channel)".into(),
         Step::PeerAck => "the peer acks our goodbye".into(),
         Step::PeerCancel(kind) => format!("the peer cancels ({kind})"),
+        Step::PeerAnnounces => {
+            "the peer announces that its part is unfinished, with its failure".into()
+        }
         Step::PeerFin => "the peer closes its side of the connection".into(),
         Step::PeerGone => "the peer goes away: our next write fails".into(),
         Step::WriteError => "fault: a write error".into(),
@@ -2892,6 +4529,16 @@ fn describe(step: Step, before: &World, after: &World, cfg: Config) -> String {
             _ => "fault: the connection is reset".into(),
         },
         Step::ResetInbound => "fault: the connection the peer's frames arrive on is reset".into(),
+        Step::LateRecord { late } => {
+            format!("fault: the data bridge receives {late}, and holds its report")
+        }
+        Step::CorruptFrame => {
+            "fault: the peer's next frame to us, on progress channel 0, is corrupt".into()
+        }
+        Step::ReportLate => format!(
+            "the data bridge reports {}",
+            after.queue.iter().last().expect("reported")
+        ),
     }
 }
 
@@ -2903,16 +4550,18 @@ fn describe(step: Step, before: &World, after: &World, cfg: Config) -> String {
 struct Known {
     property: Property,
     wirings: &'static [Wiring],
+    faults: &'static [Faults],
     why: &'static str,
 }
 
 /// What main breaks, and why. A test fails unless the properties it finds
 /// broken are exactly those listed for its wiring, so a fix has to update
-/// this list (and the pins, see [`GOLDEN`]).
+/// this list (and the pins, see [`PINS`]).
 const KNOWN_FAILURES: &[Known] = &[
     Known {
         property: Property::NoFalseSettle,
         wirings: &[Wiring::Shared, Wiring::SharedSplit],
+        faults: &[Faults::Transport, Faults::Inbound],
         why: "a send fails and the peer's end-of-stream is applied after its ControlClosed: \
               nothing settles the send then (only ControlClosed or a link failure does), so the \
               grace period holds a loss although the peer said goodbye and its link closed",
@@ -2920,119 +4569,403 @@ const KNOWN_FAILURES: &[Known] = &[
     Known {
         property: Property::NoFalseSettle,
         wirings: &[Wiring::Dedicated],
+        faults: &[Faults::Transport, Faults::Inbound],
         why: "while draining, the forwarder's refusal of our goodbye is a second SendFailed, \
               which settles the first at once as a loss although the peer's Cancel is on its \
               way; the grace period also holds a loss after the peer's goodbye, as in Shared mode",
     },
     Known {
+        property: Property::NoFalseSettle,
+        wirings: &[Wiring::SharedSplit, Wiring::Dedicated],
+        faults: &[Faults::Transport],
+        why: "the timer race: select! finds no event, the peer's Cancel is queued next, and it \
+              still takes the expired grace deadline, which settles the failed send as a link \
+              failure with the Cancel waiting in the channel",
+    },
+    Known {
         property: Property::NoOkAfterFailedSend,
         wirings: &[Wiring::Shared, Wiring::SharedSplit, Wiring::Dedicated],
-        why: "a write fails before the last worker succeeds, but its SendFailed is applied after \
-              that success: draining takes it for the goodbye's failure, marks the link lost and \
-              ends Ok",
+        faults: &[Faults::Transport, Faults::Inbound],
+        why: "a write fails before the last worker succeeds (a fault, or the peer has gone), but \
+              its SendFailed is applied after that success: draining takes it for the goodbye's \
+              failure, marks the link lost and ends Ok",
     },
     Known {
         property: Property::NoOkOverKnownLoss,
         wirings: &[Wiring::Shared, Wiring::SharedSplit, Wiring::Dedicated],
+        faults: &[Faults::Transport, Faults::Inbound],
         why: "as for NoOkAfterFailedSend: the records were still queued when the write failed, so \
               they never reached the peer, and the run ends Ok",
     },
+    Known {
+        property: Property::NoOkOverInboundLoss,
+        wirings: &[Wiring::Shared, Wiring::SharedSplit, Wiring::Dedicated],
+        faults: &[Faults::Inbound],
+        why: "teardown waits for the inbound data bridges only for a bound, and applies only what \
+              is queued once it is over: a bridge that reports later is not heard",
+    },
+    Known {
+        property: Property::NoOkOverInboundLoss,
+        wirings: &[Wiring::Shared, Wiring::SharedSplit, Wiring::Dedicated],
+        faults: &[Faults::Inbound],
+        why: "teardown cancels the progress bridges first, and they take the cancellation ahead \
+              of what is queued for them: a corrupt frame that reached one is never read",
+    },
+    Known {
+        property: Property::NoOkOverInboundLoss,
+        wirings: &[Wiring::Shared, Wiring::SharedSplit, Wiring::Dedicated],
+        faults: &[Faults::Inbound],
+        why: "the bridges cancelled from outside tear down before every worker has finished: a \
+              loss held while the dataflow was cancelled (it counts only if every worker still \
+              succeeds) is dropped, and teardown ignores lost records queued for it, so a \
+              worker's later success ends Ok",
+    },
 ];
 
-/// The pins: for each configuration and each property it breaks, a line
-/// `configuration | property | violations | identities | digest | trace`:
-/// how many violations the search found (states; steps for NoFalseSettle),
-/// how many distinct identities they have ([`World::identity`]), a digest of
-/// that set, and the shortest trace the search finds first. A test fails
-/// unless it finds exactly its lines, so any change to a counterexample shows.
-/// A fix lowers the counts; until the golden file lists identities (to check
-/// that a change only removes violations), a lower count can still hide a new
-/// counterexample. Read when a test runs, so a pin is updated without a
-/// rebuild.
-const GOLDEN: &str = concat!(
+/// The pins: one file per configuration, `exhaustive/<configuration>.pins`
+/// next to this file. For each property the configuration breaks, a summary
+/// line `property | violations | identities | trace`: how many violations the
+/// search found (states; steps for NoFalseSettle), how many distinct
+/// identities they have, and the shortest trace the search finds first. Then
+/// the identities themselves ([`World::identity`] with the clause broken,
+/// truncated to 48 bits), sorted, under a `[property]` header. A test fails
+/// unless it finds exactly its pins, and says whether it found an identity
+/// that is not pinned (a new counterexample, with a shortest trace to the
+/// first one of each property) or no longer finds a pinned one: a fix can
+/// then show that it only removes violations. A change to what the
+/// environment's side of a state holds changes every identity: its pins
+/// are then rewritten whole. Read when a test
+/// runs, so the pins can be updated without a rebuild: run a test with
+/// [`PIN_VAR`] set and it writes what it found instead of comparing.
+const PINS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/src/runtime/cluster_lifecycle/exhaustive.golden"
+    "/src/runtime/cluster_lifecycle/exhaustive"
 );
 
-/// A configuration's lines for [`GOLDEN`], from what its search found.
-fn golden_lines(report: &Report) -> Vec<String> {
-    let name = report.cfg.name();
-    report
-        .violations
-        .iter()
-        .map(|(property, violations)| {
+/// Set (to anything) to make a test write its configuration's pins.
+const PIN_VAR: &str = "INSTANCY_EXHAUSTIVE_PIN";
+
+/// The path of the pins of the configuration called `name`.
+fn pins_path(name: &str) -> String {
+    format!("{PINS}/{name}.pins")
+}
+
+/// What a configuration breaks: a summary line and the identities of each
+/// broken property.
+#[derive(Default, PartialEq, Eq)]
+struct Pins {
+    summary: BTreeMap<String, String>,
+    identities: BTreeMap<String, BTreeSet<u64>>,
+}
+
+/// An identity as pinned: its low 48 bits. Two violations of a property in
+/// a configuration then share an identity by chance with probability about
+/// `n / 2^48` (thousands of identities: below one in ten billion).
+fn pinned_identity(identity: u64) -> u64 {
+    identity & ((1 << 48) - 1)
+}
+
+impl Pins {
+    /// The pins of what a search found.
+    fn of(report: &Report) -> Self {
+        let mut pins = Self::default();
+        for (property, violations) in &report.violations {
             let finding = report
                 .found
                 .iter()
                 .find(|finding| finding.property == *property)
                 .expect("a finding for each violated property");
-            let trace: Vec<String> = finding
-                .trace
+            let trace: Vec<String> = finding.trace.iter().map(|step| step.text()).collect();
+            let identities: BTreeSet<u64> = violations
+                .identities
                 .iter()
-                .map(|step| format!("{step:?}"))
+                .map(|&identity| pinned_identity(identity))
                 .collect();
-            format!(
-                "{name} | {property:?} | {} | {} | {:016x} | {}",
-                violations.count,
-                violations.identities.len(),
-                violations.digest(),
-                trace.join(", ")
-            )
-        })
-        .collect()
-}
+            let name = format!("{property:?}");
+            pins.summary.insert(
+                name.clone(),
+                format!(
+                    "{name} | {} | {} | {}",
+                    violations.count,
+                    identities.len(),
+                    trace.join(", ")
+                ),
+            );
+            pins.identities.insert(name, identities);
+        }
+        pins
+    }
 
-/// The pinned lines of the configuration called `name`.
-fn pinned_lines(name: &str) -> Vec<String> {
-    let golden = std::fs::read_to_string(GOLDEN)
-        .unwrap_or_else(|error| panic!("cannot read {GOLDEN}: {error}"));
-    golden
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with("//"))
-        .filter(|line| line.split('|').next().map(str::trim) == Some(name))
-        .map(String::from)
-        .collect()
-}
-
-/// Each property's violations and identities, from lines of [`GOLDEN`].
-fn pin_counts<'a>(lines: impl IntoIterator<Item = &'a str>) -> BTreeMap<String, (u64, u64)> {
-    lines
-        .into_iter()
-        .filter_map(|line| {
-            let columns: Vec<&str> = line.split('|').map(str::trim).collect();
-            let count = |i: usize| columns.get(i)?.parse::<u64>().ok();
-            Some((columns.get(1)?.to_string(), (count(2)?, count(3)?)))
-        })
-        .collect()
-}
-
-/// How each property's violations moved from its pins, for a failure.
-fn pin_changes(pinned: &[String], found: &[String]) -> Vec<String> {
-    let pinned = pin_counts(pinned.iter().map(String::as_str));
-    let found = pin_counts(found.iter().map(String::as_str));
-    let properties: BTreeSet<&String> = pinned.keys().chain(found.keys()).collect();
-    properties
-        .into_iter()
-        .map(|property| match (pinned.get(property), found.get(property)) {
-            (Some(pin), Some(now)) if now.0 > pin.0 || now.1 > pin.1 => {
-                format!("{property}: more violations or identities than pinned: a new counterexample")
+    /// The pins written by [`Self::render`].
+    fn parse(text: &str) -> Self {
+        let mut pins = Self::default();
+        let mut section: Option<String> = None;
+        for line in text.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with("//") {
+                continue;
             }
-            (Some(pin), Some(now)) if now == pin => {
-                format!("{property}: as many as pinned, but another digest or shortest trace")
+            if let Some(property) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                pins.identities.entry(property.to_string()).or_default();
+                section = Some(property.to_string());
+            } else if let Some(property) = &section {
+                let identity = u64::from_str_radix(line, 16)
+                    .unwrap_or_else(|error| panic!("pinned identity {line:?}: {error}"));
+                pins.identities
+                    .get_mut(property)
+                    .expect("its section")
+                    .insert(identity);
+            } else {
+                let property = line.split('|').next().map_or("", str::trim);
+                pins.summary.insert(property.to_string(), line.to_string());
             }
-            (Some(_), Some(_)) => format!("{property}: fewer violations than pinned"),
-            (Some(_), None) => format!("{property}: no longer broken"),
-            (None, _) => format!("{property}: newly broken"),
-        })
-        .collect()
+        }
+        pins
+    }
+
+    fn render(&self, name: &str) -> String {
+        let mut text = format!(
+            "// Pins of runtime::cluster_lifecycle::exhaustive, configuration {name}\n\
+             // (see `PINS` there). Written by a test run with {PIN_VAR} set.\n\
+             //\n\
+             // property | violations | identities | shortest trace\n"
+        );
+        for line in self.summary.values() {
+            let _ = writeln!(text, "{line}");
+        }
+        for (property, identities) in &self.identities {
+            let _ = write!(text, "\n[{property}]\n");
+            for identity in identities {
+                let _ = writeln!(text, "{identity:012x}");
+            }
+        }
+        text
+    }
+
+    /// How `found` differs from these pins, for a failure.
+    fn changes(&self, found: &Self) -> Vec<String> {
+        let properties: BTreeSet<&String> = self
+            .summary
+            .keys()
+            .chain(found.summary.keys())
+            .chain(self.identities.keys())
+            .chain(found.identities.keys())
+            .collect();
+        let empty = BTreeSet::new();
+        let identities = |n: usize| if n == 1 { "identity" } else { "identities" };
+        let mut changes = Vec::new();
+        for property in properties {
+            let pinned = self.identities.get(property).unwrap_or(&empty);
+            let now = found.identities.get(property).unwrap_or(&empty);
+            let new: Vec<String> = now
+                .difference(pinned)
+                .map(|identity| format!("{identity:012x}"))
+                .collect();
+            if !new.is_empty() {
+                changes.push(format!(
+                    "{property}: {} {} not pinned, a new counterexample (first: {})",
+                    new.len(),
+                    identities(new.len()),
+                    new[..new.len().min(4)].join(", ")
+                ));
+            }
+            let gone = pinned.difference(now).count();
+            if gone > 0 {
+                changes.push(format!(
+                    "{property}: {gone} pinned {} no longer found (fewer violations)",
+                    identities(gone)
+                ));
+            }
+            let (was, is) = (self.summary.get(property), found.summary.get(property));
+            if was != is {
+                changes.push(format!(
+                    "{property}: summary pinned as `{}`, found `{}`",
+                    was.map_or("(none)", String::as_str),
+                    is.map_or("(none)", String::as_str)
+                ));
+            }
+        }
+        changes
+    }
+}
+/// Every text a coordinator step can broadcast from `(w, m)`, whatever the
+/// token does before each of its reads.
+fn broadcasts(
+    w: &World,
+    m: Mach,
+    step: Step,
+    cfg: Config,
+    tables: &mut Tables,
+) -> BTreeSet<String> {
+    let mut texts = BTreeSet::new();
+    let mut scripts = vec![step];
+    while let Some(step) = scripts.pop() {
+        let mut seen = Observer {
+            narrate: true,
+            ..Observer::default()
+        };
+        let mut others = Vec::new();
+        take(w, m, step, cfg, tables, &mut seen, &mut others);
+        scripts.extend(others.into_iter().map(|script| step.with_script(script)));
+        texts.extend(seen.effects.into_iter().filter_map(|effect| match effect {
+            Effect::Broadcast(text) => Some(text),
+            _ => None,
+        }));
+    }
+    texts
 }
 
-fn check(wiring: Wiring, workers: u8, channels: u8) {
+/// The state `trace` leads to from the start, each of its steps enabled where
+/// it is taken (the coordinator's with the token left alone), and the
+/// texts broadcast on the way.
+fn reach(cfg: Config, trace: &[Step]) -> (World, Mach, Tables, Vec<String>) {
+    let mut tables = Tables::new();
+    let mut w = World::new(cfg);
+    let mut m = Mach::of(&initial(cfg), &mut tables);
+    let mut enabled = Vec::new();
+    let mut seen = Observer {
+        narrate: true,
+        ..Observer::default()
+    };
+    for &step in trace {
+        steps(&w, &m, cfg, &tables, &mut enabled);
+        assert!(
+            enabled.contains(&step),
+            "{} is not enabled after {:?}",
+            step.text(),
+            trace.iter().map(|step| step.text()).collect::<Vec<_>>()
+        );
+        (w, m) = take(&w, m, step, cfg, &mut tables, &mut seen, &mut Vec::new());
+    }
+    let texts = seen
+        .effects
+        .into_iter()
+        .filter_map(|effect| match effect {
+            Effect::Broadcast(text) => Some(text),
+            _ => None,
+        })
+        .collect();
+    (w, m, tables, texts)
+}
+
+/// The token changes between the coordinator's reads of it. A worker fails
+/// while the token is not cancelled: the broadcast finds no reason, the
+/// token is cancelled next, and the broadcast says only "cancelled". After a
+/// requested stop was announced, a worker reports its cancellation:
+/// `AnnounceUnfinished` reads the escalation twice, and the peer's failure
+/// (its second `Cancel`, after its own requested stop) can be escalated
+/// before either read or between them.
+#[test]
+fn the_token_changes_between_reads() {
+    let cfg = Config {
+        wiring: Wiring::Shared,
+        workers: 1,
+        channels: 1,
+        faults: Faults::Transport,
+    };
+    let (w, m, mut tables, _) = reach(cfg, &[Step::Finish(Outcome::Failed)]);
+    let texts = broadcasts(&w, m, Step::Apply(Script::NONE), cfg, &mut tables);
+    assert!(texts.contains("cancelled"), "{texts:?}");
+
+    let (w, m, mut tables, _) = reach(
+        cfg,
+        &[
+            Step::LocalCancel(Kind::Stop),
+            Step::TokenSeen(Script::NONE),
+            Step::PeerCancel(Kind::Stop),
+            Step::PeerAnnounces,
+            Step::Read,
+            Step::Read,
+            Step::Finish(Outcome::Cancelled),
+        ],
+    );
+    assert_eq!(w.ctrl.iter().collect::<Vec<_>>(), [Kind::Stop, Kind::Fail]);
+    let texts = broadcasts(&w, m, Step::Apply(Script::NONE), cfg, &mut tables);
+    let stop = CancellationReason::UserRequested.to_string();
+    let failure = tables.reason(Why::PEER_FAILURE).to_string();
+    let unfinished = "(the node stopped before finishing its part of the dataflow)";
+    assert_eq!(
+        texts,
+        BTreeSet::from([
+            format!("{stop} {unfinished}"),
+            failure.clone(),
+            format!("{failure} {unfinished}"),
+        ])
+    );
+}
+
+/// The peer stops, and our `Cancel` says so; then it announces that its
+/// part is unfinished, with its failure, which the control dispatcher
+/// escalates the token with; our workers stop, and our `AnnounceUnfinished`
+/// forwards that failure.
+#[test]
+fn the_peer_s_failure_after_its_stop_is_forwarded() {
+    let cfg = Config {
+        wiring: Wiring::Shared,
+        workers: 1,
+        channels: 1,
+        faults: Faults::Transport,
+    };
+    let (_, _, tables, texts) = reach(
+        cfg,
+        &[
+            Step::PeerCancel(Kind::Stop),
+            Step::Read,
+            Step::Dispatch,
+            Step::DispatchReport,
+            Step::TokenSeen(Script::NONE),
+            Step::PeerAnnounces,
+            Step::Read,
+            Step::Dispatch,
+            Step::DispatchReport,
+            Step::Apply(Script::NONE),
+            Step::Finish(Outcome::Cancelled),
+            Step::Apply(Script::NONE),
+        ],
+    );
+    assert_eq!(
+        texts,
+        [Why::PEER_STOP, Why::PEER_FAILURE].map(|why| tables.reason(why).to_string())
+    );
+}
+/// The data bridge reports corrupt traffic it buffered after the connection
+/// it came on has ended, and after the coordinator applied that end (a soft
+/// failure, waiting for the rest of the link): while the workers still run,
+/// it is fatal at once.
+#[test]
+fn the_data_bridge_reports_after_the_connection_ends() {
+    let cfg = Config {
+        wiring: Wiring::Dedicated,
+        workers: 1,
+        channels: 1,
+        faults: Faults::Inbound,
+    };
+    let (w, m, _, texts) = reach(
+        cfg,
+        &[
+            Step::LateRecord {
+                late: Late::Corrupt,
+            },
+            Step::PeerFin,
+            Step::ReaderEof,
+            Step::ForwardNotice,
+            Step::Apply(Script::NONE),
+            Step::ReportLate,
+            Step::Apply(Script::NONE),
+        ],
+    );
+    assert!(w.timer, "the connection's end armed the grace deadline");
+    assert!(m.phase == Phase::Running && m.data_loss != 0);
+    assert_eq!(texts.len(), 1, "{texts:?}");
+}
+
+fn check(wiring: Wiring, workers: u8, channels: u8, faults: Faults) {
     for known in KNOWN_FAILURES {
         assert!(
-            !known.property.asserted() && !known.wirings.is_empty() && !known.why.is_empty(),
-            "{:?}: a known failure needs a pinned property, wirings and a reason",
+            !known.property.asserted()
+                && !known.wirings.is_empty()
+                && !known.faults.is_empty()
+                && !known.why.is_empty(),
+            "{:?}: a known failure needs a pinned property, wirings, faults and a reason",
             known.property
         );
     }
@@ -3040,11 +4973,21 @@ fn check(wiring: Wiring, workers: u8, channels: u8) {
         wiring,
         workers,
         channels,
+        faults,
     };
-    let report = explore(cfg);
+    let path = pins_path(&cfg.name());
+    let writing = std::env::var_os(PIN_VAR).is_some();
+    let pinned = (!writing).then(|| {
+        std::fs::read_to_string(&path)
+            .map(|text| Pins::parse(&text))
+            .unwrap_or_else(|error| {
+                panic!("cannot read {path}: {error}; run the test with {PIN_VAR}=1 to write it")
+            })
+    });
+    let report = explore(cfg, pinned.as_ref().map(|pins| pins.identities.clone()));
     println!("{report}");
     let broken = report.broken();
-    for property in [Property::Termination, Property::NoLossWithoutFailedSend] {
+    for property in [Property::Termination, Property::NoLossWithoutCause] {
         assert!(
             !broken.contains(&property),
             "{cfg}: {property:?} is broken (see the trace above)"
@@ -3052,7 +4995,7 @@ fn check(wiring: Wiring, workers: u8, channels: u8) {
     }
     let listed: BTreeSet<Property> = KNOWN_FAILURES
         .iter()
-        .filter(|known| known.wirings.contains(&wiring))
+        .filter(|known| known.wirings.contains(&wiring) && known.faults.contains(&faults))
         .map(|known| known.property)
         .collect();
     assert_eq!(
@@ -3068,101 +5011,179 @@ fn check(wiring: Wiring, workers: u8, channels: u8) {
     );
     assert!(
         s.loss_runs > 0,
-        "{cfg}: NoLossWithoutFailedSend is vacuous: no run reports a data loss"
+        "{cfg}: NoLossWithoutCause is vacuous: no run reports a data loss"
     );
+    match faults {
+        Faults::Transport => {
+            assert!(
+                o.settled_failed > 0,
+                "{cfg}: NoFalseSettle is vacuous: no failed send is settled as a failure"
+            );
+            assert!(
+                s.ok_after_failed_send > 0,
+                "{cfg}: NoOkAfterFailedSend is vacuous: no run ends Ok after a failed send"
+            );
+            assert!(
+                s.ok_over_known_loss > 0,
+                "{cfg}: NoOkOverKnownLoss is vacuous: no run ends Ok over a known loss"
+            );
+        }
+        Faults::Inbound => assert!(
+            s.inbound_loss_runs > 0,
+            "{cfg}: NoOkOverInboundLoss is vacuous: no run loses records on their way in"
+        ),
+    }
+    let found = Pins::of(&report);
+    let Some(pinned) = pinned else {
+        std::fs::write(&path, found.render(&cfg.name()))
+            .unwrap_or_else(|error| panic!("cannot write {path}: {error}"));
+        println!("{cfg}: pins written to {path}");
+        return;
+    };
+    let changes = pinned.changes(&found);
+    let mut new = String::new();
+    for finding in &report.unpinned {
+        let _ = writeln!(
+            new,
+            "A shortest new counterexample of {:?} ({}), {} steps:",
+            finding.property,
+            finding.what,
+            finding.trace.len()
+        );
+        for line in narrate(cfg, &finding.trace) {
+            let _ = writeln!(new, "  {line}");
+        }
+    }
     assert!(
-        o.settled_failed > 0,
-        "{cfg}: NoFalseSettle is vacuous: no failed send is settled as a failure"
-    );
-    assert!(
-        s.ok_after_failed_send > 0,
-        "{cfg}: NoOkAfterFailedSend is vacuous: no run ends Ok after a failed send"
-    );
-    assert!(
-        s.ok_over_known_loss > 0,
-        "{cfg}: NoOkOverKnownLoss is vacuous: no run ends Ok over a known loss"
-    );
-    let pinned = pinned_lines(&cfg.name());
-    let found = golden_lines(&report);
-    assert!(
-        pinned == found,
-        "{cfg}: the violations differ from the pins in {GOLDEN}:\n{}\npinned:\n{}\n\
-         found:\n{}\nIf the change is meant, replace the configuration's lines with the ones \
-         found.",
-        pin_changes(&pinned, &found).join("\n"),
-        pinned.join("\n"),
-        found.join("\n")
+        changes.is_empty(),
+        "{cfg}: the violations differ from the pins in {path}:\n{}\n{new}If the change is meant, \
+         run the test again with {PIN_VAR}=1 to rewrite them.",
+        changes.join("\n")
     );
 }
 
 #[test]
-#[ignore = "slow in a debug build: CI runs it in release (conformance job)"]
+#[ignore = "slow in a debug build: CI's lifecycle job runs it in release"]
 fn shared_one_worker_one_channel() {
-    check(Wiring::Shared, 1, 1);
+    check(Wiring::Shared, 1, 1, Faults::Transport);
 }
 
 #[test]
-#[ignore = "slow in a debug build: CI runs it in release (conformance job)"]
+#[ignore = "slow in a debug build: CI's lifecycle job runs it in release"]
 fn shared_one_worker_two_channels() {
-    check(Wiring::Shared, 1, 2);
+    check(Wiring::Shared, 1, 2, Faults::Transport);
 }
 
 #[test]
-#[ignore = "slow in a debug build: CI runs it in release (conformance job)"]
+#[ignore = "slow in a debug build: CI's lifecycle job runs it in release"]
 fn shared_two_workers_one_channel() {
-    check(Wiring::Shared, 2, 1);
+    check(Wiring::Shared, 2, 1, Faults::Transport);
 }
 
 #[test]
-#[ignore = "slow in a debug build: CI runs it in release (conformance job)"]
+#[ignore = "slow in a debug build: CI's lifecycle job runs it in release"]
 fn shared_two_workers_two_channels() {
-    check(Wiring::Shared, 2, 2);
+    check(Wiring::Shared, 2, 2, Faults::Transport);
 }
 
 #[test]
-#[ignore = "slow in a debug build: CI runs it in release (conformance job)"]
+#[ignore = "slow in a debug build: CI's lifecycle job runs it in release"]
 fn shared_split_one_worker_one_channel() {
-    check(Wiring::SharedSplit, 1, 1);
+    check(Wiring::SharedSplit, 1, 1, Faults::Transport);
 }
 
 #[test]
-#[ignore = "slow in a debug build: CI runs it in release (conformance job)"]
+#[ignore = "slow in a debug build: CI's lifecycle job runs it in release"]
 fn shared_split_one_worker_two_channels() {
-    check(Wiring::SharedSplit, 1, 2);
+    check(Wiring::SharedSplit, 1, 2, Faults::Transport);
 }
 
 #[test]
-#[ignore = "abstract and large (67 million states, about 6 GB): CI skips it; run it by hand in release (see the module docs)"]
+#[ignore = "abstract and large (94 million states, about 5 GB): CI skips it; run it by hand in release (see the module docs)"]
 fn shared_split_two_workers_one_channel() {
-    check(Wiring::SharedSplit, 2, 1);
+    check(Wiring::SharedSplit, 2, 1, Faults::Transport);
 }
 
 #[test]
-#[ignore = "too large for CI (308 million states, about 9 minutes and 23 GB): run it by hand in release (see the module docs)"]
+#[ignore = "too large for CI (423 million states, about 16 minutes and 20 GB): run it by hand in release (see the module docs)"]
 fn shared_split_two_workers_two_channels() {
-    check(Wiring::SharedSplit, 2, 2);
+    check(Wiring::SharedSplit, 2, 2, Faults::Transport);
 }
 
 #[test]
-#[ignore = "slow in a debug build: CI runs it in release (conformance job)"]
+#[ignore = "slow in a debug build: CI's lifecycle job runs it in release"]
 fn dedicated_one_worker_one_channel() {
-    check(Wiring::Dedicated, 1, 1);
+    check(Wiring::Dedicated, 1, 1, Faults::Transport);
 }
 
 #[test]
-#[ignore = "slow in a debug build: CI runs it in release (conformance job)"]
+#[ignore = "slow in a debug build: CI's lifecycle job runs it in release"]
 fn dedicated_one_worker_two_channels() {
-    check(Wiring::Dedicated, 1, 2);
+    check(Wiring::Dedicated, 1, 2, Faults::Transport);
 }
 
 #[test]
-#[ignore = "abstract and large (53 million states, about 3 GB): CI skips it; run it by hand in release (see the module docs)"]
+#[ignore = "abstract and large (69 million states, about 4 GB): CI skips it; run it by hand in release (see the module docs)"]
 fn dedicated_two_workers_one_channel() {
-    check(Wiring::Dedicated, 2, 1);
+    check(Wiring::Dedicated, 2, 1, Faults::Transport);
 }
 
 #[test]
-#[ignore = "too large for CI (223 million states, about 7 minutes and 12 GB): run it by hand in release (see the module docs)"]
+#[ignore = "too large for CI (282 million states, about 11 minutes and 16 GB): run it by hand in release (see the module docs)"]
 fn dedicated_two_workers_two_channels() {
-    check(Wiring::Dedicated, 2, 2);
+    check(Wiring::Dedicated, 2, 2, Faults::Transport);
+}
+
+#[test]
+#[ignore = "slow in a debug build: CI's lifecycle job runs it in release"]
+fn shared_one_worker_one_channel_inbound() {
+    check(Wiring::Shared, 1, 1, Faults::Inbound);
+}
+
+#[test]
+#[ignore = "large (91 million states, about 4 GB): CI skips it; run it by hand in release (see the module docs)"]
+fn shared_one_worker_two_channels_inbound() {
+    check(Wiring::Shared, 1, 2, Faults::Inbound);
+}
+
+#[test]
+#[ignore = "abstract and large (86 million states, about 4 GB): CI skips it; run it by hand in release (see the module docs)"]
+fn shared_two_workers_one_channel_inbound() {
+    check(Wiring::Shared, 2, 1, Faults::Inbound);
+}
+
+#[test]
+#[ignore = "slow in a debug build: CI's lifecycle job runs it in release"]
+fn shared_split_one_worker_one_channel_inbound() {
+    check(Wiring::SharedSplit, 1, 1, Faults::Inbound);
+}
+
+#[test]
+#[ignore = "too large for CI (402 million states, about 15 minutes and 19 GB): run it by hand in release (see the module docs)"]
+fn shared_split_one_worker_two_channels_inbound() {
+    check(Wiring::SharedSplit, 1, 2, Faults::Inbound);
+}
+
+#[test]
+#[ignore = "abstract and too large for CI (375 million states, about 14 minutes and 18 GB): run it by hand in release (see the module docs)"]
+fn shared_split_two_workers_one_channel_inbound() {
+    check(Wiring::SharedSplit, 2, 1, Faults::Inbound);
+}
+
+#[test]
+#[ignore = "slow in a debug build: CI's lifecycle job runs it in release"]
+fn dedicated_one_worker_one_channel_inbound() {
+    check(Wiring::Dedicated, 1, 1, Faults::Inbound);
+}
+
+#[test]
+#[ignore = "large (217 million states, about 10 GB): CI skips it; run it by hand in release (see the module docs)"]
+fn dedicated_one_worker_two_channels_inbound() {
+    check(Wiring::Dedicated, 1, 2, Faults::Inbound);
+}
+
+#[test]
+#[ignore = "abstract and large (186 million states, about 9 GB): CI skips it; run it by hand in release (see the module docs)"]
+fn dedicated_two_workers_one_channel_inbound() {
+    check(Wiring::Dedicated, 2, 1, Faults::Inbound);
 }

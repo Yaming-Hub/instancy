@@ -86,28 +86,43 @@ RUSTFLAGS="-Dwarnings --cfg instancy_loom" \
 
 ## The lifecycle machine, checked exhaustively
 
-`runtime::cluster_lifecycle::exhaustive` drives the cluster lifecycle machine
-through every order in which its events can reach it, for one peer (see
-`docs/design/cluster.md`, §5.5.4). Each configuration is a test: Shared mode
-on one connection or on two, or Dedicated mode; one or two local workers; one
-or two progress channels. A debug build is too slow for them, so they are
-ignored, and the conformance job runs eight of them in release, in a few
-minutes:
+`runtime::cluster_lifecycle::exhaustive` drives the cluster lifecycle
+coordinator through every order in which its events can reach it, for one
+peer (see `docs/design/cluster.md`, §5.5.4). Each configuration is a test:
+Shared mode on one connection or on two, or Dedicated mode; one or two local
+workers; one or two progress channels; transport faults (a write error or a
+reset) or inbound ones (records lost on their way in, corrupt frames). A
+debug build is too slow for them, so they are ignored. CI's `lifecycle` job
+runs eleven of them in release, in two parts that run at the same time; each
+part's checking takes about six minutes, not counting its build. A part runs
+two lanes at once, and a lane runs its configurations one after another,
+each in its own process, so that the log shows each one's time and peak
+memory. The lanes, in `.github/workflows/ci.yml`, are balanced by time. The
+job checks that every configuration is in exactly one lane or is listed
+there as run by hand, so a new configuration goes in one or the other. The
+same eleven, locally:
 
 ```sh
 cargo test -p instancy --release --all-features --lib -- --include-ignored \
   --nocapture --test-threads 2 cluster_lifecycle::exhaustive:: \
-  --skip dedicated_two_workers --skip shared_split_two_workers
+  --skip dedicated_two_workers --skip shared_split_two_workers \
+  --skip two_channels_inbound --skip two_workers_one_channel_inbound
 ```
 
-To run the four largest too, by hand, drop the `--skip`s and run one test at
-a time (`--test-threads 1`): the largest, split Shared mode with two workers
-and two channels, visits 308 million states in about 9 minutes and needs
-about 23 GB. `--nocapture` prints, for each configuration, its counts and a
-shortest counterexample of every property it breaks. What each configuration
-breaks is pinned in `instancy/src/runtime/cluster_lifecycle/exhaustive.golden`;
-a test that finds anything else fails and prints the lines to put there
-instead.
+To run the others too, by hand, drop the `--skip`s and run one test at a time
+(`--test-threads 1`): the largest, split Shared mode with two workers and two
+channels and transport faults, visits 423 million states in about 16 minutes
+and needs about 20 GB. `--nocapture` prints, for each configuration, its
+counts and a shortest counterexample of every way it breaks a property.
+
+What each configuration breaks is pinned in
+`instancy/src/runtime/cluster_lifecycle/exhaustive/<configuration>.pins`: for
+each property, the number of violations, the set of their identities and a
+shortest trace. A test that finds anything else fails and says whether it
+found an identity that is not pinned (a new counterexample) or no longer
+finds a pinned one. Once the change is meant, run the test again with
+`INSTANCY_EXHAUSTIVE_PIN=1` to rewrite the file: a fix shows in its diff as
+identities removed, none added.
 
 ## Differences from `cargo test`
 

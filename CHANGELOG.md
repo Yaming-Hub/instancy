@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Cluster lifecycle check, extended to its driver
+
+- **Tests:** the exhaustive check of the cluster lifecycle coordinator
+  (`runtime::cluster_lifecycle::exhaustive`) now covers a copy of the
+  decisions its driver makes around the machine, and how the driver
+  schedules them: the dataflow token's reasons as values, which can change
+  between any two of its reads; the text of every `Cancel` it broadcasts, and
+  an `AnnounceUnfinished` that sends nothing; the driver awaiting a broadcast
+  while other tasks move; the timer race in its `select!`; and teardown's
+  phases, with the reports it hears before its bounded waits are over. The
+  peer can also announce that its part is unfinished, with a second
+  `Cancel`. Nine configurations add records lost on their way in and
+  corrupt frames from the peer, and a new property, NoOkOverInboundLoss,
+  does not hold: teardown waits for the inbound bridges only for a bound,
+  cancels the progress bridges before they read what is queued for them,
+  and drops a loss held during a cancellation when the bridges are
+  cancelled from outside. The timer race breaks NoFalseSettle further. Pins
+  are now the sets of the counterexamples' identities, one file per
+  configuration, so that a fix shows it only removes counterexamples. Three
+  tests drive the real driver's teardown with controlled timing. CI runs
+  eleven configurations in a job of their own, in two parts that run at the
+  same time (`docs/testing/nextest.md`; design: §5.5.4 of
+  `docs/design/cluster.md`).
+
 ### Pinned Rust toolchain
 
 - **CI and local builds use Rust 1.99.1**, named in `rust-toolchain.toml`
