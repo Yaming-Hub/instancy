@@ -595,35 +595,49 @@ connection is corrupt traffic, reported at once.
 
 #### 5.5.4 The coordinator, checked exhaustively
 
+The coordinator's decisions live in `Coordinator`, which awaits nothing and
+does no I/O but logging (which the check does not see): the
+`LifecycleMachine`, and what is decided around it (the text of each `Cancel`,
+the escalations, whether an announcement goes out, teardown's choices).
+`ClusterLifecycle::run` only waits for what comes next (its biased `select!`
+and the grace timers), asks the coordinator, and performs what it decides,
+reading the dataflow token through the coordinator in the same order as it did
+before the decisions moved.
+
 `runtime::cluster_lifecycle::exhaustive` (a test module) drives the real
-`LifecycleMachine`, with a copy of the decisions `ClusterLifecycle` makes
-around it, through every order in which its events can reach it, for one
+`Coordinator` through every order in which its events can reach it, for one
 peer, within small bounds. Written by hand: the producers that feed the
 coordinator's event channel and how they interleave (the io forwarder, the
 control dispatcher, the progress bridges, the data bridge, the outbox
-forwarder and the workers), the driver's scheduling around its decisions
-(its biased `select!`, its awaits, its grace timer, teardown's phases), a copy
-of its decisions (`glue`), the transport in each mode (Shared with our lane
-and the peer's frames on one connection or on two, Dedicated; in both, a
-`Cancel` can overtake lane frames queued before it, and only the one frame
-the transport was already taking can overtake a `Cancel` queued before it,
-either way; in Shared mode a write that is not ours, such as an RTT probe or
-another dataflow's frame, can fail our lane, and a notice the transport
-queues after the end of the read side can reach the coordinator first, as
-the transport hands that end on from a task of its own), the peer and our
-workers. Every configuration includes a local cancellation (a requested stop
-or a failure), the bridges cancelled from outside, workers that finish after
-teardown (with our frames still in the transport written, or lost to a write
-that fails, until they do), and at most one fault: a write error or a reset
-(transport faults), or records lost on their way in and corrupt frames
-(inbound faults). The dataflow token holds its reasons as
-values, and it can change between any two of the coordinator's reads of it.
-The driver awaits its `Cancel` broadcasts while the environment moves, its
-`select!` can take an expired grace deadline with an event queued since it
-found none, and teardown lets the inbound bridges drain (when every worker
-is done) and waits for them for a bound, then applies the lost records and
-corrupt traffic it finds queued. States are deduplicated exactly, and the
+forwarder and the workers), the driver's scheduling around its decisions (its
+biased `select!`, its awaits, its grace timer, teardown's phases), the
+transport in each mode (Shared with our lane and the peer's frames on one
+connection or on two, Dedicated; in both, a `Cancel` can overtake lane frames
+queued before it, and only the one frame the transport was already taking can
+overtake a `Cancel` queued before it, either way; in Shared mode a write that
+is not ours, such as an RTT probe or another dataflow's frame, can fail our
+lane, and a notice the transport queues after the end of the read side can
+reach the coordinator first, as the transport hands that end on from a task
+of its own), the peer and our workers. Every configuration includes a local
+cancellation (a requested stop or a failure), the bridges cancelled from
+outside, workers that finish after teardown (with our frames still in the
+transport written, or lost to a write that fails, until they do), and at most
+one fault: a write error or a reset (transport faults), or records lost on
+their way in and corrupt frames (inbound faults). The dataflow token holds its
+reasons as values, and it can change between any two of the coordinator's
+reads of it. The driver awaits its `Cancel` broadcasts while the environment
+moves, its `select!` can take an expired grace deadline with an event queued
+since it found none, and teardown lets the inbound bridges drain (when every
+worker is done) and waits for them for a bound, then applies the lost records
+and corrupt traffic it finds queued. States are deduplicated exactly, and the
 search is breadth first, so every finding comes with a shortest trace.
+
+On every step, a copy of the decisions as the driver made them before
+`Coordinator` existed takes the same step, from the same state and with the
+token changing the same way, and must read the token in the same order, take
+the same effects, publish the same result and lead to the same state. With
+two peers, a test does the same on runs written out and on random ones (the
+token does not change between the reads of one decision there).
 
 The properties:
 
