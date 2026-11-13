@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Pinned Rust toolchain
+
+- **CI and local builds use Rust 1.99.1**, named in `rust-toolchain.toml`
+  (rustup installs it on first use), instead of the latest stable release.
+  A new release can bring lints that fail CI on code that passed the day
+  before, as Rust 1.100.0 did; moving to a new release is now a change of
+  its own, which bumps the file and fixes what the release reports.
+
+### Cluster lifecycle, checked exhaustively
+
+- **Tests:** `runtime::cluster_lifecycle::exhaustive` drives the real
+  `LifecycleMachine` through every order in which its events can reach it,
+  for one peer, in twelve configurations (Shared mode on one connection or
+  two, Dedicated mode; one or two workers; one or two progress channels),
+  with a local cancellation, an abort from outside, workers that finish after
+  teardown and at most one fault. Termination and no data loss without a
+  failed send hold. Three properties do not: a failed send can be settled as
+  a failure too early, and a run can end `Ok` although a send had failed
+  before its workers succeeded. Each of these is pinned with its
+  counterexamples, so that a fix shows. The conformance job runs eight
+  configurations in release (`docs/testing/nextest.md`; design: §5.5.4 of
+  `docs/design/cluster.md`).
+
 ### SPSC wake
 
 - **Fixed: an SPSC consumer with a wake handle wakes a producer it unblocks.**

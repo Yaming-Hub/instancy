@@ -10,15 +10,16 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
 
+# Every job builds with the toolchain rust-toolchain.toml names, never the
+# latest stable release, so a new release cannot fail a job on its own.
 jobs:
   check:
     name: Check, Clippy, Docs & Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt --check (workspace)
         run: cargo fmt --all -- --check
@@ -42,7 +43,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2 pin
         with:
@@ -64,7 +66,8 @@ jobs:
       INSTANCY_TRACE_DIR: ${{ github.workspace }}/trace-dumps
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2 pin
         with:
@@ -91,7 +94,8 @@ jobs:
       CARGO_BUILD_JOBS: "2"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2 pin
         with:
@@ -125,7 +129,8 @@ jobs:
       CARGO_BUILD_JOBS: "2"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2 pin
         with:
@@ -154,9 +159,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@v2
       # dactor's build script runs prost-build, which needs protoc.
       - name: Install protoc
@@ -179,12 +183,23 @@ jobs:
       INSTANCY_TRACE_DIR: ${{ github.workspace }}/trace-dumps
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@v2
       # The `test` job runs a subset; this runs all of it, in parallel with
       # the other jobs.
       - name: Progress conformance matrix (full)
         run: cargo test -p instancy --all-features --test progress_conformance -- --ignored --exact --test-threads=1 full_conformance_matrix
+      # Every order in which the lifecycle machine's events can reach it
+      # (runtime::cluster_lifecycle::exhaustive), in release, where the eight
+      # configurations run here take a few minutes. Dedicated and split Shared
+      # mode with two workers are run by hand (docs/testing/nextest.md).
+      - name: Lifecycle machine, every order of events
+        run: |
+          cargo test -p instancy --release --all-features --lib -- \
+            --include-ignored --nocapture --test-threads 2 \
+            cluster_lifecycle::exhaustive:: \
+            --skip dedicated_two_workers --skip shared_split_two_workers
       - name: Upload progress traces
         if: always()
         uses: actions/upload-artifact@v4

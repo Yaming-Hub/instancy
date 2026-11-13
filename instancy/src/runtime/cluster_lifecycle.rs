@@ -1922,6 +1922,9 @@ impl ClusterLifecycle {
 }
 
 #[cfg(test)]
+mod exhaustive;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
