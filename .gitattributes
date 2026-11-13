@@ -1,0 +1,4 @@
+# Golden files of the lifecycle check, written by its tests
+# (INSTANCY_EXHAUSTIVE_GOLDEN=1): collapsed in GitHub's diffs (Git's own diffs
+# and stats are unaffected), and LF on every platform, as the tests write them.
+instancy/src/runtime/cluster_lifecycle/exhaustive/*.golden linguist-generated=true eol=lf
