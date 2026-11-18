@@ -443,7 +443,7 @@ Two models check it, splitting logic from timing:
 | `"silence"` in `Faults`, `SilenceNodes`, `SilenceConns` | where silence may strike (default: any direction of any connection, one connection per run) | — |
 | `Detect` | `"silence"`: the dead verdict | `"none"`: today, no rule |
 | `StallAbort` | `TRUE`: a writer stuck on a silent direction fails its connection like a write error, at any time | `FALSE`: only a release ends a writer, and the model gives a release no deadline |
-| `SharedBridge`, `WQCap` | `FALSE`: each lane is forwarded on its own | `TRUE`: today's one bridge per node. It takes the head of one FIFO, numbers it, holds it and waits for room in a bounded writer queue (`WQCap`), committed to that frame. |
+| `SharedBridge`, `WQCap` | `FALSE`: each lane is forwarded on its own | `TRUE`: the one bridge per node, which the code still has. It takes the head of one FIFO, numbers it, holds it and waits for room in a bounded writer queue (`WQCap`), committed to that frame. It drops a frame whose registration has ended, as the code did before R58's interim fix. |
 | `StuckCap` | frames a writer puts into a silent direction before it blocks | — |
 
 **`ConnSilence.tla`.** The base configuration is P = 2, D = 1, S = 1 and T = 6, which is P + D + 2S + 1. Frames are up to F = 7 bytes, longer than T, at one byte per tick. The writer queue holds 2 frames, the application sends 2 frames, there is one pause per node, and the horizon is 16 ticks.
@@ -473,7 +473,7 @@ TLC 2.19, 4 workers. A scenario that finds a violation stops at the first one, s
 | `ct_reach_silence_contained` | `NeverContained` | Witness (15,734,359 states): silence fails the dataflow on one connection while the other succeeds on both nodes. |
 | `live_ct_silence_noexit` | `LeftPoolCloses` | **Fails as expected** without the writer stall rule. Managers are kept; the node that saw the clean close keeps writing into the silent direction, its writer blocks, and the connection never closes. |
 | `ct_silence_sharedbridge` | deadlock | **Fails as expected** (today's bridge, no stall rule; simulation). a's bridge holds a frame for its stuck writer on connection 1, and the dataflow on the healthy connection 2 never ends. |
-| `ct_silence_sharedbridge_stall` | deadlock | **Fails as expected** (today's bridge with the stall rule; simulation). The dataflow on the healthy connection finishes during the stall; its flush gives up, the bridge later drops its ack and goodbye as late, and its peer waits forever. Any stall longer than the flush deadline does this today (R58). The multi-process harness reproduces it on real processes (`finished_dataflow_survives_a_one_way_stall_longer_than_handshake`, scenario `one_way_stall_schedule`). |
+| `ct_silence_sharedbridge_stall` | deadlock | **Fails as expected** (the bridge as it was before R58's interim fix, with the stall rule; simulation). The dataflow on the healthy connection finishes during the stall; its flush gives up, the bridge later drops its ack and goodbye as late, and its peer waits forever. Before that fix, any stall longer than the flush deadline did this (R58). The multi-process harness reproduced it on real processes (`finished_dataflow_survives_a_one_way_stall_longer_than_handshake`, scenario `one_way_stall_schedule`), and passes with the fix. The scenario is kept as the record of the bug: the fix keeps a registration until the frames its runtime senders queued are handled, which the model does not include. |
 
 Every earlier `ClusterTransport.tla` scenario was re-run on the extended spec with the same results and the same state counts for the passing ones, `ct_pr9_crosswise` included (226,561,926 states).
 
@@ -482,7 +482,7 @@ Every earlier `ClusterTransport.tla` scenario was re-run on the extended spec wi
 **They show,** for two nodes and these bounds:
 - **With the rule, the right dataflows fail and nothing hangs.** A connection silent in one direction or both fails only the dataflows that used it, on both nodes, however the nodes pinned them (alike or crosswise). Every run ends, every connection closes, and nothing is Ok with lost data. Without the rule, the runs hang (`ct_silence_hang`).
 - **The writer stall rule is needed.** Without it, the node that saw a clean close keeps writing into the silent direction, and with a kept manager that connection never closes (`live_ct_silence_noexit`).
-- **Today's shared bridge turns one stuck writer into a hang of a dataflow on a healthy connection** (`ct_silence_sharedbridge`). Even with the stall rule it still does, through the flush deadline (`ct_silence_sharedbridge_stall`, R58). That is why the design also removes the bridge.
+- **The shared bridge, which the code still has, turns one stuck writer into a hang of a dataflow on a healthy connection** (`ct_silence_sharedbridge`). Before R58's interim fix it did even with the stall rule, through the flush deadline (`ct_silence_sharedbridge_stall`). The fix keeps those frames, so with the stall rule they would go out once the stuck connection fails (argued, not modelled); the stall itself remains. That is why the design also removes the bridge.
 - **The timing condition T > P + D + 2S is exact** in the timed model: at T = P + D + 2S, a probe delayed by a pause on each node is read just after the check (`cs_tight`).
 - **Each part of the rule is needed:** counting frames instead of bytes, a timeout shorter than P + D, and a reader that can block each kill a healthy connection.
 
@@ -490,7 +490,8 @@ Every earlier `ClusterTransport.tla` scenario was re-run on the extended spec wi
 - **The writer stall rule's timing.** `ConnSilence.tla` models the read side. That a healthy writer always makes progress within T rests on CL6 and the same argument; `WriteStall` fires only on a writer that is stuck.
 - **The inbound binding.** `Arrive` reads the peer's pin, but the code binds a dataflow to its inbound connection only when a first frame arrives there. Before that, silence ends the dataflow at `handshake_timeout`.
 - **Races between a lane's producers** once numbering happens at enqueue (R57's obligations). The model numbers each lane atomically, from one ordered outbox.
-- **Fixed deadlines.** The teardown flush, and in the code a release's linger, have fixed deadlines that can also expire on a slow but healthy writer. Here they expire only on a stuck one; this behaviour is existing and unchanged.
+- **R58's interim fix.** With `SharedBridge`, an ended registration's frames are dropped, as before the fix. The fix keeps a registration, closing, while the runtime's senders or their queued frames hold its lane. Its risk is in a lock and a reference count, below this abstraction, so code tests check it; R57 replaces it.
+- **Fixed deadlines.** The teardown flush, and in the code a release's linger, have fixed deadlines that can also expire on a slow but healthy writer. Here they expire only on a stuck one; this behaviour is existing and unchanged. Since R58's interim fix, an expired flush no longer drops the run's frames while the managers are kept.
 - **More than one pause per node in a detection window.** With k pauses, the detection bound is T + P + kS.
 - **TCP's own timers,** real frame and probe sizes, and links slower than one byte per tick: D covers delay, not bandwidth.
 - **More than two nodes, and Dedicated mode.**

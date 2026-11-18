@@ -72,10 +72,14 @@
 (* TCP_USER_TIMEOUT does for gRPC, gRFC A18); the same timing makes that   *)
 (* happen exactly when its writer is stuck on a silent direction (a       *)
 (* healthy peer always reads, so its socket accepts bytes).               *)
-(* SharedBridge models today's single bridge task per peer: one FIFO for   *)
-(* every run's frames, waiting for room in bounded writer queues (WQCap). *)
-(* Without it, as in every earlier scenario, each lane is forwarded on    *)
-(* its own, which is the per-connection queues of the proposal.           *)
+(* SharedBridge models the single bridge task per peer that the code still *)
+(* has: one FIFO for every run's frames, waiting for room in bounded       *)
+(* writer queues (WQCap). Like the code before R58's interim fix, it       *)
+(* drops a frame whose registration has ended; the fix keeps the           *)
+(* registration until the frames its runtime senders queued are            *)
+(* handled, which is not modelled. Without it, as in every earlier         *)
+(* scenario, each lane is forwarded on its own, which is the               *)
+(* per-connection queues of the proposal.                                  *)
 (*                                                                         *)
 (* Not modelled for liveness: Arrive reads the peer's pin, but the code    *)
 (* binds a dataflow to its inbound connection only when its first frame    *)
@@ -801,8 +805,9 @@ WriteStall(n, c) ==
     /\ WriteFail(n, c)
     /\ UNCHANGED <<rel, mem, cnt, bq>>
 
-\* Today's shared bridge (SharedBridge): each run's outbox feeds one FIFO
-\* per node (the manager's payload queue) ...
+\* The shared bridge (SharedBridge), as the code had it before R58's interim
+\* fix: each run's outbox feeds one FIFO per node (the manager's payload
+\* queue) ...
 ToBridge(n, r) ==
     /\ SharedBridge /\ rs[n][r].ob # <<>>
     /\ rs' = [rs EXCEPT ![n][r].ob = Tail(@)]
