@@ -83,7 +83,9 @@
 //! before, since the peer may be waiting for them (a goodbye, an
 //! acknowledgement). Once the last of those senders is gone and the bridge
 //! has handled every frame they queued, it is removed. So a teardown that
-//! stops waiting for its frames does not lose them.
+//! stops waiting for its frames does not lose them. Other senders' frames
+//! (those of a sender from [`SharedPeerManager::dataflow_sender`], which
+//! holds nothing) are dropped from the unregistration on.
 //! [`SharedPeerManager::unregister_dataflow`] instead removes a registration
 //! at once and drops its queued frames. Either way, a frame is never
 //! numbered into another registration's lane.
@@ -488,10 +490,10 @@ struct DataflowRegistration {
     inbound_failed: bool,
     /// The registration's [`LaneHold`], while anything holds it.
     lane: std::sync::Weak<LaneHold>,
-    /// Unregistered, but its lane is still held: the frames its senders
-    /// queued, or still send, are numbered and written, while frames from
-    /// the peer are no longer delivered and nothing is reported. Removed
-    /// once the lane is released.
+    /// Unregistered, but its lane is still held: the frames that hold its
+    /// lane, queued or still sent, are numbered and written (another
+    /// sender's are dropped), while frames from the peer are no longer
+    /// delivered and nothing is reported. Removed once the lane is released.
     closing: bool,
 }
 
@@ -810,7 +812,15 @@ impl Inner {
 
     /// Sequence a payload frame of the registration `token` of
     /// `dataflow_id` and queue it on the dataflow's pinned connection.
-    async fn send_payload(self: &Arc<Self>, dataflow_id: DataflowId, token: u64, mut frame: Frame) {
+    /// `hold` is the frame's hold on its registration's lane, if its sender
+    /// holds one.
+    async fn send_payload(
+        self: &Arc<Self>,
+        dataflow_id: DataflowId,
+        token: u64,
+        hold: Option<&Arc<LaneHold>>,
+        mut frame: Frame,
+    ) {
         // The receiver handles the control and probe channels outside the
         // lane, and a frame over the size limit cannot be written: reject
         // any of them without consuming a sequence number. Only this
@@ -844,6 +854,14 @@ impl Inner {
             else {
                 return;
             };
+            // Unregistered, it takes only the frames that hold its lane (its
+            // session's): another sender's are dropped, as once it is
+            // removed.
+            if reg.closing
+                && !hold.is_some_and(|hold| std::ptr::eq(Arc::as_ptr(hold), reg.lane.as_ptr()))
+            {
+                return;
+            }
             if let Some(error) = rejected {
                 #[cfg(feature = "tracing")]
                 tracing::error!(
@@ -1538,7 +1556,7 @@ async fn bridge_task(
 
             result = payload_rx.recv(), if payload_open => match result {
                 Some(Outbound::Payload { dataflow_id, token, frame, hold }) => {
-                    inner.send_payload(dataflow_id, token, frame).await;
+                    inner.send_payload(dataflow_id, token, hold.as_ref(), frame).await;
                     // Outside the state lock, which releasing it may take.
                     drop(hold);
                 }
@@ -2006,7 +2024,8 @@ impl SharedPeerManager {
     /// dataflow is not registered (or was unregistered).
     ///
     /// It does not hold the registration's lane: keeping it does not keep a
-    /// registration that the runtime's teardown unregistered (see the
+    /// registration that the runtime's teardown unregistered, and what it
+    /// sends from the unregistration on is dropped (see the
     /// [module documentation](self)).
     pub fn dataflow_sender(&self, dataflow_id: &DataflowId) -> Option<DataframeSender> {
         let token = self
@@ -2286,7 +2305,8 @@ impl SharedTransportSession {
 /// lane, which keeps a registration the runtime's teardown unregistered until
 /// every such sender is gone and the bridge has handled what they queued (see
 /// the [module documentation](self)); one from
-/// [`SharedPeerManager::dataflow_sender`] does not.
+/// [`SharedPeerManager::dataflow_sender`] does not, and what it sends from
+/// that unregistration on is dropped.
 #[derive(Clone)]
 pub struct DataframeSender {
     dataflow_id: DataflowId,
@@ -2741,6 +2761,67 @@ mod tests {
         })
         .await
         .expect("the registration outlived its last sender and frame");
+    }
+
+    /// While teardown's unregistration keeps a registration closing for its
+    /// session's senders, a sender that doesn't hold the lane (one from
+    /// `dataflow_sender`, taken before) sends nothing more: what it sends
+    /// from then on is dropped, as once the registration is removed. The
+    /// holder's frames are still written, numbered in their lane.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_closing_registration_takes_only_frames_that_hold_its_lane() {
+        const TOKEN: u64 = 7;
+        let (manager, peer) = manager_with_raw_peer();
+        let df = DataflowId::new();
+        let _registered = manager
+            .register(df, TOKEN, &[1], 4, Arc::default())
+            .await
+            .unwrap();
+        let holder = manager.registration_sender(&df, TOKEN).unwrap();
+        let unheld = manager.dataflow_sender(&df).unwrap();
+        unheld
+            .send(frame(df, 1, b"unheld, before".to_vec()))
+            .await
+            .unwrap();
+        holder
+            .send(frame(df, 1, b"held, before".to_vec()))
+            .await
+            .unwrap();
+        manager.flush().await;
+        manager.unregister_registration(&df, TOKEN).await;
+        unheld
+            .send(frame(df, 1, b"unheld, after".to_vec()))
+            .await
+            .unwrap();
+        holder
+            .send(frame(df, 1, b"held, after".to_vec()))
+            .await
+            .unwrap();
+        drop(holder);
+        manager.flush().await;
+        assert!(
+            !manager.inner.state().registered.contains_key(&df),
+            "removed once its holder is gone and its frames were handled"
+        );
+        let mut reader = FramedReader::new(peer);
+        for (seq, payload) in [
+            (0u64, &b"unheld, before"[..]),
+            (1, b"held, before"),
+            (2, b"held, after"),
+        ] {
+            let frame = tokio::time::timeout(Duration::from_secs(5), reader.read_frame())
+                .await
+                .expect("a frame was lost")
+                .unwrap();
+            assert_eq!(frame.payload[..SEQUENCE_PREFIX], seq.to_le_bytes());
+            assert_eq!(frame.payload[SEQUENCE_PREFIX..], *payload);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), reader.read_frame())
+                .await
+                .is_err(),
+            "nothing more is written"
+        );
     }
 
     /// A sender from `dataflow_sender` does not hold a registration's lane:

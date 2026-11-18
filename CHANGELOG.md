@@ -22,7 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kept; a per-job manager released meanwhile still drops what is queued on
   it, but closes its connections, which its peers see.
   `SharedPeerManager::unregister_dataflow` still removes a registration at
-  once. Teardown's flush keeps its fixed deadline, and the shared bridge,
+  once, and a sender from `SharedPeerManager::dataflow_sender` holds nothing:
+  what it sends after the dataflow was unregistered is dropped, as before.
+  Teardown's flush keeps its fixed deadline, and the shared bridge,
   where one stalled connection holds up the frames of the others, stays: R57
   and R58's flush without a deadline are not implemented.
   `instancy-integration`'s
