@@ -227,9 +227,13 @@
 //!     goodbye or ack. Writing a `Cancel` can fail like writing any other
 //!     frame.
 //!   - A failed write loses the frame it was writing, and everything behind
-//!     it. A write that fails although its frame went out whole is left out:
-//!     `write_frame` flushes after the frame's last byte, and a TCP stream's
-//!     flush does nothing (see "Not covered").
+//!     it. A Shared connection's writer writes the frames queued on it as a
+//!     batch with one flush (`write_frames`): on a stream that buffers until
+//!     it is flushed, a failure can also lose the batch's earlier frames,
+//!     the same as a failure at the first frame lost. A write that fails
+//!     although its frame went out whole is left out: `write_frame` and
+//!     `write_frames` flush after the last byte, and a TCP stream's flush
+//!     does nothing (see "Not covered").
 //!   - Shared: a write error or a failed read fails the lane at once and for
 //!     good. The manager then drops our frames (`send_payload`), so the outbox
 //!     forwarder never sees one refused. A write error is reported, then

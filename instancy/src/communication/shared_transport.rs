@@ -169,6 +169,9 @@ const MAX_COMPLETED_DATAFLOWS: usize = 16_384;
 /// Capacity of a pooled connection's writer queue.
 const WRITER_QUEUE: usize = 256;
 
+/// Most queued frames a connection writer takes and writes at once.
+const WRITER_BATCH: usize = 64;
+
 /// Background tasks of a [`SharedPeerManager`].
 ///
 /// Connection writers and readers are kept apart from the other tasks:
@@ -1226,6 +1229,11 @@ pub(crate) fn new_registration_token() -> u64 {
 
 /// Per-connection writer task: writes queued frames to the connection.
 ///
+/// It takes every frame queued (up to [`WRITER_BATCH`]) and writes them
+/// together, with one flush: one connection carries the frames of every
+/// dataflow pinned to it, and one write per frame would make its writer
+/// the bottleneck under load.
+///
 /// On a write error the frames queued on the connection are lost: it fails
 /// the dataflows pinned to the connection, then has the reader stop
 /// (`close`), so both halves are dropped and the whole connection closes.
@@ -1243,10 +1251,27 @@ async fn writer_task(
     close: tokio::sync::oneshot::Sender<TransportError>,
 ) {
     let mut framed = FramedWriter::new(writer);
-    while let Some(frame) = rx.recv().await {
-        let payload_size = frame.payload.len();
-        let is_user_traffic = frame.channel_id != PROBE_CHANNEL_ID;
-        if let Err(error) = framed.write_frame(&frame).await {
+    let mut batch = Vec::with_capacity(WRITER_BATCH);
+    while rx.recv_many(&mut batch, WRITER_BATCH).await > 0 {
+        // A frame over the size limit cannot be written: the frames queued
+        // before it are, then it fails the connection.
+        let writable = batch
+            .iter()
+            .position(|frame| frame.payload.len() > MAX_MESSAGE_SIZE)
+            .unwrap_or(batch.len());
+        let mut written = framed.write_frames(&batch[..writable]).await;
+        if written.is_ok() {
+            for frame in &batch[..writable] {
+                metrics.record_write(frame.payload.len(), frame.channel_id != PROBE_CHANNEL_ID);
+            }
+            if let Some(oversize) = batch.get(writable) {
+                written = Err(TransportError::PayloadTooLarge {
+                    size: oversize.payload.len(),
+                    max: MAX_MESSAGE_SIZE,
+                });
+            }
+        }
+        if let Err(error) = written {
             let detail = error.to_string();
             if let Some(inner) = inner.upgrade() {
                 inner.fail_outbound(conn_id, error);
@@ -1258,7 +1283,7 @@ async fn writer_task(
             )));
             return;
         }
-        metrics.record_write(payload_size, is_user_traffic);
+        batch.clear();
     }
     // Nothing more will be written: tell the peer. Only some write halves
     // do that when dropped (`OwnedWriteHalf`); with others (TLS streams,
@@ -2827,6 +2852,32 @@ mod tests {
             let (reader, inner) = tokio::io::split(stream);
             Ok((reader, BreakableWriter { inner, broken }))
         }
+    }
+
+    /// A frame over the size limit fails its connection, but the frames the
+    /// writer took with it and wrote before it go out and are counted.
+    #[tokio::test]
+    async fn frames_written_before_an_oversize_one_go_out_and_count() {
+        let (manager, peer) = manager_with_raw_peer();
+        let df = DataflowId::new();
+        let _registered = manager.register_dataflow(df, &[1], 4).await.unwrap();
+        let (writer, metrics) = {
+            let state = manager.inner.state();
+            let conn = state.connections.values().next().unwrap();
+            (conn.writer.clone(), Arc::clone(&conn.metrics))
+        };
+        // On one thread both are queued before the writer runs, so it takes
+        // them together.
+        writer
+            .try_send(frame(df, CONTROL_CHANNEL_ID, b"small".to_vec()))
+            .unwrap();
+        writer
+            .try_send(frame(df, CONTROL_CHANNEL_ID, vec![0; MAX_MESSAGE_SIZE + 1]))
+            .unwrap();
+        let mut reader = FramedReader::new(peer);
+        assert_eq!(reader.read_frame().await.unwrap().payload, b"small");
+        assert!(reader.read_frame().await.is_err(), "the connection closes");
+        assert_eq!(metrics.total_frames_written(), 1);
     }
 
     /// A write error closes the whole connection, not just its write

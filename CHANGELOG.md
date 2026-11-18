@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Shared transport at scale
+
+- **Faster: a frame is written with one `write_all` instead of one per part,
+  and a pooled connection writes its queued frames together.**
+  `FramedWriter` wrote each frame's header, header checksum, payload and frame
+  checksum with a `write_all` each: on a plain socket, at least one system
+  call for each part that is not empty. It now encodes a frame into one
+  buffer and hands it over with one `write_all` (a payload over 16 KiB is
+  written from the frame, in three), and `write_frames` hands a batch over
+  about 64 KiB at a time. A pooled connection's writer takes every frame
+  queued on it (up to 64) and writes them with one flush. With 3 nodes in one
+  process on one machine, the CPU a dataflow costs fell about 7-fold in
+  Shared mode (10,000 dataflows) and 3-fold in Dedicated mode (1,000).
+
+
 ### Cluster lifecycle coordinator, checked as it runs
 
 - **Internal:** the decisions the cluster lifecycle coordinator's driver
