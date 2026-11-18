@@ -2530,7 +2530,7 @@ impl RuntimeHandle {
         use crate::progress::network_progress::{
             DEFAULT_MAX_BATCH_SIZE, create_network_progress_channels, progress_channel_id,
         };
-        use cluster_lifecycle::{ClusterLifecycle, LifecycleMachine, teardown_signal};
+        use cluster_lifecycle::{ClusterLifecycle, Coordinator, LifecycleMachine, teardown_signal};
 
         // Tells the peers if this spawn fails (or this future is dropped)
         // before the lifecycle coordinator takes over. In Shared mode it is
@@ -3454,7 +3454,7 @@ impl RuntimeHandle {
                 }),
             );
             let lifecycle = ClusterLifecycle {
-                machine,
+                coordinator: Coordinator::new(machine),
                 events: events_rx,
                 dataflow_id,
                 dataflow_cancel: dataflow_cancel
@@ -3476,9 +3476,6 @@ impl RuntimeHandle {
                 shared_managers: shared_managers_arc,
                 shared_registration,
                 transport,
-                failure_announced: false,
-                unfinished_announced: false,
-                worker_failure: None,
                 #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
                 loss_dumped: false,
                 _teardown: teardown_notifier,

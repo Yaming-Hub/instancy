@@ -1,19 +1,27 @@
-//! The lifecycle coordinator checked exhaustively: the real
-//! [`LifecycleMachine`], with today's driver glue around it, driven through
-//! every order in which events can reach it, for one peer, within small
-//! bounds.
+//! The lifecycle coordinator checked exhaustively: the real [`Coordinator`]
+//! (the [`LifecycleMachine`] and the decisions made around it), driven
+//! through every order in which events can reach it, for one peer, within
+//! small bounds.
 //!
-//! Only the machine's environment is written here, and a copy of the
-//! driver's decisions: the producers that feed the coordinator's event
-//! channel and how their sends interleave, the driver's scheduling around its
-//! decisions (the [`driver`] module: its biased `select!`, its awaits, its
-//! timers and teardown's phases), the driver's decisions themselves (the
-//! [`glue`] module, copied from `ClusterLifecycle` and called through the
-//! [`Decide`] interface), the transport in each mode, the peer and our
-//! workers. Every state reachable from the start is visited once, breadth
-//! first. A state is deduplicated on an exact copy of it (every field of the
-//! machine included, see [`Key`]), so nothing is pruned by a hash collision,
-//! and whatever is found comes with a shortest trace that leads to it.
+//! Only the coordinator's environment is written here: the producers that
+//! feed the coordinator's event channel and how their sends interleave, the
+//! driver's scheduling around its decisions (the [`driver`] module: its
+//! biased `select!`, its awaits, its timers and teardown's phases, as
+//! `ClusterLifecycle::run` and `teardown` perform them), the transport in
+//! each mode, the peer and our workers. The coordinator is called through
+//! the [`Decide`] interface. Every state reachable from the start is visited
+//! once, breadth first. A state is deduplicated on an exact copy of it (every
+//! field of the machine included, see [`Key`]), so nothing is pruned by a
+//! hash collision, and whatever is found comes with a shortest trace that
+//! leads to it.
+//!
+//! On every step, the decisions the driver made before [`Coordinator`]
+//! existed (the [`glue`] module, a copy of them) take the same step from the
+//! same state, with the token changing the same way, and must read the
+//! token in the same order, take the same effects, publish the same result
+//! and lead to the same state: an equivalence oracle ([`oracle`]). With
+//! two peers, a test does the same on runs written out and on random ones,
+//! with the token still between the reads of one decision ([`two_peers`]).
 //!
 //! # Properties
 //!
@@ -179,11 +187,12 @@
 //!   read whose value it could change, the environment may cancel it (a
 //!   local stop or failure, or the dispatcher with the peer's `Cancel` it
 //!   holds) or escalate it (the dispatcher, with the peer's failure), and the
-//!   search explores each choice ([`Script`]). Every read the copied glue
-//!   makes goes through [`TokenRead`], in today's order: `apply`'s
-//!   `is_cancelled`, the token branch's `reason`, and `cancel_broadcast_reason`
-//!   and `unfinished_reason`, which reads the escalation twice.
-//! - Today's driver (`ClusterLifecycle::run`), in [`driver`]:
+//!   search explores each choice ([`Script`]). Every read the coordinator
+//!   makes goes through a [`TokenReader`], in the driver's order: `on_event`'s
+//!   `is_cancelled`, the token branch's `reason`, and
+//!   `cancel_broadcast_reason` and `unfinished_reason`, which reads the
+//!   escalation twice.
+//! - The driver (`ClusterLifecycle::run`), in [`driver`]:
 //!   - its biased `select!`: the dataflow token (once), the bridges'
 //!     cancellation, the next event, the grace timer. The branches are polled
 //!     in turn, so once it has found no event and the grace deadline has
@@ -266,7 +275,8 @@
 //!
 //! # Not covered
 //!
-//! Several peers. A data channel that ends without its close sentinel, a
+//! Several peers (the two-peer test checks only that the coordinator decides
+//! as the glue did). A data channel that ends without its close sentinel, a
 //! frame the transport rejects (oversize), an encoding failure, a corrupt
 //! control message and corrupt framing (a checksum or sequence error the
 //! transport reports): no event here reports them. A write reported failed
@@ -298,7 +308,9 @@
 //! reader after teardown: a reset then shows only as our next write
 //! failing. The peer's own machine. A peer that never goes away (a shared
 //! manager whose connections stay up). The control dispatcher stopping on
-//! the bridges' cancellation: here it goes on.
+//! the bridges' cancellation: here it goes on. The event channel closing
+//! (`on_events_closed`): it cannot while the machine runs, since each
+//! outbox the driver holds owns a sender, and teardown drops them.
 //!
 //! # Running
 //!
@@ -307,13 +319,15 @@
 //! (see `docs/testing/nextest.md`); `--nocapture` prints each configuration's
 //! counts and counterexamples. To run all twenty-one, one at a time (the
 //! largest, split Shared mode with two workers and two channels and transport
-//! faults, needs about 23 GB and 20 minutes for its 520 million states):
+//! faults, needs about 23 GB and 20 minutes for its 520 million states; the
+//! equivalence oracle adds about a quarter to the times here and in the tests'
+//! `#[ignore]` reasons):
 //!
 //! ```text
 //! cargo test -p instancy --release --all-features --lib -- --include-ignored \
 //!     --nocapture --test-threads 1 cluster_lifecycle::exhaustive::
 //! ```
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::fmt::{self, Write as _};
 use std::time::Instant;
 
@@ -1151,8 +1165,8 @@ impl Forwarder {
 // The world around the machine
 // ---------------------------------------------------------------------------
 
-/// Everything but the machine: the coordinator's channel and today's
-/// driver's state, our workers, the transport, the peer, and the ghosts the
+/// Everything but the machine: the coordinator's channel and what the
+/// coordinator and the driver remember, our workers, the transport, the peer, and the ghosts the
 /// properties need.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct World {
@@ -3139,6 +3153,8 @@ struct Observer {
     narrate: bool,
     notes: Vec<String>,
     effects: Vec<Effect>,
+    /// What the coordinator's step produced (see [`Output`]).
+    outputs: Vec<Output>,
     /// NoFalseSettle broke in this step.
     false_settle: Option<&'static str>,
     /// Failed sends settled as a failure, and settled excused.
@@ -3164,6 +3180,7 @@ impl Observer {
             }
             self.effects.push(effect.clone());
         }
+        self.outputs.push(Output::Effect(effect.clone()));
     }
 }
 
@@ -3322,14 +3339,6 @@ fn grace_expires(w: &World, d: &mut impl Decide, seen: &mut Observer) -> Vec<Act
     actions
 }
 
-/// What the coordinator reads of the dataflow token
-/// ([`CancellationToken`]'s accessors).
-trait TokenRead {
-    fn is_cancelled(&self) -> bool;
-    fn reason(&self) -> Option<CancellationReason>;
-    fn escalation(&self) -> Option<CancellationReason>;
-}
-
 /// A change the environment makes to the dataflow token while a coordinator
 /// step runs, just before one of its reads, whose value it changes. Each
 /// takes the environment's own steps, in their own order.
@@ -3401,10 +3410,13 @@ struct TokenCtx<'a> {
     cursor: &'a mut Cursor,
     /// What the environment did, for a trace.
     notes: Option<Vec<String>>,
+    /// The reads made, in order.
+    reads: Vec<Read>,
 }
 
 impl TokenCtx<'_> {
     fn before(&mut self, read: Read) {
+        self.reads.push(read);
         let options = changes(self.w, self.tables, read);
         if options.is_empty() {
             return;
@@ -3471,16 +3483,19 @@ impl<'a> ModelToken<'a> {
                 cfg,
                 cursor,
                 notes: narrate.then(Vec::new),
+                reads: Vec::new(),
             }),
         }
     }
 
-    fn notes(self) -> Vec<String> {
-        self.ctx.into_inner().notes.unwrap_or_default()
+    /// What the environment did, and the reads made.
+    fn into_log(self) -> (Vec<String>, Vec<Read>) {
+        let ctx = self.ctx.into_inner();
+        (ctx.notes.unwrap_or_default(), ctx.reads)
     }
 }
 
-impl TokenRead for ModelToken<'_> {
+impl TokenReader for ModelToken<'_> {
     fn is_cancelled(&self) -> bool {
         let mut ctx = self.ctx.borrow_mut();
         ctx.before(Read::Cancelled);
@@ -3501,58 +3516,71 @@ impl TokenRead for ModelToken<'_> {
 }
 
 /// Run one of the coordinator's decisions, `decision`, in state `w`: the
-/// token it reads may change before each read, as `cursor` chooses.
+/// token it reads may change before each read, as `cursor` chooses. The
+/// reads are logged in `seen`.
 fn decide<T>(
     w: &mut World,
     tables: &Tables,
     cfg: Config,
     cursor: &mut Cursor,
     seen: &mut Observer,
-    decision: impl FnOnce(&dyn TokenRead) -> T,
+    decision: impl FnOnce(&dyn TokenReader) -> T,
 ) -> T {
     let token = ModelToken::new(w, tables, cfg, cursor, seen.narrate);
     let decided = decision(&token);
-    for note in token.notes() {
+    let (notes, reads) = token.into_log();
+    for note in notes {
         seen.note(|| note);
     }
+    seen.outputs.extend(reads.into_iter().map(Output::Read));
     decided
 }
-/// What the driver does for one action: its I/O, decided by the
-/// coordinator just before the driver takes it.
+
+/// What a coordinator's step produced, in order: its reads of the token,
+/// what the driver did for it, and what it published. The equivalence
+/// oracle compares these, and the state the step led to.
 #[derive(Clone, PartialEq, Eq, Debug)]
-enum Effect {
-    /// Queue our ack of the peer's goodbye.
-    SendAck(String),
-    /// Broadcast `Cancel` with this reason, bounded.
-    Broadcast(String),
-    /// An `AnnounceUnfinished` that sends nothing.
-    Silent,
-    /// Escalate the dataflow token with this reason.
-    Escalate(CancellationReason),
-    /// Queue our goodbye.
-    SendGoodbye,
-    /// Arm the peer's grace deadline, unless it is armed.
-    ArmGrace(String),
-    Teardown {
-        graceful: bool,
-    },
+enum Output {
+    /// The coordinator read the token.
+    Read(Read),
+    /// The driver took this effect.
+    Effect(Effect),
+    /// After the actions, the progress lanes of these peers close.
+    LanesClosed(Vec<String>),
+    /// Teardown begins, letting the inbound bridges drain or not.
+    TeardownBegins { drain_inbound: bool },
+    /// Teardown ends, publishing this data loss to the completion (after
+    /// its last broadcast, an [`Output::Effect`], if it sends one).
+    Published(Option<DataLoss>),
 }
 
 /// The coordinator's decisions: what the driver asks of it at each of its
 /// decision points. The driver keeps the order in which it asks, and every
-/// await and every I/O step.
+/// await and every I/O step. Implemented by the production [`Coordinator`]
+/// and by a copy of the decisions the driver made before it existed
+/// ([`glue::Glue`]), its equivalence oracle.
 trait Decide {
+    /// The decisions in state `w`, around `machine`.
+    fn restore(w: &World, machine: LifecycleMachine) -> Self
+    where
+        Self: Sized;
+    /// Store what they remember in `w`.
+    fn store(&self, w: &mut World);
     fn machine(&self) -> &LifecycleMachine;
     /// The token's branch of `select!` is taken.
     fn begin_token_noticed(&mut self);
     /// One event from the channel (in the token's branch, or the events').
-    fn on_event(&mut self, event: LifecycleEvent, token: &dyn TokenRead) -> Vec<Action>;
+    fn on_event(&mut self, event: LifecycleEvent, token: &dyn TokenReader) -> Vec<Action>;
     /// The token's branch, after the events queued before it.
-    fn finish_token_noticed(&mut self, token: &dyn TokenRead) -> Vec<Action>;
+    fn finish_token_noticed(&mut self, token: &dyn TokenReader) -> Vec<Action>;
     fn on_external_abort(&mut self) -> Vec<Action>;
+    /// Every sender of the event channel is gone. Never while the machine
+    /// runs: each outbox the driver holds owns a sender, and teardown drops
+    /// them. The explorer never calls it; the two-peer test does.
+    fn on_events_closed(&mut self) -> Vec<Action>;
     fn on_soft_failure_expired(&mut self, peer: String) -> Vec<Action>;
     /// An action, just before the driver takes it.
-    fn prepare(&mut self, action: Action, token: &dyn TokenRead) -> Effect;
+    fn prepare(&mut self, action: &Action, token: &dyn TokenReader) -> Effect;
     /// The peers whose progress lanes close after the actions.
     fn stopped_peers(&self) -> Vec<String>;
     /// Teardown begins: whether it lets the inbound bridges drain.
@@ -3564,9 +3592,88 @@ trait Decide {
     fn unannounced_loss(&mut self) -> Option<String>;
 }
 
-/// Today's driver glue's decisions, copied from `ClusterLifecycle` (`run`,
-/// `apply`, `perform`, `cancel_broadcast_reason` and `unfinished_reason`),
-/// with every read of the token through [`TokenRead`], in the same order.
+/// The production coordinator, in the state a [`World`] holds.
+impl Decide for Coordinator {
+    fn restore(w: &World, machine: LifecycleMachine) -> Self {
+        Self {
+            machine,
+            cancel_seen: w.cancel_seen,
+            worker_failure: w.worker_failure.then(|| WORKER_ERROR.to_string()),
+            failure_announced: w.failure_announced,
+            unfinished_announced: w.unfinished_announced,
+        }
+    }
+
+    fn store(&self, w: &mut World) {
+        w.cancel_seen = self.cancel_seen;
+        w.worker_failure = worker_failed(self.worker_failure.as_deref());
+        w.failure_announced = self.failure_announced;
+        w.unfinished_announced = self.unfinished_announced;
+    }
+
+    fn machine(&self) -> &LifecycleMachine {
+        Coordinator::machine(self)
+    }
+
+    fn begin_token_noticed(&mut self) {
+        Coordinator::begin_token_noticed(self);
+    }
+
+    fn on_event(&mut self, event: LifecycleEvent, token: &dyn TokenReader) -> Vec<Action> {
+        Coordinator::on_event(self, event, token)
+    }
+
+    fn finish_token_noticed(&mut self, token: &dyn TokenReader) -> Vec<Action> {
+        Coordinator::finish_token_noticed(self, token)
+    }
+
+    fn on_external_abort(&mut self) -> Vec<Action> {
+        Coordinator::on_external_abort(self)
+    }
+
+    fn on_events_closed(&mut self) -> Vec<Action> {
+        Coordinator::on_events_closed(self)
+    }
+
+    fn on_soft_failure_expired(&mut self, peer: String) -> Vec<Action> {
+        Coordinator::on_soft_failure_expired(self, peer)
+    }
+
+    fn prepare(&mut self, action: &Action, token: &dyn TokenReader) -> Effect {
+        Coordinator::prepare(self, action, token)
+    }
+
+    fn stopped_peers(&self) -> Vec<String> {
+        Coordinator::stopped_peers(self).map(String::from).collect()
+    }
+
+    fn teardown_drains_inbound(&self) -> bool {
+        Coordinator::teardown_drains_inbound(self)
+    }
+
+    fn on_late_event(&mut self, event: LifecycleEvent, drain_inbound: bool) {
+        Coordinator::on_late_event(self, event, drain_inbound);
+    }
+
+    fn unannounced_loss(&mut self) -> Option<String> {
+        Coordinator::unannounced_loss(self)
+    }
+}
+
+/// Whether a worker failed, as [`World`] holds it: every worker that fails
+/// here fails with [`WORKER_ERROR`].
+fn worker_failed(failure: Option<&str>) -> bool {
+    if let Some(failure) = failure {
+        assert_eq!(failure, WORKER_ERROR, "a worker's error");
+    }
+    failure.is_some()
+}
+
+/// The driver's decisions as they were before [`Coordinator`]
+/// took them over: copied from `ClusterLifecycle` (`run`, `apply`,
+/// `perform`, `cancel_broadcast_reason`, `unfinished_reason` and `teardown`),
+/// with every read of the token through a [`TokenReader`], in the same
+/// order. The equivalence oracle for [`Coordinator`].
 mod glue {
     use super::*;
 
@@ -3579,31 +3686,6 @@ mod glue {
     }
 
     impl Glue {
-        /// The glue in state `w`, around `machine`.
-        pub(super) fn new(w: &World, machine: LifecycleMachine) -> Self {
-            Self {
-                machine,
-                cancel_seen: w.cancel_seen,
-                worker_failure: w.worker_failure.then(|| WORKER_ERROR.to_string()),
-                failure_announced: w.failure_announced,
-                unfinished_announced: w.unfinished_announced,
-            }
-        }
-
-        /// Store the driver's state in `w`.
-        pub(super) fn store(&self, w: &mut World) {
-            w.cancel_seen = self.cancel_seen;
-            w.worker_failure = match &self.worker_failure {
-                Some(failure) => {
-                    assert_eq!(failure, WORKER_ERROR, "a worker's error");
-                    true
-                }
-                None => false,
-            };
-            w.failure_announced = self.failure_announced;
-            w.unfinished_announced = self.unfinished_announced;
-        }
-
         /// `broadcast_cancel`, up to its I/O: remembered before the broadcast
         /// is awaited.
         fn broadcast(&mut self, reason: String) -> Effect {
@@ -3612,7 +3694,7 @@ mod glue {
         }
 
         /// `ClusterLifecycle::unfinished_reason`.
-        fn unfinished_reason(&self, token: &dyn TokenRead) -> String {
+        fn unfinished_reason(&self, token: &dyn TokenReader) -> String {
             if let Some(detail) = &self.worker_failure {
                 return CancellationReason::WorkerFailed {
                     detail: detail.clone(),
@@ -3630,7 +3712,7 @@ mod glue {
     }
 
     /// `cancel_broadcast_reason`.
-    fn cancel_broadcast_reason(token: &dyn TokenRead) -> String {
+    fn cancel_broadcast_reason(token: &dyn TokenReader) -> String {
         if let Some(failure) = token.escalation() {
             return failure.to_string();
         }
@@ -3646,6 +3728,23 @@ mod glue {
     }
 
     impl Decide for Glue {
+        fn restore(w: &World, machine: LifecycleMachine) -> Self {
+            Self {
+                machine,
+                cancel_seen: w.cancel_seen,
+                worker_failure: w.worker_failure.then(|| WORKER_ERROR.to_string()),
+                failure_announced: w.failure_announced,
+                unfinished_announced: w.unfinished_announced,
+            }
+        }
+
+        fn store(&self, w: &mut World) {
+            w.cancel_seen = self.cancel_seen;
+            w.worker_failure = worker_failed(self.worker_failure.as_deref());
+            w.failure_announced = self.failure_announced;
+            w.unfinished_announced = self.unfinished_announced;
+        }
+
         fn machine(&self) -> &LifecycleMachine {
             &self.machine
         }
@@ -3655,7 +3754,7 @@ mod glue {
         }
 
         /// `ClusterLifecycle::apply`.
-        fn on_event(&mut self, event: LifecycleEvent, token: &dyn TokenRead) -> Vec<Action> {
+        fn on_event(&mut self, event: LifecycleEvent, token: &dyn TokenReader) -> Vec<Action> {
             match event {
                 LifecycleEvent::Link {
                     peer,
@@ -3677,7 +3776,7 @@ mod glue {
             }
         }
 
-        fn finish_token_noticed(&mut self, token: &dyn TokenRead) -> Vec<Action> {
+        fn finish_token_noticed(&mut self, token: &dyn TokenReader) -> Vec<Action> {
             let failure = token.reason().is_some_and(|reason| reason.is_failure());
             self.machine.on_dataflow_cancelled(failure)
         }
@@ -3686,14 +3785,18 @@ mod glue {
             self.machine.on_external_abort()
         }
 
+        fn on_events_closed(&mut self) -> Vec<Action> {
+            self.machine.on_events_closed()
+        }
+
         fn on_soft_failure_expired(&mut self, peer: String) -> Vec<Action> {
             self.machine.on_soft_failure_expired(peer)
         }
 
         /// `ClusterLifecycle::perform`, up to its I/O; `run` arms the timer.
-        fn prepare(&mut self, action: Action, token: &dyn TokenRead) -> Effect {
+        fn prepare(&mut self, action: &Action, token: &dyn TokenReader) -> Effect {
             match action {
-                Action::SendAck(peer) => Effect::SendAck(peer),
+                Action::SendAck(peer) => Effect::SendAck(peer.clone()),
                 Action::BroadcastCancel => {
                     let reason = cancel_broadcast_reason(token);
                     self.broadcast(reason)
@@ -3708,7 +3811,7 @@ mod glue {
                     }
                 }
                 Action::AbortDrain(reason) | Action::CancelDataflow(reason) => {
-                    Effect::Escalate(reason)
+                    Effect::Escalate(reason.clone())
                 }
                 Action::SendGoodbye => Effect::SendGoodbye,
                 Action::LinkFailed { peer, failure } => {
@@ -3728,8 +3831,10 @@ mod glue {
                     };
                     Effect::Escalate(reason)
                 }
-                Action::ArmSoftFailureTimer(peer) => Effect::ArmGrace(peer),
-                Action::Teardown { graceful } => Effect::Teardown { graceful },
+                Action::ArmSoftFailureTimer(peer) => Effect::ArmGrace(peer.clone()),
+                Action::Teardown { graceful } => Effect::Teardown {
+                    graceful: *graceful,
+                },
             }
         }
 
@@ -3785,10 +3890,10 @@ fn effect_text(effect: &Effect) -> Option<String> {
     }
 }
 
-/// Today's driver, around the coordinator's decisions: what
+/// The driver, around the coordinator's decisions: what
 /// `ClusterLifecycle::run` does and in which order (its biased `select!`, its
-/// timers and its I/O). Everything outside this module and [`glue`] is the
-/// environment.
+/// timers and its I/O). Everything outside this module, [`Coordinator`] and
+/// [`glue`] is the environment.
 mod driver {
     use super::*;
 
@@ -3882,6 +3987,8 @@ mod driver {
                     seen.effect(&effect);
                     w.send_cancel();
                 }
+                seen.outputs
+                    .push(Output::Published(d.machine().data_loss().cloned()));
                 w.tearing_down = false;
                 w.finished = true;
                 return;
@@ -3906,7 +4013,7 @@ mod driver {
         let mut actions = actions.into_iter();
         while let Some(action) = actions.next() {
             let effect = decide(w, tables, cfg, cursor, seen, |token| {
-                d.prepare(action, token)
+                d.prepare(&action, token)
             });
             seen.effect(&effect);
             match effect {
@@ -3933,6 +4040,9 @@ mod driver {
                 Effect::Teardown { .. } => {
                     w.tearing_down = true;
                     w.drain_inbound = d.teardown_drains_inbound();
+                    seen.outputs.push(Output::TeardownBegins {
+                        drain_inbound: w.drain_inbound,
+                    });
                     seen.note(|| {
                         format!(
                             "teardown begins{}",
@@ -3953,12 +4063,20 @@ mod driver {
         let stopped = d.stopped_peers();
         if !stopped.is_empty() {
             seen.note(|| format!("closes the progress lanes of {}", stopped.join(", ")));
+            seen.outputs.push(Output::LanesClosed(stopped));
         }
     }
 }
 
 /// Take one step from `(w, m)`. A coordinator step runs its script, and
 /// adds the scripts that choose otherwise to `others`.
+///
+/// The production [`Coordinator`] decides, and the glue it replaced
+/// ([`glue::Glue`]) takes the same step from the same state with the same
+/// script: the equivalence oracle. Both must read the token in the same
+/// order, take the same effects, publish the same result and lead to the
+/// same state (before anything is forgotten). Every state is reached so,
+/// so they reach the same states.
 fn take(
     w: &World,
     m: Mach,
@@ -3968,6 +4086,7 @@ fn take(
     seen: &mut Observer,
     others: &mut Vec<Script>,
 ) -> (World, Mach) {
+    let before = *w;
     let mut w = *w;
     if step == Step::Poll {
         w.polled = true;
@@ -3979,13 +4098,24 @@ fn take(
         w.forget_reasons(m.cancel_broadcast, tables);
         return (w, m);
     };
+    seen.outputs.clear();
     let mut cursor = Cursor::new(script);
-    let mut glue = glue::Glue::new(&w, m.machine(tables));
-    driver::take(&mut w, &mut glue, step, cfg, tables, &mut cursor, seen);
-    glue.store(&mut w);
-    others.extend(cursor.others);
-    let m = Mach::of(glue.machine(), tables);
+    let mut coordinator = Coordinator::restore(&w, m.machine(tables));
+    driver::take(
+        &mut w,
+        &mut coordinator,
+        step,
+        cfg,
+        tables,
+        &mut cursor,
+        seen,
+    );
+    coordinator.store(&mut w);
+    let after = Mach::of(coordinator.machine(), tables);
+    oracle((&before, m), step, cfg, tables, seen, (&w, after, &cursor));
+    let m = after;
     w.forget(m.data_loss != 0);
+    others.extend(cursor.others);
     w.forget_reasons(m.cancel_broadcast, tables);
     let tearing_down = w.finished
         || w.tearing_down
@@ -3998,6 +4128,51 @@ fn take(
         "torn down exactly when the machine finished"
     );
     (w, m)
+}
+
+/// The equivalence oracle: the glue [`Coordinator`] replaced takes `step`
+/// from `from` with the same script, and must have done what `took` records
+/// the coordinator did: the same outputs (`seen.outputs`), the same state and
+/// the same other scripts.
+fn oracle(
+    from: (&World, Mach),
+    step: Step,
+    cfg: Config,
+    tables: &mut Tables,
+    seen: &Observer,
+    took: (&World, Mach, &Cursor),
+) {
+    let (w2, m2, cursor2) = took;
+    let mut w = *from.0;
+    let script = step.script().expect("a coordinator step").1;
+    let mut cursor = Cursor::new(script);
+    let mut oracle = Observer::default();
+    let mut glue = glue::Glue::restore(&w, from.1.machine(tables));
+    driver::take(
+        &mut w,
+        &mut glue,
+        step,
+        cfg,
+        tables,
+        &mut cursor,
+        &mut oracle,
+    );
+    glue.store(&mut w);
+    let m = Mach::of(glue.machine(), tables);
+    assert!(
+        oracle.outputs == seen.outputs && w == *w2 && m == m2 && cursor.others == cursor2.others,
+        "{cfg}: the coordinator and the glue it replaced differ on {}:\n\
+         coordinator: {:?}\n\
+         glue:        {:?}\n\
+         states equal: {}, machines equal: {}, other scripts: {:?} and {:?}",
+        step.text(),
+        seen.outputs,
+        oracle.outputs,
+        w == *w2,
+        m == m2,
+        cursor2.others,
+        cursor.others,
+    );
 }
 // ---------------------------------------------------------------------------
 // The search
@@ -5121,6 +5296,7 @@ fn the_peer_s_failure_after_its_stop_is_forwarded() {
         [Why::PEER_STOP, Why::PEER_FAILURE].map(|why| tables.reason(why).to_string())
     );
 }
+
 /// The data bridge reports corrupt traffic it buffered after the connection
 /// it came on has ended, and after the coordinator applied that end (a soft
 /// failure, waiting for the rest of the link): while the workers still run,
@@ -5226,6 +5402,377 @@ fn a_write_that_fails_after_teardown_counts_when_the_worker_succeeds() {
     );
     assert!(w.finished && !w.workers_failed && m.data_loss == 0);
     assert!(w.failed_at_finish && w.lost_at_finish);
+}
+
+/// One decision point of a two-peer run, for
+/// [`the_coordinator_decides_like_the_glue_with_two_peers`].
+#[derive(Clone, Copy, Debug)]
+enum TwoPeerOp {
+    /// An event about peer 0 or 1 (or a worker's result) is queued.
+    Post(Ev, usize),
+    /// The driver takes the next queued event.
+    Deliver,
+    /// The dataflow is cancelled locally.
+    Cancel(Kind),
+    /// The control dispatcher escalates the token with a peer's failure.
+    Escalate,
+    /// The token's branch is taken, if it can be.
+    TokenSeen,
+    /// The bridges are cancelled from outside.
+    Abort,
+    /// Every sender of the event channel is gone.
+    EventsClosed,
+    /// The grace deadline of peer 0 or 1 passes.
+    Grace(usize),
+    /// Teardown's bounded waits are over: it applies what is queued, in
+    /// order, and publishes its result.
+    TeardownEnds,
+}
+
+const TWO_PEERS: [&str; 2] = ["a", "b"];
+
+/// The dataflow token as a two-peer run's coordinator reads it: every read
+/// is logged, with what it returned.
+struct LoggedToken<'a> {
+    token: &'a CancellationToken,
+    log: &'a std::cell::RefCell<Vec<String>>,
+}
+
+impl TokenReader for LoggedToken<'_> {
+    fn is_cancelled(&self) -> bool {
+        let read = self.token.is_cancelled();
+        self.log.borrow_mut().push(format!("is_cancelled: {read}"));
+        read
+    }
+
+    fn reason(&self) -> Option<CancellationReason> {
+        let read = self.token.reason();
+        self.log.borrow_mut().push(format!("reason: {read:?}"));
+        read
+    }
+
+    fn escalation(&self) -> Option<CancellationReason> {
+        let read = self.token.escalation();
+        self.log.borrow_mut().push(format!("escalation: {read:?}"));
+        read
+    }
+}
+
+/// One implementation of the coordinator's decisions in a two-peer run,
+/// driven as `ClusterLifecycle::run` drives it, with its own token, and a
+/// log of what it read and did.
+struct TwoPeerRun<D> {
+    d: D,
+    token: CancellationToken,
+    queue: VecDeque<LifecycleEvent>,
+    cancel_seen: bool,
+    events_closed: bool,
+    /// Teardown began: whether it lets the inbound bridges drain.
+    teardown: Option<bool>,
+    done: bool,
+    log: std::cell::RefCell<Vec<String>>,
+}
+
+impl<D: Decide> TwoPeerRun<D> {
+    fn new(cfg: Config) -> Self {
+        let machine = LifecycleMachine::new(
+            usize::from(cfg.workers),
+            TWO_PEERS.iter().enumerate().map(|(channels, peer)| {
+                (
+                    peer.to_string(),
+                    channels + 1,
+                    Arc::new(PeerLinkState::default()),
+                )
+            }),
+        );
+        Self {
+            d: D::restore(&World::new(cfg), machine),
+            token: CancellationToken::new(),
+            queue: VecDeque::new(),
+            cancel_seen: false,
+            events_closed: false,
+            teardown: None,
+            done: false,
+            log: std::cell::RefCell::default(),
+        }
+    }
+
+    fn note(&self, what: String) {
+        self.log.borrow_mut().push(what);
+    }
+
+    /// What the decisions remember besides the machine, as a [`World`]
+    /// holds it.
+    fn remembered(&self, cfg: Config) -> World {
+        let mut w = World::new(cfg);
+        self.d.store(&mut w);
+        w
+    }
+
+    fn take(&mut self, op: TwoPeerOp) {
+        if self.done {
+            return;
+        }
+        let token = LoggedToken {
+            token: &self.token,
+            log: &self.log,
+        };
+        if let Some(drain_inbound) = self.teardown {
+            match op {
+                TwoPeerOp::Post(ev, peer) => self.queue.push_back(two_peer_event(ev, peer)),
+                TwoPeerOp::TeardownEnds => {
+                    while let Some(event) = self.queue.pop_front() {
+                        self.d.on_late_event(event, drain_inbound);
+                    }
+                    let broadcast = self.d.unannounced_loss();
+                    let published = self.d.machine().data_loss().cloned();
+                    self.note(format!("teardown ends: {broadcast:?}, {published:?}"));
+                    self.done = true;
+                }
+                _ => {}
+            }
+            return;
+        }
+        let actions = match op {
+            TwoPeerOp::Post(ev, peer) => {
+                self.queue.push_back(two_peer_event(ev, peer));
+                return;
+            }
+            TwoPeerOp::Deliver => match self.queue.pop_front() {
+                Some(event) => self.d.on_event(event, &token),
+                None => return,
+            },
+            TwoPeerOp::Cancel(kind) => {
+                self.token.cancel_with_reason(match kind {
+                    Kind::Stop => CancellationReason::UserRequested,
+                    Kind::Fail => CancellationReason::WorkerFailed {
+                        detail: "a local worker failed".into(),
+                    },
+                });
+                return;
+            }
+            TwoPeerOp::Escalate => {
+                self.token.escalate(CancellationReason::PeerCancelled {
+                    peer_id: TWO_PEERS[1].to_string(),
+                    detail: "worker failed: the peer's worker failed".into(),
+                });
+                return;
+            }
+            TwoPeerOp::TokenSeen if self.token.is_cancelled() && !self.cancel_seen => {
+                self.cancel_seen = true;
+                self.d.begin_token_noticed();
+                let mut actions = Vec::new();
+                while let Some(event) = self.queue.pop_front() {
+                    actions.extend(self.d.on_event(event, &token));
+                }
+                actions.extend(self.d.finish_token_noticed(&token));
+                actions
+            }
+            TwoPeerOp::Abort => self.d.on_external_abort(),
+            TwoPeerOp::EventsClosed if !self.events_closed => {
+                self.events_closed = true;
+                self.d.on_events_closed()
+            }
+            TwoPeerOp::Grace(peer) => self.d.on_soft_failure_expired(TWO_PEERS[peer].into()),
+            _ => return,
+        };
+        for action in actions {
+            let effect = self.d.prepare(&action, &token);
+            self.note(format!("{effect:?}"));
+            match effect {
+                Effect::Escalate(reason) => self.token.escalate(reason),
+                Effect::Teardown { .. } => {
+                    let drain_inbound = self.d.teardown_drains_inbound();
+                    self.note(format!("teardown drains inbound: {drain_inbound}"));
+                    self.teardown = Some(drain_inbound);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let stopped = self.d.stopped_peers();
+        if !stopped.is_empty() {
+            self.note(format!("lanes closed: {stopped:?}"));
+        }
+    }
+}
+
+/// `ev` about peer `peer` (or a worker's result).
+fn two_peer_event(ev: Ev, peer: usize) -> LifecycleEvent {
+    match ev.event() {
+        LifecycleEvent::Link { event, .. } => LifecycleEvent::Link {
+            peer: TWO_PEERS[peer].to_string(),
+            event,
+        },
+        event => event,
+    }
+}
+
+/// Run `ops` with two peers, on the production [`Coordinator`] and on the
+/// glue it replaced, each with its own token and links: after every step
+/// they must have read the token alike (each read and its value), decided
+/// alike (effects in order, lane closes, teardown's choices and result),
+/// and hold the same machine and the same state besides. The coordinator's
+/// log.
+fn two_peers(cfg: Config, ops: &[TwoPeerOp]) -> Vec<String> {
+    let mut coordinator = TwoPeerRun::<Coordinator>::new(cfg);
+    let mut glue = TwoPeerRun::<glue::Glue>::new(cfg);
+    for (i, &op) in ops.iter().enumerate() {
+        coordinator.take(op);
+        glue.take(op);
+        assert!(
+            coordinator.log == glue.log
+                && format!("{:?}", coordinator.d.machine()) == format!("{:?}", glue.d.machine())
+                && coordinator.remembered(cfg) == glue.remembered(cfg),
+            "the coordinator and the glue it replaced differ after {:?}:\n\
+             coordinator: {:?}\nglue:        {:?}",
+            &ops[..=i],
+            coordinator.log.borrow(),
+            glue.log.borrow()
+        );
+    }
+    coordinator.log.into_inner()
+}
+
+/// The equivalence oracle with two peers, where the explorer has one: a
+/// coordinator with two peers (one progress channel from the first, two
+/// from the second) and two local workers, on runs written out (a link
+/// failure on each peer, both peers stopping, late reports from both at
+/// teardown) and on seeded random ones. See [`two_peers`]. The token does
+/// not change between the reads of one decision here: the explorer covers
+/// that.
+#[test]
+fn the_coordinator_decides_like_the_glue_with_two_peers() {
+    use TwoPeerOp::{Deliver, Post, TeardownEnds};
+    const RUNS: usize = 10_000;
+    const OPS: usize = 48;
+    let cfg = Config {
+        wiring: Wiring::Shared,
+        workers: 2,
+        channels: 1,
+        faults: Faults::Transport,
+    };
+    let corrupt = Ev::ProgressCorrupt {
+        after_end_of_stream: false,
+    };
+    let mut logs = vec![
+        two_peers(cfg, &[Post(corrupt, 0), Deliver]),
+        two_peers(cfg, &[Post(corrupt, 1), Deliver]),
+        two_peers(
+            cfg,
+            &[
+                Post(Ev::Cancel, 0),
+                Post(Ev::Cancel, 0),
+                Post(Ev::Cancel, 1),
+                Post(Ev::Cancel, 1),
+                Deliver,
+                Deliver,
+                Deliver,
+                Deliver,
+            ],
+        ),
+    ];
+    let done = Ev::Done(Outcome::Ok);
+    let late = two_peers(
+        cfg,
+        &[
+            Post(done, 0),
+            Post(done, 0),
+            Deliver,
+            Deliver,
+            Post(Ev::EndOfStream, 0),
+            Post(Ev::EndOfStream, 1),
+            Post(Ev::EndOfStream, 1),
+            Deliver,
+            Deliver,
+            Deliver,
+            Post(Ev::Lost, 0),
+            Post(Ev::DataCorrupt, 1),
+            TeardownEnds,
+        ],
+    );
+    assert!(
+        late.last().is_some_and(
+            |last| last.starts_with("teardown ends: Some") && last.contains("peer: \"a\"")
+        ),
+        "{late:?}"
+    );
+    logs.push(late);
+    let events = [
+        Ev::Done(Outcome::Ok),
+        Ev::Done(Outcome::Failed),
+        Ev::Done(Outcome::Cancelled),
+        Ev::SendFailed,
+        Ev::ConnectionEnded { clean: true },
+        Ev::ConnectionEnded { clean: false },
+        Ev::Cancel,
+        Ev::ControlClosed,
+        Ev::EndOfStream,
+        Ev::Ack,
+        Ev::ChannelClosed,
+        Ev::Lost,
+        Ev::DataCorrupt,
+        corrupt,
+    ];
+    let healthy = [
+        Ev::Done(Outcome::Ok),
+        Ev::Done(Outcome::Cancelled),
+        Ev::EndOfStream,
+        Ev::Ack,
+        Ev::ControlClosed,
+    ];
+    // xorshift64*: the same runs every time.
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = |below: usize| {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let value = state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 33;
+        usize::try_from(value).expect("31 bits") % below
+    };
+    for _ in 0..RUNS {
+        // Mostly a healthy run or a requested stop, so that the peers say
+        // goodbye and ack, or the workers stop.
+        let ops: Vec<TwoPeerOp> = (0..OPS)
+            .map(|_| match next(100) {
+                0..=49 => {
+                    let ev = match next(4) {
+                        0 => events[next(events.len())],
+                        _ => healthy[next(healthy.len())],
+                    };
+                    Post(ev, next(2))
+                }
+                50..=79 => Deliver,
+                80..=81 => TwoPeerOp::Cancel(if next(2) == 0 { Kind::Stop } else { Kind::Fail }),
+                82..=83 => TwoPeerOp::Escalate,
+                84..=87 => TwoPeerOp::TokenSeen,
+                88 => TwoPeerOp::Abort,
+                89 => TwoPeerOp::EventsClosed,
+                90..=93 => TwoPeerOp::Grace(next(2)),
+                _ => TeardownEnds,
+            })
+            .collect();
+        logs.push(two_peers(cfg, &ops));
+    }
+    // What the runs must do, each at least once.
+    for kind in [
+        "SendGoodbye",
+        "SendAck",
+        "Broadcast",
+        "Silent",
+        "ArmGrace",
+        "link to peer a failed",
+        "link to peer b failed",
+        "lanes closed: [\"a\", \"b\"]",
+        "teardown drains inbound: true",
+        "teardown ends: Some",
+        "escalation: Some",
+    ] {
+        assert!(
+            logs.iter().flatten().any(|line| line.contains(kind)),
+            "no run did {kind}"
+        );
+    }
 }
 
 fn check(wiring: Wiring, workers: u8, channels: u8, faults: Faults) {

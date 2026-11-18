@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Cluster lifecycle coordinator, checked as it runs
+
+- **Internal:** the decisions the cluster lifecycle coordinator's driver
+  made around its state machine (the text of each `Cancel` it broadcasts,
+  its escalations of the dataflow token, whether an announcement goes out,
+  and teardown's choices) move into `Coordinator`, which awaits nothing and
+  does no I/O but logging.
+  `ClusterLifecycle::run` waits for what comes next, asks it, and performs
+  what it decides, in the same order as before. No behaviour change: the
+  exhaustive check now drives `Coordinator` itself, and on every step a copy
+  of the decisions as they were takes the same step and must decide the
+  same; with two peers, a test does the same on runs written out and on
+  random ones (design: §5.5.4 of `docs/design/cluster.md`). Since every
+  step of the coordinator now runs twice, CI's `lifecycle` job runs its
+  eleven configurations in three parts instead of two.
+
 ### Cluster lifecycle check, extended to its driver
 
 - **Tests:** the exhaustive check of the cluster lifecycle coordinator

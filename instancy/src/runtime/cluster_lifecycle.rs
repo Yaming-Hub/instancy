@@ -23,8 +23,13 @@
 //!   dataflow on every reachable node. Records that reach a node after the
 //!   operator they were addressed to finished fail the dataflow too.
 //!
-//! The decision logic lives in [`LifecycleMachine`], a pure state machine;
-//! [`ClusterLifecycle::run`] executes its actions.
+//! The decisions live in [`Coordinator`], which awaits nothing and does no
+//! I/O but logging: a pure state machine, [`LifecycleMachine`], and what is
+//! decided around it (what each of its actions does, given the dataflow
+//! token, and teardown's choices). [`ClusterLifecycle::run`] waits for what
+//! comes next, asks the coordinator, and performs what it decides.
+//! `exhaustive` checks the coordinator through every order in which its
+//! events can reach it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1404,6 +1409,324 @@ impl LifecycleMachine {
 }
 
 // ---------------------------------------------------------------------------
+// Coordinator
+// ---------------------------------------------------------------------------
+
+/// What the coordinator reads of the dataflow token. The driver passes the
+/// [`CancellationToken`] itself; `exhaustive` passes a model of it, which may
+/// change between any two reads, as the real one may.
+pub(crate) trait TokenReader {
+    fn is_cancelled(&self) -> bool;
+    fn reason(&self) -> Option<CancellationReason>;
+    fn escalation(&self) -> Option<CancellationReason>;
+}
+
+impl TokenReader for CancellationToken {
+    fn is_cancelled(&self) -> bool {
+        CancellationToken::is_cancelled(self)
+    }
+
+    fn reason(&self) -> Option<CancellationReason> {
+        CancellationToken::reason(self)
+    }
+
+    fn escalation(&self) -> Option<CancellationReason> {
+        CancellationToken::escalation(self)
+    }
+}
+
+/// What the driver does for one [`Action`]: its I/O, as the coordinator
+/// decided it just before the driver takes it ([`Coordinator::prepare`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Effect {
+    /// Queue our acknowledgement of the peer's goodbye.
+    SendAck(String),
+    /// Broadcast `Cancel` with this reason (bounded).
+    Broadcast(String),
+    /// An [`Action::AnnounceUnfinished`] that sends nothing: a failure was
+    /// announced already, or the unfinished stop was.
+    Silent,
+    /// Escalate the dataflow token with this reason.
+    Escalate(CancellationReason),
+    /// Queue our goodbye.
+    SendGoodbye,
+    /// Arm the peer's grace deadline, unless it is armed already.
+    ArmGrace(String),
+    /// Release bridges, transport and registrations (see
+    /// [`Action::Teardown`]).
+    Teardown { graceful: bool },
+}
+
+/// The lifecycle coordinator's decisions: the [`LifecycleMachine`], and what
+/// the driver remembers around it. It awaits nothing and does no I/O but
+/// logging (with the `tracing` feature: a link failure, as the driver did,
+/// and what the machine logs; `exhaustive` does not see those). The driver
+/// ([`ClusterLifecycle::run`]) asks it at each of its decision points, in its
+/// own order, and performs what it decides; every read of the dataflow token
+/// goes through a [`TokenReader`], in the driver's order. `exhaustive` checks
+/// it through every order in which its events and the token's changes can
+/// reach it.
+#[derive(Debug)]
+pub(crate) struct Coordinator {
+    machine: LifecycleMachine,
+    /// The token's branch of `run`'s `select!` was taken (it is taken once).
+    cancel_seen: bool,
+    /// The first local worker error other than a cancellation.
+    worker_failure: Option<String>,
+    /// A `Cancel` describing a failure went out.
+    failure_announced: bool,
+    /// [`Action::AnnounceUnfinished`] was sent.
+    unfinished_announced: bool,
+}
+
+impl Coordinator {
+    pub(crate) fn new(machine: LifecycleMachine) -> Self {
+        Self {
+            machine,
+            cancel_seen: false,
+            worker_failure: None,
+            failure_announced: false,
+            unfinished_announced: false,
+        }
+    }
+
+    #[cfg(any(
+        test,
+        debug_assertions,
+        feature = "progress-check",
+        feature = "test-utils"
+    ))]
+    pub(crate) fn machine(&self) -> &LifecycleMachine {
+        &self.machine
+    }
+
+    /// Whether the token's branch was taken.
+    pub(crate) fn cancel_seen(&self) -> bool {
+        self.cancel_seen
+    }
+
+    /// The token's branch is taken. The driver then hands over the events
+    /// queued already, one at a time ([`Self::on_event`]), collecting the
+    /// actions without taking any, and then calls
+    /// [`Self::finish_token_noticed`]: a cancellation racing with local
+    /// success must not be broadcast once every worker has succeeded.
+    pub(crate) fn begin_token_noticed(&mut self) {
+        self.cancel_seen = true;
+    }
+
+    /// Feed one event to the machine.
+    ///
+    /// Records dropped by operators of a cancelled dataflow are expected
+    /// unless the workers still succeed; the machine cannot see the token, so
+    /// its state is passed along.
+    pub(crate) fn on_event(
+        &mut self,
+        event: LifecycleEvent,
+        token: &dyn TokenReader,
+    ) -> Vec<Action> {
+        match event {
+            LifecycleEvent::Link {
+                peer,
+                event: LinkEvent::InboundDataLost(detail),
+            } => {
+                let cancelled = token.is_cancelled();
+                self.machine.on_inbound_data_lost(peer, detail, cancelled)
+            }
+            LifecycleEvent::WorkerFinished { success, failure } => {
+                if let Some(failure) = failure {
+                    self.worker_failure.get_or_insert(failure);
+                }
+                self.machine.on_event(LifecycleEvent::WorkerFinished {
+                    success,
+                    failure: None,
+                })
+            }
+            event => self.machine.on_event(event),
+        }
+    }
+
+    /// The token's branch, after the events queued before it.
+    pub(crate) fn finish_token_noticed(&mut self, token: &dyn TokenReader) -> Vec<Action> {
+        let failure = token.reason().is_some_and(|reason| reason.is_failure());
+        self.machine.on_dataflow_cancelled(failure)
+    }
+
+    /// The bridges were cancelled from outside.
+    pub(crate) fn on_external_abort(&mut self) -> Vec<Action> {
+        self.machine.on_external_abort()
+    }
+
+    /// Every sender of the event channel is gone.
+    pub(crate) fn on_events_closed(&mut self) -> Vec<Action> {
+        self.machine.on_events_closed()
+    }
+
+    /// The grace deadline of `peer`'s soft failure passed.
+    pub(crate) fn on_soft_failure_expired(&mut self, peer: String) -> Vec<Action> {
+        self.machine.on_soft_failure_expired(peer)
+    }
+
+    /// What the driver does for `action`, decided just before it takes it:
+    /// after the effects of the actions before it, so the token is read
+    /// then. What a broadcast announces is remembered before the driver
+    /// awaits it. The driver keeps `action` until it has taken the effect:
+    /// whatever it carries (an error from a reader, say) is dropped after
+    /// the effect, as before the decisions moved here.
+    pub(crate) fn prepare(&mut self, action: &Action, token: &dyn TokenReader) -> Effect {
+        match action {
+            Action::SendAck(peer) => Effect::SendAck(peer.clone()),
+            Action::BroadcastCancel => {
+                let reason = cancel_broadcast_reason(token);
+                self.announce(reason)
+            }
+            Action::AnnounceUnfinished => {
+                if self.failure_announced || self.unfinished_announced {
+                    return Effect::Silent;
+                }
+                self.unfinished_announced = true;
+                let reason = self.unfinished_reason(token);
+                self.announce(reason)
+            }
+            Action::AbortDrain(reason) | Action::CancelDataflow(reason) => {
+                Effect::Escalate(reason.clone())
+            }
+            Action::SendGoodbye => Effect::SendGoodbye,
+            Action::LinkFailed { peer, failure } => {
+                #[cfg(feature = "tracing")]
+                tracing::error!(peer = %peer, %failure, "cluster link failed while workers were running");
+                let poisoned = matches!(
+                    failure,
+                    LinkFailure::LockPoisoned
+                        | LinkFailure::Transport(TransportError::LockPoisoned { .. })
+                );
+                // Escalated: this also stops a drain on an earlier requested
+                // stop.
+                Effect::Escalate(if poisoned {
+                    CancellationReason::InternalError {
+                        detail: format!("lock poisoned on the link to peer {peer}"),
+                    }
+                } else {
+                    CancellationReason::NetworkError {
+                        detail: format!("link to peer {peer} failed: {failure}"),
+                    }
+                })
+            }
+            Action::ArmSoftFailureTimer(peer) => Effect::ArmGrace(peer.clone()),
+            Action::Teardown { graceful } => Effect::Teardown {
+                graceful: *graceful,
+            },
+        }
+    }
+
+    /// A `Cancel` with `reason` is broadcast: remember whether it told the
+    /// peers about a failure.
+    fn announce(&mut self, reason: String) -> Effect {
+        self.failure_announced |= CancellationReason::describes_failure(&reason);
+        Effect::Broadcast(reason)
+    }
+
+    /// The reason of the second `Cancel` sent when the local workers did not
+    /// complete after a requested stop (see [`Action::AnnounceUnfinished`]):
+    /// a worker error, or a failure that stopped the local drain (a peer's,
+    /// a lost link, lost records), which stops every peer's drain; otherwise
+    /// the requested stop itself, marked as unfinished, which stops only the
+    /// drains that still wait for this node's data. The escalation is read
+    /// twice, here and in [`cancel_broadcast_reason`]: it may change between
+    /// the reads.
+    fn unfinished_reason(&self, token: &dyn TokenReader) -> String {
+        if let Some(detail) = &self.worker_failure {
+            return CancellationReason::WorkerFailed {
+                detail: detail.clone(),
+            }
+            .to_string();
+        }
+        if let Some(reason) = token.escalation() {
+            return reason.to_string();
+        }
+        format!(
+            "{} (the node stopped before finishing its part of the dataflow)",
+            cancel_broadcast_reason(token)
+        )
+    }
+
+    /// The peers that stopped without finishing their part: the driver
+    /// closes their progress lanes after the actions (see
+    /// [`LifecycleMachine::stopped_peers`]).
+    pub(crate) fn stopped_peers(&self) -> impl Iterator<Item = &str> {
+        self.machine.stopped_peers()
+    }
+
+    /// Teardown begins: whether it lets the inbound bridges drain. Once every
+    /// local worker has finished, no operator consumes inbound data any more.
+    pub(crate) fn teardown_drains_inbound(&self) -> bool {
+        self.machine.workers_done()
+    }
+
+    /// An event teardown finds queued once its bounded waits are over,
+    /// queued behind the event that finished the machine: data lost on the
+    /// way in (if teardown let the inbound bridges drain, `drain_inbound`),
+    /// and corrupt traffic, still fail the result.
+    pub(crate) fn on_late_event(&mut self, event: LifecycleEvent, drain_inbound: bool) {
+        if let LifecycleEvent::Link { event: link, .. } = &event {
+            let lost = drain_inbound && matches!(link, LinkEvent::InboundDataLost(_));
+            if lost || is_corruption_event(link) {
+                let _ = self.machine.on_event(event);
+            }
+        }
+    }
+
+    /// Teardown's last decision: the reason of the `Cancel` that announces a
+    /// loss to the peers, if one goes out (remembered as announced before
+    /// the driver awaits it).
+    ///
+    /// A loss recorded once the machine had finished (by teardown, or among
+    /// the events applied just before it) was announced to nobody. A peer
+    /// that only acknowledged us may still be running on our now-invalid
+    /// output: every peer is told before the transport goes. So is any loss
+    /// when our `Cancel` announced only a requested stop, which peers may
+    /// drain on.
+    pub(crate) fn unannounced_loss(&mut self) -> Option<String> {
+        let loss = match self.machine.take_unannounced_loss() {
+            Some(loss) => loss,
+            None if !self.failure_announced => self.machine.data_loss()?.clone(),
+            None => return None,
+        };
+        let reason = CancellationReason::NetworkError {
+            detail: loss.to_string(),
+        }
+        .to_string();
+        let Effect::Broadcast(reason) = self.announce(reason) else {
+            unreachable!("announce broadcasts")
+        };
+        Some(reason)
+    }
+
+    /// The data loss teardown publishes to the completion.
+    pub(crate) fn data_loss(&self) -> Option<&DataLoss> {
+        self.machine.data_loss()
+    }
+}
+
+/// Reason text sent to peers with `Cancel`; peers classify it (a forwarded
+/// failure is itself a failure, so they never drain into a partial result).
+fn cancel_broadcast_reason(token: &dyn TokenReader) -> String {
+    // A failure that escalated a requested stop before we broadcast it.
+    if let Some(failure) = token.escalation() {
+        return failure.to_string();
+    }
+    match token.reason() {
+        Some(reason) => reason.to_string(),
+        None if token.is_cancelled() => "cancelled".to_string(),
+        // Not cancelled: the bridges were stopped from outside while the
+        // workers ran, so this node abandons a running dataflow.
+        None => CancellationReason::NetworkError {
+            detail: "the node stopped its network bridges while its workers were running".into(),
+        }
+        .to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Async driver
 // ---------------------------------------------------------------------------
 
@@ -1411,25 +1734,6 @@ async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
-    }
-}
-
-/// Reason text sent to peers with `Cancel`; peers classify it (a forwarded
-/// failure is itself a failure, so they never drain into a partial result).
-fn cancel_broadcast_reason(dataflow_cancel: &CancellationToken) -> String {
-    // A failure that escalated a requested stop before we broadcast it.
-    if let Some(failure) = dataflow_cancel.escalation() {
-        return failure.to_string();
-    }
-    match dataflow_cancel.reason() {
-        Some(reason) => reason.to_string(),
-        None if dataflow_cancel.is_cancelled() => "cancelled".to_string(),
-        // Not cancelled: the bridges were stopped from outside while the
-        // workers ran, so this node abandons a running dataflow.
-        None => CancellationReason::NetworkError {
-            detail: "the node stopped its network bridges while its workers were running".into(),
-        }
-        .to_string(),
     }
 }
 
@@ -1467,7 +1771,7 @@ fn dump_accepted_loss(id: DataflowId, machine: &LifecycleMachine, dumped: &mut b
 /// state. Field order matters: `_teardown` is dropped last so waiters resolve
 /// only after every resource has been released.
 pub(crate) struct ClusterLifecycle {
-    pub(crate) machine: LifecycleMachine,
+    pub(crate) coordinator: Coordinator,
     pub(crate) events: tokio_mpsc::UnboundedReceiver<LifecycleEvent>,
     pub(crate) dataflow_id: DataflowId,
     pub(crate) dataflow_cancel: CancellationToken,
@@ -1487,12 +1791,6 @@ pub(crate) struct ClusterLifecycle {
     /// The token of this dataflow's registrations with `shared_managers`.
     pub(crate) shared_registration: Option<u64>,
     pub(crate) transport: Arc<ClusterTransport>,
-    /// A `Cancel` describing a failure went out.
-    pub(crate) failure_announced: bool,
-    /// [`Action::AnnounceUnfinished`] was sent.
-    pub(crate) unfinished_announced: bool,
-    /// The first local worker error other than a cancellation.
-    pub(crate) worker_failure: Option<String>,
     /// The flight recorder: the data loss the machine accepted was dumped
     /// (see [`dump_accepted_loss`]).
     #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
@@ -1502,9 +1800,9 @@ pub(crate) struct ClusterLifecycle {
 }
 
 impl ClusterLifecycle {
-    /// Drive the state machine until teardown.
+    /// Drive the coordinator until teardown: wait for what comes next, ask
+    /// the [`Coordinator`] what it means, and perform what it decides.
     pub(crate) async fn run(mut self) {
-        let mut cancel_seen = false;
         // Grace deadlines of soft link failures (`ArmSoftFailureTimer`).
         let mut soft_deadlines: HashMap<String, tokio::time::Instant> = HashMap::new();
         loop {
@@ -1518,8 +1816,8 @@ impl ClusterLifecycle {
                 biased;
                 // Before bridge_cancel so a cancellation that arrives with an
                 // external abort is still broadcast first.
-                _ = self.dataflow_cancel.cancelled_async(), if !cancel_seen => {
-                    cancel_seen = true;
+                _ = self.dataflow_cancel.cancelled_async(), if !self.coordinator.cancel_seen() => {
+                    self.coordinator.begin_token_noticed();
                     // Apply worker results that are already queued first: a
                     // cancellation racing with local success must not be
                     // broadcast once every worker has succeeded.
@@ -1527,38 +1825,43 @@ impl ClusterLifecycle {
                     while let Ok(event) = self.events.try_recv() {
                         actions.extend(self.apply(event));
                     }
-                    let failure = self
-                        .dataflow_cancel
-                        .reason()
-                        .is_some_and(|reason| reason.is_failure());
-                    actions.extend(self.machine.on_dataflow_cancelled(failure));
+                    actions.extend(self.coordinator.finish_token_noticed(&self.dataflow_cancel));
                     actions
                 }
-                _ = self.bridge_cancel.cancelled() => self.machine.on_external_abort(),
+                _ = self.bridge_cancel.cancelled() => self.coordinator.on_external_abort(),
                 event = self.events.recv() => match event {
                     Some(event) => self.apply(event),
-                    None => self.machine.on_events_closed(),
+                    None => self.coordinator.on_events_closed(),
                 },
                 _ = sleep_until_opt(soft_deadline), if soft_deadline.is_some() => {
                     let (peer, _) = next_soft.expect("guarded by soft_deadline");
                     soft_deadlines.remove(&peer);
-                    self.machine.on_soft_failure_expired(peer)
+                    self.coordinator.on_soft_failure_expired(peer)
                 }
             };
             for action in actions {
-                if let Action::ArmSoftFailureTimer(peer) = action {
-                    soft_deadlines.entry(peer).or_insert_with(|| {
-                        tokio::time::Instant::now() + self.cancel_broadcast_timeout
-                    });
-                    continue;
-                }
-                if self.perform(action).await {
-                    // After teardown, which may still record a loss reported
-                    // behind the event that finished the machine.
-                    traced! {
-                        self.trace_accepted_loss();
+                // Prepared just before it is taken, after the actions before
+                // it took effect.
+                match self.coordinator.prepare(&action, &self.dataflow_cancel) {
+                    Effect::ArmGrace(peer) => {
+                        soft_deadlines.entry(peer).or_insert_with(|| {
+                            tokio::time::Instant::now() + self.cancel_broadcast_timeout
+                        });
                     }
-                    return;
+                    effect => {
+                        let torn_down = self.perform(effect).await;
+                        // Only once its effect is done (see `prepare`).
+                        drop(action);
+                        if torn_down {
+                            // After teardown, which may still record a loss
+                            // reported behind the event that finished the
+                            // machine.
+                            traced! {
+                                self.trace_accepted_loss();
+                            }
+                            return;
+                        }
+                    }
                 }
             }
             traced! {
@@ -1571,19 +1874,25 @@ impl ClusterLifecycle {
             // In Shared mode nothing else closes them: the shared link outlives
             // the peer's dataflow.
             if let Some(handles) = &self.progress_handles {
-                for peer in self.machine.stopped_peers() {
+                for peer in self.coordinator.stopped_peers() {
                     handles.close_peer(peer);
                 }
             }
         }
     }
 
-    /// Feed one event to the machine.
-    ///
-    /// Records dropped by operators of a cancelled dataflow are expected
-    /// unless the workers still succeed; the machine cannot see the token, so
-    /// its state is passed along.
+    /// Hand one event to the coordinator, noting it in the flight recorder
+    /// first.
     fn apply(&mut self, event: LifecycleEvent) -> Vec<Action> {
+        traced! {
+            self.trace_event(&event);
+        }
+        self.coordinator.on_event(event, &self.dataflow_cancel)
+    }
+
+    /// The flight recorder: an event the coordinator is about to apply.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn trace_event(&self, event: &LifecycleEvent) {
         match event {
             LifecycleEvent::Link {
                 peer,
@@ -1591,37 +1900,24 @@ impl ClusterLifecycle {
             } => {
                 // Noted in the link's ring; dumped only if the machine
                 // accepts the loss (see `trace_accepted_loss`).
-                traced! {
-                    use crate::progress::trace::{Ev, Kind, Note};
-                    if let Some(recorder) = self
-                        .outboxes
-                        .get(&peer)
-                        .and_then(|outbox| outbox.link().recorder())
-                    {
-                        recorder.record(Ev::new(Kind::Link).a(9));
-                        recorder.note(Note::Loss, &detail);
-                    }
+                use crate::progress::trace::{Ev, Kind, Note};
+                if let Some(recorder) = self
+                    .outboxes
+                    .get(peer)
+                    .and_then(|outbox| outbox.link().recorder())
+                {
+                    recorder.record(Ev::new(Kind::Link).a(9));
+                    recorder.note(Note::Loss, detail);
                 }
-                let cancelled = self.dataflow_cancel.is_cancelled();
-                self.machine.on_inbound_data_lost(peer, detail, cancelled)
             }
-            LifecycleEvent::WorkerFinished { success, failure } => {
-                traced! {
-                    self.trace_coordinator(
-                        None,
-                        crate::progress::trace::coordinator::WORKER_FINISHED,
-                        u64::from(success),
-                    );
-                }
-                if let Some(failure) = failure {
-                    self.worker_failure.get_or_insert(failure);
-                }
-                self.machine.on_event(LifecycleEvent::WorkerFinished {
-                    success,
-                    failure: None,
-                })
+            LifecycleEvent::WorkerFinished { success, .. } => {
+                self.trace_coordinator(
+                    None,
+                    crate::progress::trace::coordinator::WORKER_FINISHED,
+                    u64::from(*success),
+                );
             }
-            event => self.machine.on_event(event),
+            LifecycleEvent::Link { .. } => {}
         }
     }
 
@@ -1629,7 +1925,11 @@ impl ClusterLifecycle {
     /// the actions it led to were taken (a dump must never delay a failure).
     #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
     fn trace_accepted_loss(&mut self) {
-        dump_accepted_loss(self.dataflow_id, &self.machine, &mut self.loss_dumped);
+        dump_accepted_loss(
+            self.dataflow_id,
+            self.coordinator.machine(),
+            &mut self.loss_dumped,
+        );
     }
 
     /// The flight recorder: the coordinator's `action` (see
@@ -1647,42 +1947,21 @@ impl ClusterLifecycle {
         }
     }
 
-    /// Broadcast `Cancel` with `reason` (bounded), remembering whether it
-    /// told the peers about a failure.
-    async fn broadcast_cancel(&mut self, reason: String) {
-        self.failure_announced |= CancellationReason::describes_failure(&reason);
+    /// Broadcast `Cancel` with `reason` to every peer (bounded). The
+    /// coordinator remembered what it announces when it decided it.
+    async fn broadcast_cancel(&self, reason: &str) {
         let _ = tokio::time::timeout(
             self.cancel_broadcast_timeout,
-            broadcast_cancel_with_transport(&self.transport, self.dataflow_id, &reason),
+            broadcast_cancel_with_transport(&self.transport, self.dataflow_id, reason),
         )
         .await;
     }
 
-    /// The reason of the second `Cancel` sent when the local workers did not
-    /// complete after a requested stop (see [`Action::AnnounceUnfinished`]):
-    /// a worker error, or a failure that stopped the local drain (a peer's,
-    /// a lost link, lost records), which stops every peer's drain; otherwise
-    /// the requested stop itself, marked as unfinished, which stops only the
-    /// drains that still wait for this node's data.
-    fn unfinished_reason(&self) -> String {
-        if let Some(detail) = &self.worker_failure {
-            return CancellationReason::WorkerFailed {
-                detail: detail.clone(),
-            }
-            .to_string();
-        }
-        if let Some(reason) = self.dataflow_cancel.escalation() {
-            return reason.to_string();
-        }
-        format!(
-            "{} (the node stopped before finishing its part of the dataflow)",
-            cancel_broadcast_reason(&self.dataflow_cancel)
-        )
-    }
-    /// Execute one action; returns `true` once teardown is complete.
-    async fn perform(&mut self, action: Action) -> bool {
-        match action {
-            Action::SendAck(peer) => {
+    /// Perform the coordinator's decision for one action; returns `true` once
+    /// teardown is complete.
+    async fn perform(&mut self, effect: Effect) -> bool {
+        match effect {
+            Effect::SendAck(peer) => {
                 // On the payload lane, behind every data frame we already
                 // sent to the peer: once it reads the ack it has read those.
                 let channel = self.peer_workers.get(&peer).and_then(|&(peer_start, _)| {
@@ -1704,56 +1983,22 @@ impl ClusterLifecycle {
                 }
                 false
             }
-            Action::BroadcastCancel => {
-                let reason = cancel_broadcast_reason(&self.dataflow_cancel);
-                self.broadcast_cancel(reason).await;
+            Effect::Broadcast(reason) => {
+                self.broadcast_cancel(&reason).await;
                 false
             }
-            Action::AnnounceUnfinished => {
-                if !self.failure_announced && !self.unfinished_announced {
-                    self.unfinished_announced = true;
-                    let reason = self.unfinished_reason();
-                    self.broadcast_cancel(reason).await;
-                }
-                false
-            }
-            Action::AbortDrain(reason) => {
+            Effect::Silent => false,
+            Effect::Escalate(reason) => {
                 self.dataflow_cancel.escalate(reason);
                 false
             }
-            Action::SendGoodbye => {
+            Effect::SendGoodbye => {
                 self.send_goodbye();
                 false
             }
-            Action::LinkFailed { peer, failure } => {
-                #[cfg(feature = "tracing")]
-                tracing::error!(peer = %peer, %failure, "cluster link failed while workers were running");
-                let poisoned = matches!(
-                    failure,
-                    LinkFailure::LockPoisoned
-                        | LinkFailure::Transport(TransportError::LockPoisoned { .. })
-                );
-                let reason = if poisoned {
-                    CancellationReason::InternalError {
-                        detail: format!("lock poisoned on the link to peer {peer}"),
-                    }
-                } else {
-                    CancellationReason::NetworkError {
-                        detail: format!("link to peer {peer} failed: {failure}"),
-                    }
-                };
-                // Escalated: this also stops a drain on an earlier requested
-                // stop.
-                self.dataflow_cancel.escalate(reason);
-                false
-            }
-            Action::CancelDataflow(reason) => {
-                self.dataflow_cancel.escalate(reason);
-                false
-            }
             // Armed by `run`, which owns the deadlines.
-            Action::ArmSoftFailureTimer(_) => false,
-            Action::Teardown { graceful } => {
+            Effect::ArmGrace(_) => false,
+            Effect::Teardown { graceful } => {
                 self.teardown(graceful).await;
                 true
             }
@@ -1822,7 +2067,7 @@ impl ClusterLifecycle {
         // data any more: let the inbound bridges deliver or report what is
         // already queued, then exit. Anything a peer sent before its
         // end-of-stream or acknowledgement is queued by now.
-        let drain_inbound = self.machine.workers_done();
+        let drain_inbound = self.coordinator.teardown_drains_inbound();
         if drain_inbound {
             self.inbound.drain();
         }
@@ -1867,30 +2112,13 @@ impl ClusterLifecycle {
         // Reports queued behind the event that finished the machine: data
         // lost on the way in, and corrupt traffic, still fail the result.
         while let Ok(event) = self.events.try_recv() {
-            if let LifecycleEvent::Link { event: link, .. } = &event {
-                let lost = drain_inbound && matches!(link, LinkEvent::InboundDataLost(_));
-                if lost || is_corruption_event(link) {
-                    let _ = self.machine.on_event(event);
-                }
-            }
+            self.coordinator.on_late_event(event, drain_inbound);
         }
-        let unannounced = match self.machine.take_unannounced_loss() {
-            Some(loss) => Some(loss),
-            // Our Cancel announced a requested stop that peers may drain on.
-            None if !self.failure_announced => self.machine.data_loss().cloned(),
-            None => None,
-        };
-        if let Some(loss) = unannounced {
-            // A loss recorded once the machine had finished (in this drain,
-            // or among events applied just before teardown) was announced to
-            // nobody. A peer that only acknowledged us may still be running
-            // on our now-invalid output: tell every peer before the
-            // transport goes.
-            let reason = CancellationReason::NetworkError {
-                detail: loss.to_string(),
-            }
-            .to_string();
-            self.broadcast_cancel(reason).await;
+        // A loss recorded once the machine had finished (in this drain, or
+        // among events applied just before teardown) was announced to
+        // nobody: tell every peer before the transport goes.
+        if let Some(reason) = self.coordinator.unannounced_loss() {
+            self.broadcast_cancel(&reason).await;
         }
         if let Some(managers) = managers {
             for manager in managers.values() {
@@ -1915,7 +2143,7 @@ impl ClusterLifecycle {
         }
         self.progress_handles = None;
         self.dispatcher = None;
-        if let Some(loss) = self.machine.data_loss() {
+        if let Some(loss) = self.coordinator.data_loss() {
             self._teardown.set_data_loss(loss.clone());
         }
     }
@@ -3433,7 +3661,7 @@ mod tests {
         outbox.link().attach_trace(Some(Arc::clone(ring)));
         let (notifier, waiter) = teardown_signal(runtime);
         let lifecycle = ClusterLifecycle {
-            machine,
+            coordinator: Coordinator::new(machine),
             events: rx,
             dataflow_id: id,
             dataflow_cancel: CancellationToken::new(),
@@ -3452,9 +3680,6 @@ mod tests {
             shared_managers: None,
             shared_registration: None,
             transport: Arc::new(ClusterTransport::Dedicated(Arc::new(session))),
-            failure_announced: false,
-            unfinished_announced: false,
-            worker_failure: None,
             loss_dumped: false,
             _teardown: notifier,
         };
@@ -3745,6 +3970,62 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// A link failure's error is dropped only once the token has been
+    /// escalated with it, as before the driver's decisions moved to
+    /// [`Coordinator`]: what an error from a reader does when it is dropped
+    /// cannot get ahead of the escalation (`prepare` borrows the action).
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[tokio::test(start_paused = true)]
+    async fn a_link_failure_is_dropped_after_the_token_is_escalated_with_it() {
+        /// An error that notes the token's reason when it is dropped.
+        #[derive(Debug)]
+        struct Sentinel {
+            token: CancellationToken,
+            seen: Arc<Mutex<Option<Option<CancellationReason>>>>,
+        }
+        impl std::fmt::Display for Sentinel {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("the reader's own error")
+            }
+        }
+        impl std::error::Error for Sentinel {}
+        impl Drop for Sentinel {
+            fn drop(&mut self) {
+                *self.seen.lock().unwrap() = Some(self.token.reason());
+            }
+        }
+        let dir = temp_dir("link-failure-drop");
+        let (m, _) = machine(1, &[("node-b", 1)]);
+        let (lifecycle, events, _, _, _) = teardown_rig(m, &dir);
+        let seen = Arc::new(Mutex::new(None));
+        let error = std::io::Error::other(Sentinel {
+            token: lifecycle.dataflow_cancel.clone(),
+            seen: Arc::clone(&seen),
+        });
+        // A hard failure while the worker runs: `LinkFailed`, then the
+        // worker's failure ends the run.
+        events
+            .send(link_event(
+                "node-b",
+                LinkEvent::ProgressChannelEnded(LinkFailure::Transport(TransportError::Io(error))),
+            ))
+            .unwrap();
+        events.send(done(false)).unwrap();
+        tokio::time::timeout(Duration::from_secs(60), lifecycle.run())
+            .await
+            .unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            matches!(
+                &seen,
+                Some(Some(CancellationReason::NetworkError { detail }))
+                    if detail.contains("link to peer node-b failed")
+            ),
+            "{seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -93,8 +93,9 @@ Shared mode on one connection or on two, or Dedicated mode; one or two local
 workers; one or two progress channels; transport faults (a write error or a
 reset) or inbound ones (records lost on their way in, corrupt frames). A
 debug build is too slow for them, so they are ignored. CI's `lifecycle` job
-runs eleven of them in release, in two parts that run at the same time; each
-part's checking takes about seven and a half minutes, not counting its build.
+runs eleven of them in release, in three parts that run at the same time;
+each part's checking takes about eight minutes, not counting its build (each
+of the coordinator's steps runs twice: once more for the equivalence oracle).
 A part runs two lanes at once, and a lane runs its configurations one after
 another, each in its own process, so that the log shows each one's time and
 peak memory. The lanes, in `.github/workflows/ci.yml`, are balanced by time.

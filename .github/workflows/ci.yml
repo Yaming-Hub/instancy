@@ -201,7 +201,7 @@ jobs:
 
   # Every order in which the lifecycle coordinator's events can reach it
   # (runtime::cluster_lifecycle::exhaustive), in release: eleven
-  # configurations, in two parts that run at the same time. A part runs two
+  # configurations, in three parts that run at the same time. A part runs two
   # lanes at once, and a lane runs its configurations one after another, each
   # in its own process, so that the log shows each one's time and peak memory.
   # The lanes are balanced by time, and the largest configurations of a
@@ -209,28 +209,29 @@ jobs:
   # (the second lane's largest runs first, while the first's is half-way).
   # The others are run by hand (docs/testing/nextest.md).
   lifecycle:
-    name: Lifecycle coordinator, every order of events (${{ matrix.part }} of 2)
+    name: Lifecycle coordinator, every order of events (${{ matrix.part }} of 3)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2]
+        part: [1, 2, 3]
     defaults:
       run:
         shell: bash
     env:
       PART: ${{ matrix.part }}
-      LANE_1A: shared_two_workers_two_channels shared_one_worker_two_channels
+      LANE_1A: shared_two_workers_two_channels
       LANE_1B: >-
-        dedicated_one_worker_two_channels dedicated_one_worker_one_channel_inbound
+        dedicated_one_worker_two_channels shared_one_worker_two_channels
         shared_one_worker_one_channel
-      LANE_2A: >-
-        shared_split_one_worker_two_channels shared_two_workers_one_channel
-        dedicated_one_worker_one_channel
+      LANE_2A: shared_split_one_worker_two_channels
       LANE_2B: >-
-        shared_split_one_worker_one_channel_inbound
-        shared_split_one_worker_one_channel shared_one_worker_one_channel_inbound
+        dedicated_one_worker_one_channel_inbound shared_split_one_worker_one_channel
+        shared_two_workers_one_channel
+      LANE_3A: shared_split_one_worker_one_channel_inbound
+      LANE_3B: >-
+        shared_one_worker_one_channel_inbound dedicated_one_worker_one_channel
       BY_HAND: >-
         shared_one_worker_two_channels_inbound shared_two_workers_one_channel_inbound
         shared_split_two_workers_one_channel shared_split_two_workers_two_channels
@@ -256,7 +257,7 @@ jobs:
           # Listed first: a failure inside diff's <(...) would go unnoticed.
           listed=$("$TESTS" --list --ignored cluster_lifecycle::exhaustive:: \
             | sed -n 's/^runtime::cluster_lifecycle::exhaustive::\(.*\): test$/\1/p' | sort)
-          diff <(printf '%s\n' $LANE_1A $LANE_1B $LANE_2A $LANE_2B $BY_HAND | sort) \
+          diff <(printf '%s\n' $LANE_1A $LANE_1B $LANE_2A $LANE_2B $LANE_3A $LANE_3B $BY_HAND | sort) \
             <(printf '%s\n' "$listed")
       - name: Every order of events
         run: |
