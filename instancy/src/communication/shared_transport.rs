@@ -118,6 +118,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+// Schedule tests (`--cfg instancy_shuttle`, Linux) substitute Shuttle's
+// models for the manager's state lock and the per-thread count of state
+// locks held; see `closing_shuttle` below.
+#[cfg(all(test, target_os = "linux", instancy_shuttle))]
+use shuttle::sync::{Mutex as StateLock, MutexGuard as StateLockGuard};
+#[cfg(not(all(test, target_os = "linux", instancy_shuttle)))]
+use std::sync::{Mutex as StateLock, MutexGuard as StateLockGuard};
+
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -210,8 +218,15 @@ impl Drop for Lane {
 
 // The state locks (any manager's) this thread holds, counted in debug builds
 // so that a lane hold dropped under one is caught (see `LaneHold`).
-#[cfg(debug_assertions)]
+#[cfg(all(
+    debug_assertions,
+    not(all(test, target_os = "linux", instancy_shuttle))
+))]
 std::thread_local! {
+    static STATE_LOCKS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(all(debug_assertions, test, target_os = "linux", instancy_shuttle))]
+shuttle::thread_local! {
     static STATE_LOCKS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -225,10 +240,10 @@ fn state_locks_held() -> usize {
 /// A held manager state lock (see [`Inner::state`]). Debug builds count the
 /// state locks each thread holds, so that a [`LaneHold`] dropped under one is
 /// caught.
-struct StateGuard<'a>(std::sync::MutexGuard<'a, State>);
+struct StateGuard<'a>(StateLockGuard<'a, State>);
 
 impl<'a> StateGuard<'a> {
-    fn new(guard: std::sync::MutexGuard<'a, State>) -> Self {
+    fn new(guard: StateLockGuard<'a, State>) -> Self {
         #[cfg(debug_assertions)]
         let _ = STATE_LOCKS_HELD.try_with(|held| held.set(held.get() + 1));
         Self(guard)
@@ -708,7 +723,7 @@ impl PendingControl {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(all(target_os = "linux", instancy_shuttle))))]
     fn len(&self) -> usize {
         self.by_dataflow.len()
     }
@@ -818,10 +833,20 @@ enum Report {
 // Inner: state shared with the background tasks
 // ---------------------------------------------------------------------------
 
+/// Logs `step` for the schedule tests, in the order the state lock
+/// serializes the steps: call it under the lock (see `closing_shuttle`).
+/// Outside those tests it expands to nothing.
+macro_rules! log_step {
+    ($inner:expr, $step:expr) => {
+        #[cfg(all(test, target_os = "linux", instancy_shuttle))]
+        $inner.steps.lock().unwrap().push($step);
+    };
+}
+
 struct Inner {
     peer_node_id: String,
     config: SharedConnectionConfig,
-    state: Mutex<State>,
+    state: StateLock<State>,
     prober: RttProber,
     probe_counter: ProbeCounter,
     /// Factory used to establish the pool's connections.
@@ -834,6 +859,9 @@ struct Inner {
     init_lock: TokioMutex<()>,
     /// Health event sender (connection failures).
     health_tx: tokio::sync::broadcast::Sender<crate::runtime_event::RuntimeEvent>,
+    /// The steps logged for the schedule tests (see `log_step!`).
+    #[cfg(all(test, target_os = "linux", instancy_shuttle))]
+    steps: std::sync::Mutex<Vec<closing_shuttle::Step>>,
 }
 
 impl Inner {
@@ -969,6 +997,14 @@ impl Inner {
             };
             let seq = reg.next_send_seq;
             reg.next_send_seq += 1;
+            log_step!(
+                self,
+                closing_shuttle::Step::Numbered {
+                    dataflow_id,
+                    held: hold.is_some(),
+                    seq,
+                }
+            );
             (reg.conn, conn.writer.clone(), seq)
         };
         let mut payload = Vec::with_capacity(SEQUENCE_PREFIX + frame.payload.len());
@@ -1172,6 +1208,10 @@ impl Inner {
     fn fail_outbound(self: &Arc<Self>, conn_id: usize, error: TransportError) {
         let reports = {
             let mut state = self.state();
+            log_step!(
+                self,
+                closing_shuttle::Step::OutboundFailed { conn: conn_id }
+            );
             let removed = state.connections.remove(&conn_id).is_some();
             let mut reports = Vec::new();
             for reg in state.registered.values_mut() {
@@ -1344,6 +1384,13 @@ impl Inner {
         } = &mut *state;
         match registered.get_mut(dataflow_id) {
             Some(reg) if token.is_none_or(|token| token == reg.token) => {
+                log_step!(
+                    self,
+                    closing_shuttle::Step::Unregistered {
+                        dataflow_id: *dataflow_id,
+                        public: token.is_none(),
+                    }
+                );
                 if token.is_none() || reg.lane.strong_count() == 0 {
                     Self::remove_registration(registered, connections, dataflow_id);
                 } else if !reg.closing {
@@ -1398,6 +1445,12 @@ impl Inner {
             .registered
             .get_mut(dataflow_id)
             .filter(|reg| reg.token == token && !reg.closing)?;
+        log_step!(
+            self,
+            closing_shuttle::Step::HoldMade {
+                dataflow_id: *dataflow_id,
+            }
+        );
         Some(LaneHold(reg.lane.upgrade().unwrap_or_else(|| {
             let lane = Arc::new(Lane {
                 inner: Arc::downgrade(self),
@@ -1739,7 +1792,7 @@ impl SharedPeerManager {
         let inner = Arc::new(Inner {
             peer_node_id,
             config,
-            state: Mutex::new(State::default()),
+            state: StateLock::new(State::default()),
             prober: RttProber::new(),
             probe_counter: ProbeCounter::new(),
             connection_factory,
@@ -1747,6 +1800,8 @@ impl SharedPeerManager {
             task_handles: TaskHandles::default(),
             init_lock: TokioMutex::new(()),
             health_tx,
+            #[cfg(all(test, target_os = "linux", instancy_shuttle))]
+            steps: Default::default(),
         });
 
         // Payload queue: dataflow tasks send their frames here.
@@ -2441,7 +2496,523 @@ impl DataframeSender {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+/// Schedule tests of a registration's closing state, under Shuttle (Linux,
+/// `RUSTFLAGS="--cfg instancy_shuttle"`; see `docs/testing/nextest.md`).
+///
+/// The registration under test (token `T`) is pinned to connection `CONN`,
+/// beside another registration. Its session holds its lane through the
+/// sender `S`, a frame `F` that `S` sent is queued for the bridge, and `P`
+/// holds nothing (a sender from `dataflow_sender`). Shuttle threads then run:
+/// - the bridge task, which handles the queue;
+/// - a cleanup that unregisters the registration, as teardown does (with
+///   `T`) or as the public call does (without);
+/// - the owner, which drops `S`;
+/// - a request for a hold on the registration's lane, dropping what it gets;
+/// - `P` sending a frame `G`;
+/// - in some cases, `CONN`'s writer failing.
+///
+/// Some cases hold a thread back until another has acted, to check what
+/// must follow from that order. In every execution, the steps whose order
+/// matters are logged where the state lock serializes them (see
+/// `log_step!`), and checked: no unheld frame is numbered after the
+/// cleanup, no frame after the public unregistration or after its
+/// connection failed, and no hold is made after the cleanup. The state lock
+/// is Shuttle's; Tokio's channels are opaque to it (each call is one step).
+/// Each case samples `SAMPLES` executions with PCT from seed `SEED`: their
+/// exhaustive search does not finish.
+#[cfg(all(test, target_os = "linux", instancy_shuttle))]
+mod closing_shuttle {
+    use super::*;
+    use std::sync::atomic::AtomicUsize as Count;
+
+    /// The only seed: `SHUTTLE_RANDOM_SEED` must be unset.
+    const SEED: u64 = 0x1a4e;
+    /// Sampled executions per case, not distinct interleavings.
+    const SAMPLES: usize = 5_000;
+    const T: u64 = 1;
+    const OTHER_TOKEN: u64 = 2;
+    const CONN: usize = 0;
+
+    /// The registration under test.
+    fn id() -> DataflowId {
+        DataflowId::from_bytes([1; 16])
+    }
+
+    /// Another registration on the same connection.
+    fn other() -> DataflowId {
+        DataflowId::from_bytes([2; 16])
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Cleanup {
+        /// Teardown's unregistration, with the registration's token.
+        Teardown,
+        /// `SharedPeerManager::unregister_dataflow`, without a token.
+        Public,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Order {
+        /// No thread waits for another.
+        Free,
+        /// `P` sends `G`, and the hold is asked for, only after the cleanup.
+        AfterCleanup,
+        /// The bridge starts only after the cleanup and the failure, if any.
+        BridgeLast,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct Case {
+        cleanup: Cleanup,
+        fail: bool,
+        order: Order,
+    }
+
+    /// A step the state lock serializes, logged where it takes effect (see
+    /// `log_step!`).
+    #[derive(Clone, Copy, Debug)]
+    pub(super) enum Step {
+        /// A payload frame took a number in its registration's lane.
+        Numbered {
+            dataflow_id: DataflowId,
+            held: bool,
+            seq: u64,
+        },
+        /// A registration was unregistered, by teardown or (`public`) by
+        /// `SharedPeerManager::unregister_dataflow`.
+        Unregistered {
+            dataflow_id: DataflowId,
+            public: bool,
+        },
+        /// A connection's writer failed.
+        OutboundFailed { conn: usize },
+        /// A hold on a registration's lane was handed out.
+        HoldMade { dataflow_id: DataflowId },
+    }
+
+    /// What an execution's frames and hold request came to.
+    #[derive(Default)]
+    struct Outcomes {
+        f_written: Count,
+        f_dropped: Count,
+        g_written: Count,
+        g_dropped: Count,
+        hold_made: Count,
+        hold_refused: Count,
+    }
+
+    /// A held registration's frames are written, an unheld sender's are
+    /// dropped once the registration closes, and it is removed once the
+    /// last hold is released.
+    #[test]
+    fn teardown_keeps_its_holders_frames_until_the_last_hold_goes() {
+        for order in [Order::Free, Order::AfterCleanup, Order::BridgeLast] {
+            sample(Case {
+                cleanup: Cleanup::Teardown,
+                fail: false,
+                order,
+            });
+        }
+    }
+
+    /// The public call removes a registration at once, held or not.
+    #[test]
+    fn the_public_unregistration_removes_a_registration_at_once() {
+        for order in [Order::Free, Order::AfterCleanup, Order::BridgeLast] {
+            sample(Case {
+                cleanup: Cleanup::Public,
+                fail: false,
+                order,
+            });
+        }
+    }
+
+    /// A failed connection drops what is handled after the failure and
+    /// leaves the pool; either cleanup still removes the registration.
+    #[test]
+    fn a_failed_connection_beside_either_cleanup() {
+        for cleanup in [Cleanup::Teardown, Cleanup::Public] {
+            for order in [Order::Free, Order::BridgeLast] {
+                sample(Case {
+                    cleanup,
+                    fail: true,
+                    order,
+                });
+            }
+        }
+    }
+
+    /// Run `case` in `SAMPLES` executions sampled by PCT from `SEED`. Each
+    /// must pass, and with no thread held back, each frame and the hold
+    /// request must have come out both ways in some of them.
+    fn sample(case: Case) {
+        assert!(
+            std::env::var_os("SHUTTLE_RANDOM_SEED").is_none(),
+            "SHUTTLE_RANDOM_SEED would replace the test's seed"
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let handle = runtime.handle().clone();
+        let outcomes = Arc::new(Outcomes::default());
+        let passed = Arc::new(Count::new(0));
+        let mut config = shuttle::Config::new();
+        config.stack_size = 0x10_0000;
+        config.max_steps = shuttle::MaxSteps::FailAfter(10_000);
+        config.max_time = None;
+        let scheduler = shuttle::scheduler::PctScheduler::new_from_seed(SEED, 3, SAMPLES);
+        let executions = shuttle::Runner::new(scheduler, config).run({
+            let outcomes = Arc::clone(&outcomes);
+            let passed = Arc::clone(&passed);
+            move || {
+                execution(case, &handle, &outcomes);
+                passed.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let count = |count: &Count| count.load(Ordering::Relaxed);
+        println!(
+            "{case:?}, seed {SEED:#x}: {executions} sampled executions; F written {}, dropped {}; \
+             G written {}, dropped {}; a hold made {}, refused {}",
+            count(&outcomes.f_written),
+            count(&outcomes.f_dropped),
+            count(&outcomes.g_written),
+            count(&outcomes.g_dropped),
+            count(&outcomes.hold_made),
+            count(&outcomes.hold_refused),
+        );
+        assert_eq!(executions, SAMPLES);
+        assert_eq!(count(&passed), executions, "every execution passed");
+        if case.order == Order::Free {
+            for (what, written, dropped) in [
+                ("G", &outcomes.g_written, &outcomes.g_dropped),
+                (
+                    "the hold request",
+                    &outcomes.hold_made,
+                    &outcomes.hold_refused,
+                ),
+            ] {
+                assert!(
+                    count(written) > 0 && count(dropped) > 0,
+                    "{what} came out only one way"
+                );
+            }
+        }
+    }
+
+    /// One execution of `case`.
+    fn execution(case: Case, runtime: &tokio::runtime::Handle, outcomes: &Outcomes) {
+        let (id, other) = (id(), other());
+        let inner = Arc::new(Inner {
+            peer_node_id: "peer".into(),
+            config: SharedConnectionConfig::default(),
+            state: StateLock::new(State::default()),
+            prober: RttProber::new(),
+            probe_counter: ProbeCounter::new(),
+            connection_factory: Arc::new(NoConnections),
+            runtime_handle: runtime.clone(),
+            task_handles: TaskHandles::default(),
+            init_lock: TokioMutex::new(()),
+            health_tx: tokio::sync::broadcast::channel(1).0,
+            steps: Default::default(),
+        });
+        let (writer, mut written) = tokio_mpsc::channel(8);
+        let (events, _events) = tokio_mpsc::channel(8);
+        {
+            let mut state = inner.state();
+            let alpha = inner.config.rtt_ema_alpha;
+            state.connections.insert(
+                CONN,
+                PooledConnection {
+                    metrics: Arc::new(ConnectionMetrics::new(CONN, alpha)),
+                    writer,
+                    pinned: 2,
+                    peer_closed: false,
+                },
+            );
+            state.next_conn_id = CONN + 1;
+            state.registered.insert(id, registration(T, events.clone()));
+            state
+                .registered
+                .insert(other, registration(OTHER_TOKEN, events));
+        }
+        let (payload_tx, payload_rx) = tokio_mpsc::channel(8);
+        let (_, control_rx) = tokio_mpsc::channel(1);
+        let s = DataframeSender {
+            dataflow_id: id,
+            token: T,
+            tx: payload_tx.clone(),
+            hold: inner.lane_hold(&id, T),
+        };
+        assert!(s.hold.is_some());
+        s.try_send(frame(b"F")).unwrap();
+        let p = DataframeSender {
+            dataflow_id: id,
+            token: T,
+            tx: payload_tx,
+            hold: None,
+        };
+
+        // Hold a thread back until another has acted (see `Order`).
+        let (cleaned_for_p, p_waits) = shuttle::sync::mpsc::channel::<()>();
+        let (cleaned_for_hold, hold_waits) = shuttle::sync::mpsc::channel::<()>();
+        let (cleaned_for_bridge, bridge_waits) = shuttle::sync::mpsc::channel::<()>();
+        let (failed_for_bridge, bridge_waits_failure) = shuttle::sync::mpsc::channel::<()>();
+
+        let mut threads = vec![
+            // The bridge task.
+            shuttle::thread::spawn({
+                let inner = Arc::clone(&inner);
+                move || {
+                    if case.order == Order::BridgeLast {
+                        bridge_waits.recv().unwrap();
+                        if case.fail {
+                            bridge_waits_failure.recv().unwrap();
+                        }
+                    }
+                    shuttle::future::block_on(bridge_task(inner, payload_rx, control_rx));
+                }
+            }),
+            // The cleanup.
+            shuttle::thread::spawn({
+                let inner = Arc::clone(&inner);
+                move || {
+                    let token = (case.cleanup == Cleanup::Teardown).then_some(T);
+                    inner.unregister(&id, token);
+                    if case.cleanup == Cleanup::Public {
+                        assert!(
+                            !inner.state().registered.contains_key(&id),
+                            "the public call left the registration"
+                        );
+                    }
+                    for gate in [cleaned_for_p, cleaned_for_hold, cleaned_for_bridge] {
+                        let _ = gate.send(());
+                    }
+                }
+            }),
+            // The owner.
+            shuttle::thread::spawn(move || drop(s)),
+            // `P`.
+            shuttle::thread::spawn(move || {
+                if case.order == Order::AfterCleanup {
+                    p_waits.recv().unwrap();
+                }
+                p.try_send(frame(b"G")).unwrap();
+            }),
+        ];
+        if case.fail {
+            threads.push(shuttle::thread::spawn({
+                let inner = Arc::clone(&inner);
+                move || {
+                    inner.fail_outbound(CONN, TransportError::ConnectionClosed);
+                    let _ = failed_for_bridge.send(());
+                }
+            }));
+        }
+        // The request for a hold: whether it got one.
+        let hold_request = shuttle::thread::spawn({
+            let inner = Arc::clone(&inner);
+            move || {
+                if case.order == Order::AfterCleanup {
+                    hold_waits.recv().unwrap();
+                }
+                let Some(hold) = inner.lane_hold(&id, T) else {
+                    return false;
+                };
+                assert!(
+                    case.order != Order::AfterCleanup,
+                    "a hold was made after the cleanup"
+                );
+                if case.cleanup == Cleanup::Teardown {
+                    let kept = inner
+                        .state()
+                        .registered
+                        .get(&id)
+                        .is_some_and(|reg| reg.token == T);
+                    assert!(kept, "a held registration was removed");
+                }
+                drop(hold);
+                true
+            }
+        });
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let hold_made = hold_request.join().unwrap();
+
+        // The steps in the order the state lock took them: nothing that
+        // must precede the cleanup or the failure followed it.
+        let steps = std::mem::take(&mut *inner.steps.lock().unwrap());
+        let cleaned_at = steps
+            .iter()
+            .position(|step| matches!(step, Step::Unregistered { .. }))
+            .expect("the cleanup ran");
+        let failed_at = steps
+            .iter()
+            .position(|step| matches!(step, Step::OutboundFailed { .. }));
+        let mut numbered = 0;
+        for (at, step) in steps.into_iter().enumerate() {
+            match step {
+                Step::Numbered {
+                    dataflow_id,
+                    held,
+                    seq,
+                } => {
+                    assert_eq!((dataflow_id, seq), (id, numbered), "numbered out of order");
+                    numbered += 1;
+                    assert!(
+                        at < cleaned_at || held,
+                        "an unheld frame was numbered after the cleanup"
+                    );
+                    assert!(
+                        at < cleaned_at || case.cleanup == Cleanup::Teardown,
+                        "a frame was numbered after the public unregistration"
+                    );
+                    assert!(
+                        failed_at.is_none_or(|failed_at| at < failed_at),
+                        "a frame was numbered after its connection failed"
+                    );
+                }
+                Step::HoldMade { dataflow_id } => {
+                    assert_eq!(dataflow_id, id);
+                    assert!(at < cleaned_at, "a hold was made after the cleanup");
+                }
+                Step::Unregistered {
+                    dataflow_id,
+                    public,
+                } => assert_eq!((dataflow_id, public), (id, case.cleanup == Cleanup::Public)),
+                Step::OutboundFailed { conn } => assert_eq!(conn, CONN),
+            }
+        }
+
+        // Every frame written is `id`'s, numbered from 0 in queue order (`F`,
+        // then `G`): none went to another registration's lane.
+        let mut names = Vec::new();
+        while let Ok(frame) = written.try_recv() {
+            assert_eq!(frame.dataflow_id, id);
+            assert_eq!(
+                frame.payload[..SEQUENCE_PREFIX],
+                (names.len() as u64).to_le_bytes()
+            );
+            names.push(frame.payload[SEQUENCE_PREFIX..].to_vec());
+        }
+        assert!(
+            [b"F".to_vec(), b"G".to_vec()].starts_with(&names),
+            "written out of queue order: {names:?}"
+        );
+        let f_written = !names.is_empty();
+        assert_eq!(
+            numbered,
+            names.len() as u64,
+            "a numbered frame was not written"
+        );
+        let g_written = names.len() == 2;
+        match case {
+            // `F` holds the lane, so the registration is there, closing, if
+            // the bridge handles it after the cleanup; `G` holds nothing.
+            Case {
+                cleanup: Cleanup::Teardown,
+                fail: false,
+                order,
+            } => {
+                assert!(f_written, "a held frame was lost");
+                assert!(
+                    !g_written || order == Order::Free,
+                    "an unheld frame was written after the cleanup"
+                );
+            }
+            Case {
+                order: Order::BridgeLast,
+                ..
+            } => assert!(
+                names.is_empty(),
+                "a frame was written after the cleanup or the failure"
+            ),
+            Case {
+                cleanup: Cleanup::Public,
+                order: Order::AfterCleanup,
+                ..
+            } => assert!(!g_written, "a frame was written after the cleanup"),
+            _ => {}
+        }
+        let state = inner.state();
+        assert_eq!(
+            state.registered[&other].next_send_seq, 0,
+            "a frame was numbered into another registration's lane"
+        );
+        assert!(
+            !state.registered.contains_key(&id),
+            "the registration outlived its cleanup and its holds"
+        );
+        if case.fail {
+            assert!(
+                !state.connections.contains_key(&CONN),
+                "the failed connection is still pooled"
+            );
+        } else {
+            assert_eq!(
+                state.connections[&CONN].pinned, 1,
+                "the pin count is not back"
+            );
+        }
+        assert!(
+            inner.id_unavailable(&state, &id, OTHER_TOKEN + 1).is_some(),
+            "the id can be registered again"
+        );
+        drop(state);
+        for (happened, yes, no) in [
+            (f_written, &outcomes.f_written, &outcomes.f_dropped),
+            (g_written, &outcomes.g_written, &outcomes.g_dropped),
+            (hold_made, &outcomes.hold_made, &outcomes.hold_refused),
+        ] {
+            if happened { yes } else { no }.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn registration(token: u64, events: tokio_mpsc::Sender<PeerIoNotice>) -> DataflowRegistration {
+        DataflowRegistration {
+            token,
+            conn: CONN,
+            next_send_seq: 0,
+            next_recv_seq: 0,
+            inbound_conn: None,
+            channel_senders: Some(HashMap::new()),
+            events,
+            hold_channels: Arc::default(),
+            outbound_failed: false,
+            inbound_failed: false,
+            lane: std::sync::Weak::new(),
+            closing: false,
+        }
+    }
+
+    fn frame(payload: &[u8]) -> Frame {
+        Frame {
+            dataflow_id: id(),
+            channel_id: 1,
+            payload: payload.to_vec(),
+        }
+    }
+
+    /// Never connects: the cases' connection is in the pool from the start.
+    struct NoConnections;
+
+    impl ConnectionFactory for NoConnections {
+        type Reader = tokio::io::Empty;
+        type Writer = tokio::io::Sink;
+
+        async fn establish(
+            &self,
+            _peer_node_id: &str,
+        ) -> Result<(Self::Reader, Self::Writer), Box<dyn std::error::Error + Send + Sync>>
+        {
+            Err("no connections".into())
+        }
+    }
+}
+
+// Native tests: under `--cfg instancy_shuttle` the manager's state lock is
+// Shuttle's model, which works only inside a model run.
+#[cfg(all(test, not(all(target_os = "linux", instancy_shuttle))))]
 mod tests {
     use super::*;
     use tokio::io::{DuplexStream, duplex};
