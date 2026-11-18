@@ -152,30 +152,108 @@ enum Outbound {
         dataflow_id: DataflowId,
         token: u64,
         frame: Frame,
-        hold: Option<Arc<LaneHold>>,
+        hold: Option<LaneHold>,
     },
     /// A flush barrier (see [`SharedPeerManager::flush`]): everything queued
     /// before it has been processed. Never sent.
     Barrier(tokio::sync::oneshot::Sender<()>),
 }
 
-/// Keeps a registration's lane: held by each of its [`SharedTransportSession`]'s
-/// senders and by each frame they queued for the bridge. Once the last one
-/// is gone, nothing more can be sent under the registration that must not
-/// be lost, and one that was unregistered is removed (see
-/// [`DataflowRegistration::closing`]).
-struct LaneHold {
+/// A hold on a registration's lane: kept by each of its
+/// [`SharedTransportSession`]'s payload senders and by each frame they
+/// queued for the bridge. Once the last one is gone, nothing more can be
+/// sent under the registration that must not be lost, and one that was
+/// unregistered is removed (see [`DataflowRegistration::closing`]).
+///
+/// Releasing the last hold takes the manager's state lock, so no hold may be
+/// dropped under a state lock (any manager's). Debug builds check every
+/// drop, the last or not (see [`StateGuard`]).
+#[derive(Clone)]
+struct LaneHold(Arc<Lane>);
+
+impl LaneHold {
+    /// Whether this holds `lane`, a registration's.
+    fn holds(&self, lane: &std::sync::Weak<Lane>) -> bool {
+        std::ptr::eq(Arc::as_ptr(&self.0), lane.as_ptr())
+    }
+}
+
+impl Drop for LaneHold {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        if !std::thread::panicking() {
+            assert_eq!(
+                state_locks_held(),
+                0,
+                "a lane hold was dropped under a manager's state lock, which releasing \
+                 the last one takes"
+            );
+        }
+    }
+}
+
+/// A registration's lane, while anything holds it (see [`LaneHold`]).
+struct Lane {
     inner: std::sync::Weak<Inner>,
     dataflow_id: DataflowId,
     token: u64,
 }
 
-impl Drop for LaneHold {
+impl Drop for Lane {
     fn drop(&mut self) {
-        // Never dropped under the state lock (see `Inner::lane_hold`).
+        // The last hold is gone, outside any state lock (see `LaneHold`).
         if let Some(inner) = self.inner.upgrade() {
             inner.lane_released(&self.dataflow_id, self.token);
         }
+    }
+}
+
+// The state locks (any manager's) this thread holds, counted in debug builds
+// so that a lane hold dropped under one is caught (see `LaneHold`).
+#[cfg(debug_assertions)]
+std::thread_local! {
+    static STATE_LOCKS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many manager state locks this thread holds (none once its thread
+/// locals are gone).
+#[cfg(debug_assertions)]
+fn state_locks_held() -> usize {
+    STATE_LOCKS_HELD.try_with(std::cell::Cell::get).unwrap_or(0)
+}
+
+/// A held manager state lock (see [`Inner::state`]). Debug builds count the
+/// state locks each thread holds, so that a [`LaneHold`] dropped under one is
+/// caught.
+struct StateGuard<'a>(std::sync::MutexGuard<'a, State>);
+
+impl<'a> StateGuard<'a> {
+    fn new(guard: std::sync::MutexGuard<'a, State>) -> Self {
+        #[cfg(debug_assertions)]
+        let _ = STATE_LOCKS_HELD.try_with(|held| held.set(held.get() + 1));
+        Self(guard)
+    }
+}
+
+impl Drop for StateGuard<'_> {
+    fn drop(&mut self) {
+        // Runs before the lock is released.
+        #[cfg(debug_assertions)]
+        let _ = STATE_LOCKS_HELD.try_with(|held| held.set(held.get().saturating_sub(1)));
+    }
+}
+
+impl std::ops::Deref for StateGuard<'_> {
+    type Target = State;
+
+    fn deref(&self) -> &State {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for StateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        &mut self.0
     }
 }
 
@@ -488,8 +566,8 @@ struct DataflowRegistration {
     outbound_failed: bool,
     /// Frames from the peer can no longer arrive (reported once).
     inbound_failed: bool,
-    /// The registration's [`LaneHold`], while anything holds it.
-    lane: std::sync::Weak<LaneHold>,
+    /// The registration's lane, while a [`LaneHold`] holds it.
+    lane: std::sync::Weak<Lane>,
     /// Unregistered, but its lane is still held: the frames that hold its
     /// lane, queued or still sent, are numbered and written (another
     /// sender's are dropped), while frames from the peer are no longer
@@ -759,11 +837,13 @@ struct Inner {
 }
 
 impl Inner {
-    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+    fn state(&self) -> StateGuard<'_> {
         // Critical sections never panic; recover the data if one ever did.
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        StateGuard::new(
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     fn live_connections(&self) -> usize {
@@ -818,7 +898,7 @@ impl Inner {
         self: &Arc<Self>,
         dataflow_id: DataflowId,
         token: u64,
-        hold: Option<&Arc<LaneHold>>,
+        hold: Option<&LaneHold>,
         mut frame: Frame,
     ) {
         // The receiver handles the control and probe channels outside the
@@ -857,9 +937,7 @@ impl Inner {
             // Unregistered, it takes only the frames that hold its lane (its
             // session's): another sender's are dropped, as once it is
             // removed.
-            if reg.closing
-                && !hold.is_some_and(|hold| std::ptr::eq(Arc::as_ptr(hold), reg.lane.as_ptr()))
-            {
+            if reg.closing && !hold.is_some_and(|hold| hold.holds(&reg.lane)) {
                 return;
             }
             if let Some(error) = rejected {
@@ -1310,24 +1388,25 @@ impl Inner {
     /// A hold on the lane of `token`'s registration of `dataflow_id`, if it
     /// is registered and not closing.
     ///
-    /// A hold is never dropped under the state lock, which its drop takes:
-    /// the holds made here leave the lock with the caller, and the bridge
-    /// releases a frame's hold after handling the frame.
-    fn lane_hold(self: &Arc<Self>, dataflow_id: &DataflowId, token: u64) -> Option<Arc<LaneHold>> {
+    /// A hold is never dropped under a state lock, which releasing the last
+    /// one takes (see [`LaneHold`]): the holds made here leave the lock with
+    /// the caller, and the bridge releases a frame's hold after handling the
+    /// frame.
+    fn lane_hold(self: &Arc<Self>, dataflow_id: &DataflowId, token: u64) -> Option<LaneHold> {
         let mut state = self.state();
         let reg = state
             .registered
             .get_mut(dataflow_id)
             .filter(|reg| reg.token == token && !reg.closing)?;
-        Some(reg.lane.upgrade().unwrap_or_else(|| {
-            let hold = Arc::new(LaneHold {
+        Some(LaneHold(reg.lane.upgrade().unwrap_or_else(|| {
+            let lane = Arc::new(Lane {
                 inner: Arc::downgrade(self),
                 dataflow_id: *dataflow_id,
                 token,
             });
-            reg.lane = Arc::downgrade(&hold);
-            hold
-        }))
+            reg.lane = Arc::downgrade(&lane);
+            lane
+        })))
     }
 
     /// The last hold on the lane of `token`'s registration of `dataflow_id`
@@ -2312,7 +2391,7 @@ pub struct DataframeSender {
     dataflow_id: DataflowId,
     token: u64,
     tx: tokio_mpsc::Sender<Outbound>,
-    hold: Option<Arc<LaneHold>>,
+    hold: Option<LaneHold>,
 }
 
 impl DataframeSender {
@@ -2848,6 +2927,27 @@ mod tests {
                 .is_err(),
             "nothing is sent for a removed registration"
         );
+    }
+
+    /// Releasing a registration's last lane hold takes its manager's state
+    /// lock, so a hold dropped under a state lock would deadlock if it were
+    /// the last. Debug builds catch every hold dropped under one, the last
+    /// or not, so the check doesn't depend on which drop comes last.
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[should_panic(expected = "a lane hold was dropped under a manager's state lock")]
+    async fn a_lane_hold_dropped_under_a_state_lock_is_caught() {
+        const TOKEN: u64 = 7;
+        let (manager, _peer) = manager_with_raw_peer();
+        let df = DataflowId::new();
+        let _registered = manager
+            .register(df, TOKEN, &[1], 4, Arc::default())
+            .await
+            .unwrap();
+        let kept = manager.inner.lane_hold(&df, TOKEN).unwrap();
+        let another = kept.clone();
+        let _state = manager.inner.state();
+        drop(another);
     }
 
     /// A control frame for a registration that is unregistering, as an
