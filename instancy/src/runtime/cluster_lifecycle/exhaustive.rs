@@ -90,9 +90,11 @@
 //!   that lets teardown hear the transport's notices would tell the two
 //!   apart, and would also have to stop [`World::forget`] dropping them.
 //!   Frames the transport drops at teardown without a failure (the outbox
-//!   forwarders are aborted, and in Shared mode a lane's queued frames are
-//!   dropped once it unregisters) are judged as frames still on their way
-//!   when the last worker succeeds, which they may be. Beyond our frames, a
+//!   forwarders are aborted, and in Shared mode a per-job manager released
+//!   after teardown's bounded flush drops what is still queued on it) are
+//!   judged as frames still on their way when the last worker succeeds,
+//!   which they may be; with the managers kept, a Shared lane's frames are
+//!   still written after it unregisters. Beyond our frames, a
 //!   run is judged as one in which the peer does nothing more but go away:
 //!   a goodbye, an ack or a `Cancel` after our teardown could only excuse an
 //!   `Ok`. What the peer did by then is all it did, and what reached whom
@@ -290,7 +292,9 @@
 //! it needs a control queue that stays full for the whole bound (a stalled
 //! connection), and the driver then counts a `Cancel` that was never queued
 //! as sent, which also keeps `AnnounceUnfinished` from sending. A `Cancel`
-//! the peer sends after unregistering the dataflow in split Shared mode:
+//! the peer sends after unregistering the dataflow in split Shared mode,
+//! once its registration is gone or its lane has failed (until then the
+//! registration is closing, and the `Cancel` takes the lane's connection):
 //! `send_control` then takes any pooled connection, where it can arrive apart
 //! from the peer's other frames, or be dropped after their connection has
 //! ended; here the peer's `Cancel` always travels with its lane. In split

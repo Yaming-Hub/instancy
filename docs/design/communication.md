@@ -320,7 +320,7 @@ A connection that silently stops delivering without ever failing makes its dataf
 
 #### Per-dataflow state at scale
 
-A manager may carry thousands of dataflows. Its per-dataflow state is a registration (pinned connection, two sequence counters, channel senders), removed when the dataflow unregisters. Control frames that arrive before their dataflow registers (the peer was faster) wait in a buffer bounded in dataflows (262,144), payload bytes (64 MiB), frames per dataflow and time (and are dropped if their connection fails; the handshake they start then times out). Past the bounds, the frames of the dataflows waiting longest are dropped and their handshakes fail, so the count bound is set well above the number of spawns that can wait for a slow node at once. Connection failures cost a scan of the registrations; nothing is per-frame per-dataflow beyond the sequence check.
+A manager may carry thousands of dataflows. Its per-dataflow state is a registration (pinned connection, two sequence counters, channel senders), removed when the dataflow unregisters (at teardown, once the frames its session's payload senders queued were handled; see below). Control frames that arrive before their dataflow registers (the peer was faster) wait in a buffer bounded in dataflows (262,144), payload bytes (64 MiB), frames per dataflow and time (and are dropped if their connection fails; the handshake they start then times out). Past the bounds, the frames of the dataflows waiting longest are dropped and their handshakes fail, so the count bound is set well above the number of spawns that can wait for a slow node at once. Connection failures cost a scan of the registrations; nothing is per-frame per-dataflow beyond the sequence check.
 
 #### One run per `DataflowId`
 
@@ -328,7 +328,7 @@ A `DataflowId` identifies one run of a dataflow, as an execution-attempt id does
 
 - each manager remembers the ids of the dataflows that unregistered (the most recent 16,384), and refuses to register one again, or one that is registered already (`TransportError::InvalidRegistration`). A spawn claims its id with every peer manager before anything else can fail; a spawn refused because another run holds the id (registered, claimed by another spawn, or already ran) drops only its own claims and sends nothing under the id, since a `Cancel` would reach the run that owns it. A peer that did register the id freshly fails at its handshake timeout. A spawn that held its claims and then fails tells its peers, and retires the id;
 - the late frames of a remembered id are dropped instead of being buffered for a registration;
-- the payload frames a dataflow queued before it unregistered carry its registration token, and the bridge drops them, so they are never numbered into another registration's lane; and a cleanup removes only its own registration.
+- the payload frames of a registration carry its registration token. When the runtime's teardown unregisters a dataflow, the id is retired and the peer's frames are no longer delivered, but the registration is removed only once the payload senders that hold its lane (those of its `SharedTransportSession`, the runtime's) are gone and the bridge has handled the frames they queued: what they queued, or still send, goes out in its own lane (a peer may be waiting for its goodbye or acknowledgements). `SharedPeerManager::unregister_dataflow` instead removes a registration at once, and the bridge drops its queued frames. Either way a frame is never numbered into another registration's lane; and a cleanup removes only its own registration.
 
 An id reused after it has left the window (16,384 later dataflows on that peer manager) is not detected: that is a contract violation. Dedicated mode opens fresh connections per run, so nothing crosses between runs there. Linking the runs that are retries of one logical computation (a stable logical id and an attempt number) is planned as a separate feature.
 
@@ -406,14 +406,20 @@ the event that ended the read side was handed on. `NetworkPush` rejects an
 envelope whose encoding exceeds the transport's frame limit
 (`ClusterTransport::max_payload_len`; shared frames carry an 8-byte sequence
 prefix) with `CommunicationError::FrameTooLarge`, and the data decoder accepts
-any record count the encoder can produce. With shared connections, a
-dataflow that must not lose what it has queued (its end-of-stream markers and
-acknowledgements, or final progress for a peer that is still draining) calls
-`SharedPeerManager::flush` before
-unregistering: it puts a local-only barrier (an entry of the manager's own
-queue, never a frame) on the payload queue and returns once
-the bridge task reaches it, that is, once every earlier frame has been
-sequenced and handed to a connection writer. See
+any record count the encoder can produce. With shared connections, the
+runtime's teardown never drops a dataflow's payload frames by unregistering
+it: the registration stays until its session's payload senders, which hold
+its lane, are gone and the bridge has handled the frames they queued, so its
+end-of-stream markers and acknowledgements, or final progress for a peer
+that is still draining, go out even if teardown stopped waiting for them, as
+long as the managers are kept. Teardown first
+calls `SharedPeerManager::flush` (bounded) before unregistering, so that they
+are on their connections before per-job managers are released: it puts a
+local-only barrier (an entry of the manager's own queue, never a frame) on
+the payload queue and returns once the bridge task reaches it, that is, once
+every earlier frame has been sequenced and handed to a connection writer. A
+per-job manager released after that bound expired still drops what is queued
+on it, but it closes its connections, which its peers see. See
 [cluster.md §5.5.3](./cluster.md#553-cluster-shutdown-protocol-clean-teardown).
 
 ### 6.5 Dataflow Isolation
