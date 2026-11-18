@@ -152,8 +152,15 @@ enum Outbound {
 const WRITER_DRAIN_GRACE: Duration = Duration::from_secs(10);
 
 /// Most dataflows whose control frames are buffered before they register
-/// here (see [`PendingControl`]).
-const MAX_PENDING_DATAFLOWS: usize = 16_384;
+/// here (see [`PendingControl`]). A peer sends its handshake as soon as it
+/// has registered a dataflow, so when this node registers late (a burst of
+/// spawns while it is busy), this many handshakes can wait for it.
+const MAX_PENDING_DATAFLOWS: usize = 262_144;
+
+/// Most payload bytes of control frames buffered for dataflows that have not
+/// registered here (a handshake's is 37 bytes plus the node id); the
+/// buffer's bookkeeping is not counted.
+const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 
 /// Most control frames buffered for one dataflow that has not registered.
 const MAX_PENDING_FRAMES_PER_DATAFLOW: usize = 64;
@@ -457,62 +464,110 @@ struct PendingFrames {
     since: tokio::time::Instant,
 }
 
+impl PendingFrames {
+    fn bytes(&self) -> usize {
+        self.frames.iter().map(|(_, payload)| payload.len()).sum()
+    }
+}
+
 /// Control frames that arrive before their dataflow registers here.
 ///
 /// The peer may register a dataflow and send its handshake before this node
 /// has registered it; the frames wait here until it does. Bounded in the
-/// number of dataflows, in frames per dataflow and in time, so frames for a
-/// dataflow that never registers do not accumulate: such a dataflow's
-/// handshake times out.
+/// number of dataflows, in bytes, in frames per dataflow and in time, so
+/// frames for a dataflow that never registers do not accumulate: such a
+/// dataflow's handshake times out. Past the bounds, the frames of the
+/// dataflows that have waited longest are dropped, and their handshakes
+/// fail.
 #[derive(Default)]
 struct PendingControl {
     by_dataflow: HashMap<DataflowId, PendingFrames>,
     /// Insertion order, for expiry and eviction (may hold stale ids).
     order: VecDeque<DataflowId>,
+    /// Payload bytes buffered.
+    bytes: usize,
 }
 
 impl PendingControl {
     /// Buffer `payload`.
     fn push(&mut self, dataflow_id: DataflowId, conn: usize, payload: Vec<u8>) {
         self.expire();
-        if let Some(pending) = self.by_dataflow.get_mut(&dataflow_id) {
-            if pending.frames.len() < MAX_PENDING_FRAMES_PER_DATAFLOW {
-                pending.frames.push((conn, payload));
-            } else {
-                #[cfg(feature = "tracing")]
-                tracing::warn!(%dataflow_id, "too many control frames for an unregistered dataflow; dropping one");
-            }
+        if payload.len() > MAX_PENDING_BYTES
+            || self
+                .by_dataflow
+                .get(&dataflow_id)
+                .is_some_and(|pending| pending.frames.len() >= MAX_PENDING_FRAMES_PER_DATAFLOW)
+        {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                %dataflow_id,
+                size = payload.len(),
+                "a control frame for an unregistered dataflow is over its bounds; dropping it"
+            );
             return;
         }
-        while self.by_dataflow.len() >= MAX_PENDING_DATAFLOWS {
+        let mut evicted = 0usize;
+        while (self.by_dataflow.len() >= MAX_PENDING_DATAFLOWS
+            && !self.by_dataflow.contains_key(&dataflow_id))
+            || self.bytes + payload.len() > MAX_PENDING_BYTES
+        {
             let Some(oldest) = self.order.pop_front() else {
                 break;
             };
-            self.by_dataflow.remove(&oldest);
+            if let Some(dropped) = self.by_dataflow.remove(&oldest) {
+                self.bytes -= dropped.bytes();
+                evicted += 1;
+            }
         }
-        self.by_dataflow.insert(
-            dataflow_id,
-            PendingFrames {
-                frames: vec![(conn, payload)],
-                since: tokio::time::Instant::now(),
-            },
-        );
-        self.order.push_back(dataflow_id);
-        if self.order.len() > 2 * MAX_PENDING_DATAFLOWS {
+        #[cfg(feature = "tracing")]
+        if evicted > 0 {
+            tracing::warn!(
+                evicted,
+                "too many dataflows wait to register here; dropping the control frames of \
+                 those waiting longest"
+            );
+        }
+        #[cfg(not(feature = "tracing"))]
+        let _ = evicted;
+        self.bytes += payload.len();
+        match self.by_dataflow.entry(dataflow_id) {
+            std::collections::hash_map::Entry::Occupied(pending) => {
+                pending.into_mut().frames.push((conn, payload));
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(PendingFrames {
+                    frames: vec![(conn, payload)],
+                    since: tokio::time::Instant::now(),
+                });
+                self.order.push_back(dataflow_id);
+            }
+        }
+        // Registered dataflows leave stale ids behind a live one at the
+        // front: keep them fewer than the live ones.
+        if self.order.len() > 2 * self.by_dataflow.len() + 64 {
             let live = &self.by_dataflow;
             self.order.retain(|id| live.contains_key(id));
         }
     }
 
     fn take(&mut self, dataflow_id: &DataflowId) -> Option<PendingFrames> {
-        self.by_dataflow.remove(dataflow_id)
+        let pending = self.by_dataflow.remove(dataflow_id)?;
+        self.bytes -= pending.bytes();
+        Some(pending)
     }
 
     /// Forget the frames that arrived on `conn` (it failed: what followed
     /// them on it is lost, so the handshake they start cannot complete).
     fn forget_connection(&mut self, conn: usize) {
+        let bytes = &mut self.bytes;
         self.by_dataflow.retain(|_, pending| {
-            pending.frames.retain(|(from, _)| *from != conn);
+            pending.frames.retain(|(from, payload)| {
+                let keep = *from != conn;
+                if !keep {
+                    *bytes -= payload.len();
+                }
+                keep
+            });
             !pending.frames.is_empty()
         });
     }
@@ -525,7 +580,9 @@ impl PendingControl {
                 }
                 Some(pending) if pending.since.elapsed() >= PENDING_CONTROL_TTL => {
                     let id = *front;
-                    self.by_dataflow.remove(&id);
+                    if let Some(expired) = self.by_dataflow.remove(&id) {
+                        self.bytes -= expired.bytes();
+                    }
                     self.order.pop_front();
                 }
                 Some(_) => break,
@@ -3372,14 +3429,40 @@ mod tests {
                 "the oldest is evicted"
             );
             assert!(pending.order.len() <= 2 * MAX_PENDING_DATAFLOWS);
+            assert_eq!(pending.bytes, MAX_PENDING_DATAFLOWS);
             // Frames from a failed connection are forgotten.
             pending.forget_connection(1);
             assert_eq!(pending.len(), 0);
+            assert_eq!(pending.bytes, 0);
             // Frames for a dataflow that never registers expire.
             pending.push(first, 0, vec![3]);
             tokio::time::advance(PENDING_CONTROL_TTL).await;
             pending.push(DataflowId::new(), 0, vec![4]);
             assert_eq!(pending.len(), 1);
+            assert_eq!(pending.bytes, 1);
+
+            // The bytes buffered are bounded too.
+            let mut pending = PendingControl::default();
+            let quarter = MAX_PENDING_BYTES / 4;
+            let ids: Vec<_> = (0..4).map(|_| DataflowId::new()).collect();
+            for &id in &ids {
+                pending.push(id, 0, vec![0; quarter]);
+            }
+            assert_eq!(pending.len(), 4);
+            pending.push(DataflowId::new(), 0, vec![5]);
+            assert_eq!(pending.len(), 4);
+            assert!(
+                !pending.by_dataflow.contains_key(&ids[0]),
+                "the oldest is evicted"
+            );
+            assert_eq!(pending.bytes, 3 * quarter + 1);
+            pending.take(&ids[1]);
+            assert_eq!(pending.bytes, 2 * quarter + 1);
+            // A frame over the byte bound by itself is dropped, and nothing
+            // is evicted for it.
+            pending.push(DataflowId::new(), 0, vec![0; MAX_PENDING_BYTES + 1]);
+            assert_eq!(pending.len(), 3);
+            assert_eq!(pending.bytes, 2 * quarter + 1);
         });
     }
 

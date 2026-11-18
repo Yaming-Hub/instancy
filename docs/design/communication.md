@@ -320,7 +320,7 @@ A connection that silently stops delivering without ever failing makes its dataf
 
 #### Per-dataflow state at scale
 
-A manager may carry thousands of dataflows. Its per-dataflow state is a registration (pinned connection, two sequence counters, channel senders), removed when the dataflow unregisters. Control frames that arrive before their dataflow registers (the peer was faster) wait in a buffer bounded in dataflows, frames per dataflow and time (and are dropped if their connection fails; the handshake they start then times out). Connection failures cost a scan of the registrations; nothing is per-frame per-dataflow beyond the sequence check.
+A manager may carry thousands of dataflows. Its per-dataflow state is a registration (pinned connection, two sequence counters, channel senders), removed when the dataflow unregisters. Control frames that arrive before their dataflow registers (the peer was faster) wait in a buffer bounded in dataflows (262,144), payload bytes (64 MiB), frames per dataflow and time (and are dropped if their connection fails; the handshake they start then times out). Past the bounds, the frames of the dataflows waiting longest are dropped and their handshakes fail, so the count bound is set well above the number of spawns that can wait for a slow node at once. Connection failures cost a scan of the registrations; nothing is per-frame per-dataflow beyond the sequence check.
 
 #### One run per `DataflowId`
 

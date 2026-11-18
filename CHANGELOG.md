@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   queued on it (up to 64) and writes them with one flush. With 3 nodes in one
   process on one machine, the CPU a dataflow costs fell about 7-fold in
   Shared mode (10,000 dataflows) and 3-fold in Dedicated mode (1,000).
+- **Fixed: a node that registers late no longer loses handshakes once more
+  than 16,384 dataflows wait for it.** Control frames that arrive before their
+  dataflow registers here were buffered for at most 16,384 dataflows; past
+  that the oldest were dropped silently, and those spawns failed with
+  "expected Handshake, got Ready". The buffer now holds 262,144 dataflows and
+  64 MiB of frame payload (its bookkeeping comes on top), drops a frame that
+  alone exceeds the byte bound, and logs a warning when it evicts frames to
+  make room or rejects one (frames that wait past 120 s still expire without
+  one).
 
 
 ### Cluster lifecycle coordinator, checked as it runs
