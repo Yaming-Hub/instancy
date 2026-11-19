@@ -110,7 +110,9 @@
 //! counterexample, so a fix has to show that it only removes identities.
 //! The identity leaves out the coordinator's channel and the driver's state,
 //! so it is coarser than a state: a new counterexample whose identity matches
-//! one the file lists goes unnoticed.
+//! one the file lists goes unnoticed. It has an encoding of its own, so a
+//! change to the driver's or the machine's state changes no identity (see
+//! [`World::identity`] for what does).
 //!
 //! # Configurations
 //!
@@ -450,14 +452,18 @@ trait Code: Copy {
 /// The 64-bit words a state packs into.
 const WORDS: usize = 4;
 
-/// Bits written, or read, in order.
-struct Bits {
-    words: [u64; WORDS],
+/// The 64-bit words an identity packs into ([`World::identity`]): its own,
+/// so that a state packed into more words keeps its identity.
+const IDENTITY_WORDS: usize = 4;
+
+/// Bits written, or read, in order, in `N` words.
+struct Bits<const N: usize = WORDS> {
+    words: [u64; N],
     at: u32,
 }
 
-impl Bits {
-    fn new(words: [u64; WORDS]) -> Self {
+impl<const N: usize> Bits<N> {
+    fn new(words: [u64; N]) -> Self {
         Self { words, at: 0 }
     }
 
@@ -586,6 +592,53 @@ impl<T: Code, const N: usize> Fifo<T, N> {
     }
 }
 
+/// An identity's slots ([`World::identity`]), written in order into
+/// [`IDENTITY_WORDS`] words of their own. A slot's width is fixed, and its
+/// value must fit: a value that outgrows it (a wider code, a queue holding
+/// more items than its slot) needs a further slot, after the last.
+struct Slots(Bits<IDENTITY_WORDS>);
+
+impl Slots {
+    fn new() -> Self {
+        Self(Bits::new([0; IDENTITY_WORDS]))
+    }
+
+    fn put(&mut self, value: u64, width: u32) {
+        assert!(
+            value >> width == 0,
+            "{value} outgrows its identity slot of {width} bits: put the rest in a further \
+             slot, after the last"
+        );
+        self.0.put(value, width);
+    }
+
+    fn flag(&mut self, flag: bool) {
+        self.put(u64::from(flag), 1);
+    }
+
+    fn item<T: Code>(&mut self, item: Option<T>, width: u32) {
+        self.put(item.map_or(0, T::code), width);
+    }
+
+    /// A queue in a slot of `items` items of `width` bits, whatever its
+    /// bound.
+    fn queue<T: Code, const N: usize>(&mut self, queue: &Fifo<T, N>, items: usize, width: u32) {
+        assert!(
+            queue.len() <= items,
+            "{} items outgrow their identity slot of {items}: put the rest in a further slot, \
+             after the last",
+            queue.len()
+        );
+        for at in 0..items {
+            self.item(queue.items.get(at).copied().flatten(), width);
+        }
+    }
+
+    fn hash(&self) -> u64 {
+        mix(self.0.words)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The environment's vocabulary
 // ---------------------------------------------------------------------------
@@ -696,9 +749,13 @@ impl Code for Why {
 /// reasons seen so far. A loss is held as 1 + its index here (0 for none), a
 /// reason as a [`Why`]. The first reasons are the environment's, so their
 /// codes are fixed; the coordinator's own escalations follow as they appear.
+/// An identity holds a reason by a code of its own ([`Self::identity_code`]).
 struct Tables {
     losses: Vec<DataLoss>,
     reasons: Vec<CancellationReason>,
+    /// Each reason's code in an identity, distinct, in the order of
+    /// `reasons`.
+    identity_codes: Vec<u32>,
 }
 
 impl Tables {
@@ -713,17 +770,21 @@ impl Tables {
                 .to_string(),
             },
         };
-        let tables = Self {
+        let mut tables = Self {
             losses: Vec::new(),
-            reasons: vec![
-                CancellationReason::UserRequested,
-                CancellationReason::WorkerFailed {
-                    detail: "a local worker failed".into(),
-                },
-                peer(Kind::Stop),
-                peer(Kind::Fail),
-            ],
+            reasons: Vec::new(),
+            identity_codes: Vec::new(),
         };
+        for reason in [
+            CancellationReason::UserRequested,
+            CancellationReason::WorkerFailed {
+                detail: "a local worker failed".into(),
+            },
+            peer(Kind::Stop),
+            peer(Kind::Fail),
+        ] {
+            tables.intern(reason);
+        }
         for (why, failure) in [
             (Why::LOCAL_STOP, false),
             (Why::LOCAL_FAILURE, true),
@@ -758,7 +819,7 @@ impl Tables {
         let index = match self.reasons.iter().position(|known| known == reason) {
             Some(index) => index,
             None => {
-                self.reasons.push(reason.clone());
+                self.intern(reason.clone());
                 self.reasons.len() - 1
             }
         };
@@ -768,6 +829,28 @@ impl Tables {
             "more reasons than codes: raise Why::BITS"
         );
         why
+    }
+
+    /// Add `reason`, with its code in an identity: a hash of its text, so
+    /// that an identity does not depend on the order the search meets
+    /// reasons in, and distinct, so that it tells reasons apart as a [`Why`]
+    /// does.
+    fn intern(&mut self, reason: CancellationReason) {
+        let hash = mix([text_hash(&reason.to_string())]) >> 32;
+        let code = u32::try_from(hash).expect("32 bits").max(1);
+        assert!(
+            !self.identity_codes.contains(&code),
+            "two cancellation reasons share an identity code: {reason}"
+        );
+        self.reasons.push(reason);
+        self.identity_codes.push(code);
+    }
+
+    /// How an identity holds `why`: 0 for none.
+    fn identity_code(&self, why: Option<Why>) -> u64 {
+        why.map_or(0, |why| {
+            u64::from(self.identity_codes[usize::from(why.0 - 1)])
+        })
     }
 
     fn reason(&self, why: Why) -> CancellationReason {
@@ -1197,7 +1280,7 @@ struct World {
     polled: bool,
     /// The actions the driver takes once the `Cancel` broadcast it awaits is
     /// done.
-    pending: Fifo<Act, 3>,
+    pending: Fifo<Act, 4>,
     /// Teardown has begun: its bounded waits are not over. Whether it
     /// drains the inbound bridges (`drain_inbound`).
     tearing_down: bool,
@@ -1724,22 +1807,126 @@ impl World {
     /// The identity of a violation found in this state: the environment's
     /// side of it, without the coordinator's channel and the driver's state,
     /// and nothing of the machine, whose representation may change.
-    fn identity(&self) -> u64 {
-        let mut env = *self;
-        env.queue = Fifo::EMPTY;
-        env.cancel_seen = false;
-        env.timer = false;
-        env.polled = false;
-        env.pending = Fifo::EMPTY;
-        env.tearing_down = false;
-        env.drain_inbound = false;
-        env.finished = false;
-        env.failure_announced = false;
-        env.unfinished_announced = false;
-        env.worker_failure = false;
-        let mut bits = Bits::new([0; WORDS]);
-        env.pack(&mut bits);
-        mix(bits.words)
+    ///
+    /// Its encoding is its own, and frozen: the environment's fields in a
+    /// fixed order, each in a slot of fixed width ([`Slots`]). So a change to
+    /// the driver's state, to the machine or to how a search packs a state
+    /// ([`Key`]) changes no identity. The dataflow token's reasons go in by a
+    /// code of their text ([`Tables::identity_code`]), not by the order the
+    /// search met them, so a reason the coordinator gains or loses leaves the
+    /// others alone; a change to a reason's text changes the identities of
+    /// the states that hold it. A field the environment loses keeps its
+    /// slot, written as zero. A field it gains, or a value that outgrows its
+    /// slot, takes a further slot after the last, so a state that leaves it
+    /// empty keeps its identity. Any other change to the encoding changes
+    /// every identity, and is a change to the model ([`MODEL_VERSION`]).
+    fn identity(&self, tables: &Tables) -> u64 {
+        let Self {
+            // The coordinator's channel, and what the coordinator and the
+            // driver remember.
+            queue: _,
+            cancel_seen: _,
+            timer: _,
+            polled: _,
+            pending: _,
+            tearing_down: _,
+            drain_inbound: _,
+            finished: _,
+            failure_announced: _,
+            unfinished_announced: _,
+            worker_failure: _,
+            token,
+            escalation,
+            aborted,
+            workers_left,
+            workers_failed,
+            outbound,
+            locked,
+            writer_dead,
+            refusing,
+            unsure,
+            write_fails,
+            forwarder,
+            lane_reader_up,
+            wire,
+            peer_locked,
+            reader_up,
+            read_fails,
+            read_failed,
+            io,
+            channels_closed,
+            ctrl,
+            dispatching,
+            ctrl_close_reported,
+            prog: [prog_0, prog_1],
+            end_of_stream: [end_of_stream_0, end_of_stream_1],
+            prog_close_reported: [prog_close_reported_0, prog_close_reported_1],
+            to_peer,
+            from_peer,
+            fault,
+            records_delivered,
+            goodbye_delivered,
+            peer_goodbye,
+            peer_ack,
+            peer_cancel,
+            peer_announced,
+            peer_fin,
+            peer_gone,
+            late,
+            inbound_lost,
+            corrupt_in,
+            corrupt_unheard,
+            failed_at_finish,
+            lost_at_finish,
+        } = self;
+        let mut slots = Slots::new();
+        slots.put(tables.identity_code(*token), 32);
+        slots.put(tables.identity_code(*escalation), 32);
+        slots.flag(*aborted);
+        slots.put(u64::from(*workers_left), 2);
+        slots.flag(*workers_failed);
+        slots.queue(outbound, 7, 3);
+        slots.put(u64::from(*locked), 2);
+        slots.flag(*writer_dead);
+        slots.flag(*refusing);
+        slots.flag(*unsure);
+        slots.flag(*write_fails);
+        slots.put(forwarder.code(), 2);
+        slots.flag(*lane_reader_up);
+        slots.queue(wire, 5, 3);
+        slots.flag(*peer_locked);
+        slots.flag(*reader_up);
+        slots.flag(*read_fails);
+        slots.flag(*read_failed);
+        slots.queue(io, 4, 3);
+        slots.flag(*channels_closed);
+        slots.queue(ctrl, 2, 2);
+        slots.flag(*dispatching);
+        slots.flag(*ctrl_close_reported);
+        slots.queue(prog_0, 3, 3);
+        slots.queue(prog_1, 3, 3);
+        slots.flag(*end_of_stream_0);
+        slots.flag(*end_of_stream_1);
+        slots.flag(*prog_close_reported_0);
+        slots.flag(*prog_close_reported_1);
+        slots.flag(*to_peer);
+        slots.flag(*from_peer);
+        slots.flag(*fault);
+        slots.flag(*records_delivered);
+        slots.flag(*goodbye_delivered);
+        slots.flag(*peer_goodbye);
+        slots.flag(*peer_ack);
+        slots.item(*peer_cancel, 2);
+        slots.flag(*peer_announced);
+        slots.flag(*peer_fin);
+        slots.flag(*peer_gone);
+        slots.item(*late, 2);
+        slots.flag(*inbound_lost);
+        slots.flag(*corrupt_in);
+        slots.flag(*corrupt_unheard);
+        slots.flag(*failed_at_finish);
+        slots.flag(*lost_at_finish);
+        slots.hash()
     }
 
     fn pack(&self, bits: &mut Bits) {
@@ -2348,8 +2535,9 @@ impl Key {
     }
 }
 
-/// A well-mixed 64-bit hash of a state's words.
-fn mix(words: [u64; WORDS]) -> u64 {
+/// A well-mixed 64-bit hash of a state's words, or of an identity's: changing
+/// it changes every identity.
+fn mix<const N: usize>(words: [u64; N]) -> u64 {
     let mut h = 0x9e37_79b9_7f4a_7c15_u64;
     for word in words {
         h = (h ^ word).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -4268,13 +4456,10 @@ fn text_hash(text: &str) -> u64 {
     })
 }
 
-/// What an identity is hashed from: the environment's side of a violating
-/// state, and the clause it broke.
-fn identity_words(env: u64, what: &str) -> [u64; WORDS] {
-    let mut words = [0; WORDS];
-    words[0] = env;
-    words[1] = text_hash(what);
-    words
+/// The identity of a violation of the clause `what` found in `w`: the
+/// environment's side of the state ([`World::identity`]) and the clause.
+fn violation_identity(w: &World, what: &str, tables: &Tables) -> u64 {
+    mix([w.identity(tables), text_hash(what)])
 }
 
 impl Search {
@@ -4301,7 +4486,7 @@ impl Search {
         at: u32,
         last: Option<Step>,
     ) {
-        let identity = mix(identity_words(w.identity(), what));
+        let identity = violation_identity(w, what, &self.tables);
         let violations = self.violations.entry(property).or_default();
         violations.count += 1;
         violations.identities.insert(identity);
@@ -5006,12 +5191,13 @@ const KNOWN_FAILURES: &[Known] = &[
 /// file the identities it no longer finds, and still fails on a new one: a
 /// new counterexample is a regression to fix. Only a change to the model may
 /// add identities, and it bumps [`MODEL_VERSION`]; CI rejects a pull request
-/// that adds one without that bump. A change to what the environment's side
-/// of a state holds changes every identity, and the files are then rewritten
-/// whole. They are read when a test runs, so they can be updated without a
-/// rebuild. They are never edited by hand, and every commit that changes one
-/// cites, in its message, the [`KNOWN_FAILURES`] entry or the fix that
-/// explains each change.
+/// that adds one without that bump. Such a change rewrites the files whole,
+/// but leaves the identity of every counterexample still found as it was,
+/// unless it changes how identities are encoded ([`World::identity`]). They
+/// are read when a test runs, so they can be updated without a rebuild. They
+/// are never edited by hand, and every commit that changes one cites, in its
+/// message, the [`KNOWN_FAILURES`] entry or the fix that explains each
+/// change.
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/runtime/cluster_lifecycle/exhaustive"
@@ -5027,7 +5213,7 @@ const GOLDEN_VAR: &str = "INSTANCY_EXHAUSTIVE_GOLDEN";
 /// what a counterexample is. CI's `golden-files` job accepts identities added
 /// to the golden files only in a pull request that changes this number. Bump
 /// it with a change to the model, never to record a regression.
-const MODEL_VERSION: u32 = 1;
+const MODEL_VERSION: u32 = 2;
 
 /// What a test does with its golden file, as [`GOLDEN_VAR`] says.
 #[derive(Clone, Copy, PartialEq, Eq)]

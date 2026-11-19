@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Lifecycle check: identities that outlast changes to the coordinator
+
+- **Tests:** in the cluster lifecycle check, a counterexample's identity now
+  has an encoding of its own: the environment's side of the state, field by
+  field, each in a slot of fixed width, with the dataflow token's
+  cancellation reasons by their text rather than by the order the search
+  first meets them. Changing the driver's or the machine's state, or how the
+  search packs a state, no longer changes any identity, so a fix to the
+  coordinator shows in the golden files as the counterexamples it removes.
+  `MODEL_VERSION` is now 2, and every golden file is rewritten: the same
+  violations, under new identities. The model's driver may now hold four
+  actions while it awaits a `Cancel` broadcast, up from three; no state holds
+  more than three yet.
+
 ### Lifecycle check: golden files only shrink
 
 - **Tests:** the golden files of the cluster lifecycle check only shrink.
