@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Lifecycle check: stable identities, and a failed read as a cause of loss
+
+- **Tests:** in the cluster lifecycle check, a counterexample's identity now
+  has an encoding of its own: the environment's side of the state, field by
+  field, each in a slot of fixed width, with the dataflow token's
+  cancellation reasons by their text rather than by the order the search
+  first meets them. Changing the driver's or the machine's state, or how the
+  search packs a state, no longer changes any identity, so a fix to the
+  coordinator shows in the golden files as the counterexamples it removes.
+  `MODEL_VERSION` is now 2, and every golden file is rewritten: the same
+  violations, under new identities. The model's driver may now hold four
+  actions while it awaits a `Cancel` broadcast, up from three; no state holds
+  more than three yet.
+- **Tests:** the check's NoLossWithoutCause property also takes a failed read
+  of the connection that carries our frames as a cause of a reported data
+  loss, as NoOkOverKnownLoss already takes it for that connection seen
+  failing. In Dedicated mode a reset fails the reader at once, and the writer
+  only at its next write, which may never come, so in some runs any result
+  broke one of the two properties. The property accepts more causes, and
+  held before, so no violation is added or removed.
+
 ### Lifecycle check: golden files only shrink
 
 - **Tests:** the golden files of the cluster lifecycle check only shrink.
