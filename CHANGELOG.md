@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Shared transport at scale
+
+- **Fixed: a Shared-mode dataflow whose teardown stopped waiting for its last
+  frames no longer leaves its peers waiting forever (an interim fix).**
+  Graceful teardown waits for a dataflow's goodbye and acknowledgements to
+  reach the connections for at most the spawn's handshake timeout, then
+  unregisters it; the manager's bridge then dropped its frames still queued
+  or still coming, and a peer waiting for them in its drain waited forever,
+  with no error (R58 in `docs/design/progress-accounting-decisions.md`). The
+  runtime's registration now stays, closing, until its session's payload
+  senders, which hold its lane, are gone and the bridge has handled the
+  frames they queued, so those frames still go out while the managers are
+  kept; a per-job manager released meanwhile still drops what is queued on
+  it, but closes its connections, which its peers see.
+  `SharedPeerManager::unregister_dataflow` still removes a registration at
+  once, and a sender from `SharedPeerManager::dataflow_sender` holds nothing:
+  what it sends after the dataflow was unregistered is dropped, as before.
+  Teardown's flush keeps its fixed deadline, and the shared bridge,
+  where one stalled connection holds up the frames of the others, stays: R57
+  and R58's flush without a deadline are not implemented.
+  `instancy-integration`'s
+  `finished_dataflow_survives_a_one_way_stall_longer_than_handshake`
+  reproduced the hang and is no longer ignored. Any delay of those frames past
+  the timeout could cause it: a stalled or slow connection, or heavy load.
+- **Faster: a frame is written with one `write_all` instead of one per part,
+  and a pooled connection writes its queued frames together.**
+  `FramedWriter` wrote each frame's header, header checksum, payload and frame
+  checksum with a `write_all` each: on a plain socket, at least one system
+  call for each part that is not empty. It now encodes a frame into one
+  buffer and hands it over with one `write_all` (a payload over 16 KiB is
+  written from the frame, in three), and `write_frames` hands a batch over
+  about 64 KiB at a time. A pooled connection's writer takes every frame
+  queued on it (up to 64) and writes them with one flush. With 3 nodes in one
+  process on one machine, the CPU a dataflow costs fell about 7-fold in
+  Shared mode (10,000 dataflows) and 3-fold in Dedicated mode (1,000).
+- **Fixed: a node that registers late no longer loses handshakes once more
+  than 16,384 dataflows wait for it.** Control frames that arrive before their
+  dataflow registers here were buffered for at most 16,384 dataflows; past
+  that the oldest were dropped silently, and those spawns failed with
+  "expected Handshake, got Ready". The buffer now holds 262,144 dataflows and
+  64 MiB of frame payload (its bookkeeping comes on top), drops a frame that
+  alone exceeds the byte bound, and logs a warning when it evicts frames to
+  make room or rejects one (frames that wait past 120 s still expire without
+  one).
+
+
 ### Cluster lifecycle coordinator, checked as it runs
 
 - **Internal:** the decisions the cluster lifecycle coordinator's driver
@@ -279,9 +325,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SharedPeerManager` now refuses to register an id it remembers as
   finished (the most recent 16,384), with
   `TransportError::InvalidRegistration`, and drops the late frames of such
-  an id. Payload frames queued before a dataflow unregistered are dropped,
-  never numbered into another registration's lane, and a cleanup removes
-  only its own registration (so a reused id's late cleanup cannot
+  an id. Payload frames still queued when a registration is removed are
+  dropped, never numbered into another registration's lane, and a cleanup
+  removes only its own registration (so a reused id's late cleanup cannot
   unregister the new run). The manager's per-dataflow bookkeeping is
   bounded: control frames of dataflows that never register expire, the set
   of finished dataflow ids is bounded, and the handles of finished

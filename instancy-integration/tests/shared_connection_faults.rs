@@ -113,9 +113,10 @@ async fn long_stall(from: StallFrom) {
 /// dataflow X from a to b has blocked a's bridge task, holding Y's goodbye
 /// and acknowledgement to b behind X's frames, for longer than the
 /// handshake timeout; Y's own connection stays healthy. After the heal, Y
-/// must still end `Ok` with exact output on b, and X on both nodes.
+/// must still end `Ok` with exact output on b, and X on both nodes: a's
+/// teardown stops waiting for Y's frames, but a keeps Y's registration
+/// until they have been handled, so they are not dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "reproduces R58 (connection-liveness design): fails until that fix lands"]
 async fn finished_dataflow_survives_a_one_way_stall_longer_than_handshake() {
     let mut coord = TestCoordinator::start_shared(&NODES[..2], WORKERS, CONNECTIONS).await;
     let steps = scenarios::finished_behind_a_one_way_stall(&mut coord)

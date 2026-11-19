@@ -90,9 +90,11 @@
 //!   that lets teardown hear the transport's notices would tell the two
 //!   apart, and would also have to stop [`World::forget`] dropping them.
 //!   Frames the transport drops at teardown without a failure (the outbox
-//!   forwarders are aborted, and in Shared mode a lane's queued frames are
-//!   dropped once it unregisters) are judged as frames still on their way
-//!   when the last worker succeeds, which they may be. Beyond our frames, a
+//!   forwarders are aborted, and in Shared mode a per-job manager released
+//!   after teardown's bounded flush drops what is still queued on it) are
+//!   judged as frames still on their way when the last worker succeeds,
+//!   which they may be; with the managers kept, a Shared lane's frames are
+//!   still written after it unregisters. Beyond our frames, a
 //!   run is judged as one in which the peer does nothing more but go away:
 //!   a goodbye, an ack or a `Cancel` after our teardown could only excuse an
 //!   `Ok`. What the peer did by then is all it did, and what reached whom
@@ -227,9 +229,13 @@
 //!     goodbye or ack. Writing a `Cancel` can fail like writing any other
 //!     frame.
 //!   - A failed write loses the frame it was writing, and everything behind
-//!     it. A write that fails although its frame went out whole is left out:
-//!     `write_frame` flushes after the frame's last byte, and a TCP stream's
-//!     flush does nothing (see "Not covered").
+//!     it. A Shared connection's writer writes the frames queued on it as a
+//!     batch with one flush (`write_frames`): on a stream that buffers until
+//!     it is flushed, a failure can also lose the batch's earlier frames,
+//!     the same as a failure at the first frame lost. A write that fails
+//!     although its frame went out whole is left out: `write_frame` and
+//!     `write_frames` flush after the last byte, and a TCP stream's flush
+//!     does nothing (see "Not covered").
 //!   - Shared: a write error or a failed read fails the lane at once and for
 //!     good. The manager then drops our frames (`send_payload`), so the outbox
 //!     forwarder never sees one refused. A write error is reported, then
@@ -286,7 +292,9 @@
 //! it needs a control queue that stays full for the whole bound (a stalled
 //! connection), and the driver then counts a `Cancel` that was never queued
 //! as sent, which also keeps `AnnounceUnfinished` from sending. A `Cancel`
-//! the peer sends after unregistering the dataflow in split Shared mode:
+//! the peer sends after unregistering the dataflow in split Shared mode,
+//! once its registration is gone or its lane has failed (until then the
+//! registration is closing, and the `Cancel` takes the lane's connection):
 //! `send_control` then takes any pooled connection, where it can arrive apart
 //! from the peer's other frames, or be dropped after their connection has
 //! ended; here the peer's `Cancel` always travels with its lane. In split

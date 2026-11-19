@@ -74,9 +74,21 @@
 //! run's id could take that run's late frames for its own, so a manager
 //! refuses to register an id it remembers as finished (the most recent
 //! 16,384) and drops the late frames of such an id; a retry needs a fresh
-//! id. Payload frames are queued with their registration, so those still
-//! queued when it ends are dropped, never numbered into another
-//! registration's lane.
+//! id.
+//!
+//! When the runtime's teardown unregisters a dataflow, the registration
+//! ends in two steps. Unregistering it retires its id and stops delivering
+//! the peer's frames for it, but keeps its lane open: the payload frames its
+//! session's payload senders queued, or still send, are numbered and written as
+//! before, since the peer may be waiting for them (a goodbye, an
+//! acknowledgement). Once the last of those senders is gone and the bridge
+//! has handled every frame they queued, it is removed. So a teardown that
+//! stops waiting for its frames does not lose them. Other senders' frames
+//! (those of a sender from [`SharedPeerManager::dataflow_sender`], which
+//! holds nothing) are dropped from the unregistration on.
+//! [`SharedPeerManager::unregister_dataflow`] instead removes a registration
+//! at once and drops its queued frames. Either way, a frame is never
+//! numbered into another registration's lane.
 //!
 //! # Transport contract
 //!
@@ -106,6 +118,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+// Schedule tests (`--cfg instancy_shuttle`, Linux) substitute Shuttle's
+// models for the manager's state lock and the per-thread count of state
+// locks held; see `closing_shuttle` below.
+#[cfg(all(test, target_os = "linux", instancy_shuttle))]
+use shuttle::sync::{Mutex as StateLock, MutexGuard as StateLockGuard};
+#[cfg(not(all(test, target_os = "linux", instancy_shuttle)))]
+use std::sync::{Mutex as StateLock, MutexGuard as StateLockGuard};
+
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -133,17 +153,123 @@ const SEQUENCE_PREFIX: usize = 8;
 /// An entry of a manager's payload queue, which the bridge task processes in
 /// order.
 enum Outbound {
-    /// A payload frame of the registration made with `token`. Dropped if
-    /// that registration has ended: its frames are never sequenced into
-    /// another registration's lane.
+    /// A payload frame of the registration made with `token`. Its `hold`,
+    /// if its sender held the lane, keeps that registration until the frame
+    /// has been processed.
     Payload {
         dataflow_id: DataflowId,
         token: u64,
         frame: Frame,
+        hold: Option<LaneHold>,
     },
     /// A flush barrier (see [`SharedPeerManager::flush`]): everything queued
     /// before it has been processed. Never sent.
     Barrier(tokio::sync::oneshot::Sender<()>),
+}
+
+/// A hold on a registration's lane: kept by each of its
+/// [`SharedTransportSession`]'s payload senders and by each frame they
+/// queued for the bridge. Once the last one is gone, nothing more can be
+/// sent under the registration that must not be lost, and one that was
+/// unregistered is removed (see [`DataflowRegistration::closing`]).
+///
+/// Releasing the last hold takes the manager's state lock, so no hold may be
+/// dropped under a state lock (any manager's). Debug builds check every
+/// drop, the last or not (see [`StateGuard`]).
+#[derive(Clone)]
+struct LaneHold(Arc<Lane>);
+
+impl LaneHold {
+    /// Whether this holds `lane`, a registration's.
+    fn holds(&self, lane: &std::sync::Weak<Lane>) -> bool {
+        std::ptr::eq(Arc::as_ptr(&self.0), lane.as_ptr())
+    }
+}
+
+impl Drop for LaneHold {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        if !std::thread::panicking() {
+            assert_eq!(
+                state_locks_held(),
+                0,
+                "a lane hold was dropped under a manager's state lock, which releasing \
+                 the last one takes"
+            );
+        }
+    }
+}
+
+/// A registration's lane, while anything holds it (see [`LaneHold`]).
+struct Lane {
+    inner: std::sync::Weak<Inner>,
+    dataflow_id: DataflowId,
+    token: u64,
+}
+
+impl Drop for Lane {
+    fn drop(&mut self) {
+        // The last hold is gone, outside any state lock (see `LaneHold`).
+        if let Some(inner) = self.inner.upgrade() {
+            inner.lane_released(&self.dataflow_id, self.token);
+        }
+    }
+}
+
+// The state locks (any manager's) this thread holds, counted in debug builds
+// so that a lane hold dropped under one is caught (see `LaneHold`).
+#[cfg(all(
+    debug_assertions,
+    not(all(test, target_os = "linux", instancy_shuttle))
+))]
+std::thread_local! {
+    static STATE_LOCKS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(all(debug_assertions, test, target_os = "linux", instancy_shuttle))]
+shuttle::thread_local! {
+    static STATE_LOCKS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many manager state locks this thread holds (none once its thread
+/// locals are gone).
+#[cfg(debug_assertions)]
+fn state_locks_held() -> usize {
+    STATE_LOCKS_HELD.try_with(std::cell::Cell::get).unwrap_or(0)
+}
+
+/// A held manager state lock (see [`Inner::state`]). Debug builds count the
+/// state locks each thread holds, so that a [`LaneHold`] dropped under one is
+/// caught.
+struct StateGuard<'a>(StateLockGuard<'a, State>);
+
+impl<'a> StateGuard<'a> {
+    fn new(guard: StateLockGuard<'a, State>) -> Self {
+        #[cfg(debug_assertions)]
+        let _ = STATE_LOCKS_HELD.try_with(|held| held.set(held.get() + 1));
+        Self(guard)
+    }
+}
+
+impl Drop for StateGuard<'_> {
+    fn drop(&mut self) {
+        // Runs before the lock is released.
+        #[cfg(debug_assertions)]
+        let _ = STATE_LOCKS_HELD.try_with(|held| held.set(held.get().saturating_sub(1)));
+    }
+}
+
+impl std::ops::Deref for StateGuard<'_> {
+    type Target = State;
+
+    fn deref(&self) -> &State {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for StateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        &mut self.0
+    }
 }
 
 /// How long a released [`SharedPeerManager`] keeps its connections open to
@@ -152,8 +278,15 @@ enum Outbound {
 const WRITER_DRAIN_GRACE: Duration = Duration::from_secs(10);
 
 /// Most dataflows whose control frames are buffered before they register
-/// here (see [`PendingControl`]).
-const MAX_PENDING_DATAFLOWS: usize = 16_384;
+/// here (see [`PendingControl`]). A peer sends its handshake as soon as it
+/// has registered a dataflow, so when this node registers late (a burst of
+/// spawns while it is busy), this many handshakes can wait for it.
+const MAX_PENDING_DATAFLOWS: usize = 262_144;
+
+/// Most payload bytes of control frames buffered for dataflows that have not
+/// registered here (a handshake's is 37 bytes plus the node id); the
+/// buffer's bookkeeping is not counted.
+const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 
 /// Most control frames buffered for one dataflow that has not registered.
 const MAX_PENDING_FRAMES_PER_DATAFLOW: usize = 64;
@@ -168,6 +301,9 @@ const MAX_COMPLETED_DATAFLOWS: usize = 16_384;
 
 /// Capacity of a pooled connection's writer queue.
 const WRITER_QUEUE: usize = 256;
+
+/// Most queued frames a connection writer takes and writes at once.
+const WRITER_BATCH: usize = 64;
 
 /// Background tasks of a [`SharedPeerManager`].
 ///
@@ -445,6 +581,13 @@ struct DataflowRegistration {
     outbound_failed: bool,
     /// Frames from the peer can no longer arrive (reported once).
     inbound_failed: bool,
+    /// The registration's lane, while a [`LaneHold`] holds it.
+    lane: std::sync::Weak<Lane>,
+    /// Unregistered, but its lane is still held: the frames that hold its
+    /// lane, queued or still sent, are numbered and written (another
+    /// sender's are dropped), while frames from the peer are no longer
+    /// delivered and nothing is reported. Removed once the lane is released.
+    closing: bool,
 }
 
 /// Control frames for one dataflow that has not registered here yet.
@@ -454,62 +597,110 @@ struct PendingFrames {
     since: tokio::time::Instant,
 }
 
+impl PendingFrames {
+    fn bytes(&self) -> usize {
+        self.frames.iter().map(|(_, payload)| payload.len()).sum()
+    }
+}
+
 /// Control frames that arrive before their dataflow registers here.
 ///
 /// The peer may register a dataflow and send its handshake before this node
 /// has registered it; the frames wait here until it does. Bounded in the
-/// number of dataflows, in frames per dataflow and in time, so frames for a
-/// dataflow that never registers do not accumulate: such a dataflow's
-/// handshake times out.
+/// number of dataflows, in bytes, in frames per dataflow and in time, so
+/// frames for a dataflow that never registers do not accumulate: such a
+/// dataflow's handshake times out. Past the bounds, the frames of the
+/// dataflows that have waited longest are dropped, and their handshakes
+/// fail.
 #[derive(Default)]
 struct PendingControl {
     by_dataflow: HashMap<DataflowId, PendingFrames>,
     /// Insertion order, for expiry and eviction (may hold stale ids).
     order: VecDeque<DataflowId>,
+    /// Payload bytes buffered.
+    bytes: usize,
 }
 
 impl PendingControl {
     /// Buffer `payload`.
     fn push(&mut self, dataflow_id: DataflowId, conn: usize, payload: Vec<u8>) {
         self.expire();
-        if let Some(pending) = self.by_dataflow.get_mut(&dataflow_id) {
-            if pending.frames.len() < MAX_PENDING_FRAMES_PER_DATAFLOW {
-                pending.frames.push((conn, payload));
-            } else {
-                #[cfg(feature = "tracing")]
-                tracing::warn!(%dataflow_id, "too many control frames for an unregistered dataflow; dropping one");
-            }
+        if payload.len() > MAX_PENDING_BYTES
+            || self
+                .by_dataflow
+                .get(&dataflow_id)
+                .is_some_and(|pending| pending.frames.len() >= MAX_PENDING_FRAMES_PER_DATAFLOW)
+        {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                %dataflow_id,
+                size = payload.len(),
+                "a control frame for an unregistered dataflow is over its bounds; dropping it"
+            );
             return;
         }
-        while self.by_dataflow.len() >= MAX_PENDING_DATAFLOWS {
+        let mut evicted = 0usize;
+        while (self.by_dataflow.len() >= MAX_PENDING_DATAFLOWS
+            && !self.by_dataflow.contains_key(&dataflow_id))
+            || self.bytes + payload.len() > MAX_PENDING_BYTES
+        {
             let Some(oldest) = self.order.pop_front() else {
                 break;
             };
-            self.by_dataflow.remove(&oldest);
+            if let Some(dropped) = self.by_dataflow.remove(&oldest) {
+                self.bytes -= dropped.bytes();
+                evicted += 1;
+            }
         }
-        self.by_dataflow.insert(
-            dataflow_id,
-            PendingFrames {
-                frames: vec![(conn, payload)],
-                since: tokio::time::Instant::now(),
-            },
-        );
-        self.order.push_back(dataflow_id);
-        if self.order.len() > 2 * MAX_PENDING_DATAFLOWS {
+        #[cfg(feature = "tracing")]
+        if evicted > 0 {
+            tracing::warn!(
+                evicted,
+                "too many dataflows wait to register here; dropping the control frames of \
+                 those waiting longest"
+            );
+        }
+        #[cfg(not(feature = "tracing"))]
+        let _ = evicted;
+        self.bytes += payload.len();
+        match self.by_dataflow.entry(dataflow_id) {
+            std::collections::hash_map::Entry::Occupied(pending) => {
+                pending.into_mut().frames.push((conn, payload));
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(PendingFrames {
+                    frames: vec![(conn, payload)],
+                    since: tokio::time::Instant::now(),
+                });
+                self.order.push_back(dataflow_id);
+            }
+        }
+        // Registered dataflows leave stale ids behind a live one at the
+        // front: keep them fewer than the live ones.
+        if self.order.len() > 2 * self.by_dataflow.len() + 64 {
             let live = &self.by_dataflow;
             self.order.retain(|id| live.contains_key(id));
         }
     }
 
     fn take(&mut self, dataflow_id: &DataflowId) -> Option<PendingFrames> {
-        self.by_dataflow.remove(dataflow_id)
+        let pending = self.by_dataflow.remove(dataflow_id)?;
+        self.bytes -= pending.bytes();
+        Some(pending)
     }
 
     /// Forget the frames that arrived on `conn` (it failed: what followed
     /// them on it is lost, so the handshake they start cannot complete).
     fn forget_connection(&mut self, conn: usize) {
+        let bytes = &mut self.bytes;
         self.by_dataflow.retain(|_, pending| {
-            pending.frames.retain(|(from, _)| *from != conn);
+            pending.frames.retain(|(from, payload)| {
+                let keep = *from != conn;
+                if !keep {
+                    *bytes -= payload.len();
+                }
+                keep
+            });
             !pending.frames.is_empty()
         });
     }
@@ -522,7 +713,9 @@ impl PendingControl {
                 }
                 Some(pending) if pending.since.elapsed() >= PENDING_CONTROL_TTL => {
                     let id = *front;
-                    self.by_dataflow.remove(&id);
+                    if let Some(expired) = self.by_dataflow.remove(&id) {
+                        self.bytes -= expired.bytes();
+                    }
                     self.order.pop_front();
                 }
                 Some(_) => break,
@@ -530,7 +723,7 @@ impl PendingControl {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(all(target_os = "linux", instancy_shuttle))))]
     fn len(&self) -> usize {
         self.by_dataflow.len()
     }
@@ -640,10 +833,20 @@ enum Report {
 // Inner: state shared with the background tasks
 // ---------------------------------------------------------------------------
 
+/// Logs `step` for the schedule tests, in the order the state lock
+/// serializes the steps: call it under the lock (see `closing_shuttle`).
+/// Outside those tests it expands to nothing.
+macro_rules! log_step {
+    ($inner:expr, $step:expr) => {
+        #[cfg(all(test, target_os = "linux", instancy_shuttle))]
+        $inner.steps.lock().unwrap().push($step);
+    };
+}
+
 struct Inner {
     peer_node_id: String,
     config: SharedConnectionConfig,
-    state: Mutex<State>,
+    state: StateLock<State>,
     prober: RttProber,
     probe_counter: ProbeCounter,
     /// Factory used to establish the pool's connections.
@@ -656,14 +859,19 @@ struct Inner {
     init_lock: TokioMutex<()>,
     /// Health event sender (connection failures).
     health_tx: tokio::sync::broadcast::Sender<crate::runtime_event::RuntimeEvent>,
+    /// The steps logged for the schedule tests (see `log_step!`).
+    #[cfg(all(test, target_os = "linux", instancy_shuttle))]
+    steps: std::sync::Mutex<Vec<closing_shuttle::Step>>,
 }
 
 impl Inner {
-    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+    fn state(&self) -> StateGuard<'_> {
         // Critical sections never panic; recover the data if one ever did.
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        StateGuard::new(
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     fn live_connections(&self) -> usize {
@@ -712,7 +920,15 @@ impl Inner {
 
     /// Sequence a payload frame of the registration `token` of
     /// `dataflow_id` and queue it on the dataflow's pinned connection.
-    async fn send_payload(self: &Arc<Self>, dataflow_id: DataflowId, token: u64, mut frame: Frame) {
+    /// `hold` is the frame's hold on its registration's lane, if its sender
+    /// holds one.
+    async fn send_payload(
+        self: &Arc<Self>,
+        dataflow_id: DataflowId,
+        token: u64,
+        hold: Option<&LaneHold>,
+        mut frame: Frame,
+    ) {
         // The receiver handles the control and probe channels outside the
         // lane, and a frame over the size limit cannot be written: reject
         // any of them without consuming a sequence number. Only this
@@ -736,15 +952,22 @@ impl Inner {
                 connections,
                 ..
             } = &mut *state;
-            // The registration has ended (the dataflow has torn down): its
-            // frames still queued are dropped, never sequenced into another
-            // registration's lane.
+            // The frame's hold keeps its registration (closing, if it was
+            // unregistered) until the frame has been processed here, so
+            // this finds it, unless the registration was never made. A
+            // frame is never numbered into another registration's lane.
             let Some(reg) = registered
                 .get_mut(&dataflow_id)
                 .filter(|reg| reg.token == token)
             else {
                 return;
             };
+            // Unregistered, it takes only the frames that hold its lane (its
+            // session's): another sender's are dropped, as once it is
+            // removed.
+            if reg.closing && !hold.is_some_and(|hold| hold.holds(&reg.lane)) {
+                return;
+            }
             if let Some(error) = rejected {
                 #[cfg(feature = "tracing")]
                 tracing::error!(
@@ -774,6 +997,14 @@ impl Inner {
             };
             let seq = reg.next_send_seq;
             reg.next_send_seq += 1;
+            log_step!(
+                self,
+                closing_shuttle::Step::Numbered {
+                    dataflow_id,
+                    held: hold.is_some(),
+                    seq,
+                }
+            );
             (reg.conn, conn.writer.clone(), seq)
         };
         let mut payload = Vec::with_capacity(SEQUENCE_PREFIX + frame.payload.len());
@@ -788,20 +1019,23 @@ impl Inner {
     }
 
     /// Queue a control frame on its dataflow's pinned connection (any
-    /// connection for a dataflow not registered here).
+    /// connection for a dataflow not registered here, or unregistering with
+    /// its pinned connection failed).
     async fn send_control(self: &Arc<Self>, frame: Frame) {
         let target = {
             let state = self.state();
             match state.registered.get(&frame.dataflow_id) {
                 // Its lane failed and the dataflow was told.
-                Some(reg) if reg.outbound_failed => None,
-                Some(reg) => state
+                Some(reg) if reg.outbound_failed && !reg.closing => None,
+                Some(reg) if !reg.outbound_failed => state
                     .connections
                     .get(&reg.conn)
                     .map(|conn| (reg.conn, conn.writer.clone())),
                 // A dataflow that failed before registering here, or has
-                // unregistered (a late Cancel): any pool connection will do.
-                None => state
+                // unregistered or is unregistering (a late Cancel, as an
+                // aborted spawn's while its senders still hold the lane):
+                // any pool connection will do.
+                _ => state
                     .connections
                     .iter()
                     .find(|(_, conn)| !conn.peer_closed)
@@ -838,15 +1072,20 @@ impl Inner {
                 completed,
                 ..
             } = &mut *state;
-            let Some(reg) = registered.get_mut(&dataflow_id) else {
+            let Some(reg) = registered.get_mut(&dataflow_id).filter(|reg| !reg.closing) else {
                 // Control frames may arrive before their dataflow registers
                 // here (the peer was faster): they wait, boundedly (see
                 // `PendingControl`). A dataflow that finished here cannot
                 // register again (a `DataflowId` identifies one run): its
-                // late frames are dropped. A payload frame for a dataflow
-                // not registered here is late too: the peer sends payload
-                // only after this node's handshake, so it has torn down.
-                if frame.channel_id == CONTROL_CHANNEL_ID && !completed.contains(&dataflow_id) {
+                // late frames are dropped, also while its own frames still
+                // go out (a closing registration). A payload frame for a
+                // dataflow not registered here is late too: the peer sends
+                // payload only after this node's handshake, so it has torn
+                // down.
+                if frame.channel_id == CONTROL_CHANNEL_ID
+                    && !completed.contains(&dataflow_id)
+                    && !registered.contains_key(&dataflow_id)
+                {
                     pending_control.push(dataflow_id, conn_id, frame.payload);
                 }
                 return;
@@ -969,11 +1208,19 @@ impl Inner {
     fn fail_outbound(self: &Arc<Self>, conn_id: usize, error: TransportError) {
         let reports = {
             let mut state = self.state();
+            log_step!(
+                self,
+                closing_shuttle::Step::OutboundFailed { conn: conn_id }
+            );
             let removed = state.connections.remove(&conn_id).is_some();
             let mut reports = Vec::new();
             for reg in state.registered.values_mut() {
                 if reg.conn == conn_id && !reg.outbound_failed {
                     reg.outbound_failed = true;
+                    // A closing registration's dataflow is gone.
+                    if reg.closing {
+                        continue;
+                    }
                     reports.push(Report::Event {
                         events: reg.events.clone(),
                         event: PeerIoEvent::WriteFailed(error.duplicate()),
@@ -1015,6 +1262,15 @@ impl Inner {
             state.pending_control.forget_connection(conn_id);
             let mut reports = Vec::new();
             for (&dataflow_id, reg) in state.registered.iter_mut() {
+                if reg.closing {
+                    // Its dataflow is gone: nothing to report, and nothing
+                    // arrives for it. Its frames to the peer stop only when
+                    // they can no longer be written.
+                    if reg.conn == conn_id && !clean {
+                        reg.outbound_failed = true;
+                    }
+                    continue;
+                }
                 if reg.inbound_conn == Some(conn_id) && !reg.inbound_failed {
                     reg.inbound_failed = true;
                     reports.push(Report::InboundEnded {
@@ -1107,7 +1363,16 @@ impl Inner {
         }
     }
 
-    /// Remove `dataflow_id`'s registration (only `token`'s, if given).
+    /// Unregister `dataflow_id`'s registration: retire its id and stop
+    /// delivering the peer's frames for it.
+    ///
+    /// With a `token` (a registration's own cleanup, as the runtime's
+    /// teardown), only that registration, and its lane is kept while
+    /// anything still holds it: it is removed now if nothing does, or else
+    /// once the lane is released (see [`DataflowRegistration::closing`]).
+    /// Without one ([`SharedPeerManager::unregister_dataflow`]) it is removed
+    /// at once, and its payload frames still queued are dropped: a caller
+    /// that keeps senders does not keep the registration.
     fn unregister(&self, dataflow_id: &DataflowId, token: Option<u64>) {
         let mut state = self.state();
         let State {
@@ -1117,17 +1382,24 @@ impl Inner {
             completed,
             ..
         } = &mut *state;
-        match registered.get(dataflow_id) {
+        match registered.get_mut(dataflow_id) {
             Some(reg) if token.is_none_or(|token| token == reg.token) => {
-                let conn = reg.conn;
-                registered.remove(dataflow_id);
-                if let Some(pooled) = connections.get_mut(&conn) {
-                    pooled.pinned = pooled.pinned.saturating_sub(1);
-                    // The peer closed its side and the last lane on it is
-                    // done: close ours (the writer finishes what is queued).
-                    if pooled.peer_closed && pooled.pinned == 0 {
-                        connections.remove(&conn);
+                log_step!(
+                    self,
+                    closing_shuttle::Step::Unregistered {
+                        dataflow_id: *dataflow_id,
+                        public: token.is_none(),
                     }
+                );
+                if token.is_none() || reg.lane.strong_count() == 0 {
+                    Self::remove_registration(registered, connections, dataflow_id);
+                } else if !reg.closing {
+                    reg.closing = true;
+                    // As if it were removed: its channels close, and with
+                    // its last events sender the forwarding of its
+                    // connection events ends.
+                    reg.channel_senders = None;
+                    reg.events = tokio_mpsc::channel(1).0;
                 }
                 completed.insert(*dataflow_id);
             }
@@ -1139,6 +1411,73 @@ impl Inner {
             None => {}
         }
         pending_control.take(dataflow_id);
+    }
+
+    /// Remove `dataflow_id`'s registration and unpin it from its connection.
+    fn remove_registration(
+        registered: &mut HashMap<DataflowId, DataflowRegistration>,
+        connections: &mut BTreeMap<usize, PooledConnection>,
+        dataflow_id: &DataflowId,
+    ) {
+        let Some(reg) = registered.remove(dataflow_id) else {
+            return;
+        };
+        if let Some(pooled) = connections.get_mut(&reg.conn) {
+            pooled.pinned = pooled.pinned.saturating_sub(1);
+            // The peer closed its side and the last lane on it is
+            // done: close ours (the writer finishes what is queued).
+            if pooled.peer_closed && pooled.pinned == 0 {
+                connections.remove(&reg.conn);
+            }
+        }
+    }
+
+    /// A hold on the lane of `token`'s registration of `dataflow_id`, if it
+    /// is registered and not closing.
+    ///
+    /// A hold is never dropped under a state lock, which releasing the last
+    /// one takes (see [`LaneHold`]): the holds made here leave the lock with
+    /// the caller, and the bridge releases a frame's hold after handling the
+    /// frame.
+    fn lane_hold(self: &Arc<Self>, dataflow_id: &DataflowId, token: u64) -> Option<LaneHold> {
+        let mut state = self.state();
+        let reg = state
+            .registered
+            .get_mut(dataflow_id)
+            .filter(|reg| reg.token == token && !reg.closing)?;
+        log_step!(
+            self,
+            closing_shuttle::Step::HoldMade {
+                dataflow_id: *dataflow_id,
+            }
+        );
+        Some(LaneHold(reg.lane.upgrade().unwrap_or_else(|| {
+            let lane = Arc::new(Lane {
+                inner: Arc::downgrade(self),
+                dataflow_id: *dataflow_id,
+                token,
+            });
+            reg.lane = Arc::downgrade(&lane);
+            lane
+        })))
+    }
+
+    /// The last hold on the lane of `token`'s registration of `dataflow_id`
+    /// is gone: nothing more can be sent under it. Remove it if it was
+    /// unregistered (if not, unregistering it removes it).
+    fn lane_released(&self, dataflow_id: &DataflowId, token: u64) {
+        let mut state = self.state();
+        let State {
+            registered,
+            connections,
+            ..
+        } = &mut *state;
+        let released = registered
+            .get(dataflow_id)
+            .is_some_and(|reg| reg.token == token && reg.closing && reg.lane.strong_count() == 0);
+        if released {
+            Self::remove_registration(registered, connections, dataflow_id);
+        }
     }
 
     /// Why `token` cannot claim or register `dataflow_id` here: it is
@@ -1155,9 +1494,10 @@ impl Inner {
             .claims
             .get(dataflow_id)
             .is_some_and(|&claim| claim != token);
-        let reason = if state.registered.contains_key(dataflow_id) || claimed_by_other {
+        let registered = state.registered.get(dataflow_id);
+        let reason = if registered.is_some_and(|reg| !reg.closing) || claimed_by_other {
             format!("dataflow {dataflow_id} is already registered with peer {peer}")
-        } else if state.completed.contains(dataflow_id) {
+        } else if registered.is_some() || state.completed.contains(dataflow_id) {
             format!(
                 "dataflow {dataflow_id} already ran with peer {peer}: a DataflowId \
                  identifies one run, so a retry needs a fresh DataflowId"
@@ -1226,6 +1566,11 @@ pub(crate) fn new_registration_token() -> u64 {
 
 /// Per-connection writer task: writes queued frames to the connection.
 ///
+/// It takes every frame queued (up to [`WRITER_BATCH`]) and writes them
+/// together, with one flush: one connection carries the frames of every
+/// dataflow pinned to it, and one write per frame would make its writer
+/// the bottleneck under load.
+///
 /// On a write error the frames queued on the connection are lost: it fails
 /// the dataflows pinned to the connection, then has the reader stop
 /// (`close`), so both halves are dropped and the whole connection closes.
@@ -1243,10 +1588,27 @@ async fn writer_task(
     close: tokio::sync::oneshot::Sender<TransportError>,
 ) {
     let mut framed = FramedWriter::new(writer);
-    while let Some(frame) = rx.recv().await {
-        let payload_size = frame.payload.len();
-        let is_user_traffic = frame.channel_id != PROBE_CHANNEL_ID;
-        if let Err(error) = framed.write_frame(&frame).await {
+    let mut batch = Vec::with_capacity(WRITER_BATCH);
+    while rx.recv_many(&mut batch, WRITER_BATCH).await > 0 {
+        // A frame over the size limit cannot be written: the frames queued
+        // before it are, then it fails the connection.
+        let writable = batch
+            .iter()
+            .position(|frame| frame.payload.len() > MAX_MESSAGE_SIZE)
+            .unwrap_or(batch.len());
+        let mut written = framed.write_frames(&batch[..writable]).await;
+        if written.is_ok() {
+            for frame in &batch[..writable] {
+                metrics.record_write(frame.payload.len(), frame.channel_id != PROBE_CHANNEL_ID);
+            }
+            if let Some(oversize) = batch.get(writable) {
+                written = Err(TransportError::PayloadTooLarge {
+                    size: oversize.payload.len(),
+                    max: MAX_MESSAGE_SIZE,
+                });
+            }
+        }
+        if let Err(error) = written {
             let detail = error.to_string();
             if let Some(inner) = inner.upgrade() {
                 inner.fail_outbound(conn_id, error);
@@ -1258,7 +1620,7 @@ async fn writer_task(
             )));
             return;
         }
-        metrics.record_write(payload_size, is_user_traffic);
+        batch.clear();
     }
     // Nothing more will be written: tell the peer. Only some write halves
     // do that when dropped (`OwnedWriteHalf`); with others (TLS streams,
@@ -1325,8 +1687,10 @@ async fn bridge_task(
             },
 
             result = payload_rx.recv(), if payload_open => match result {
-                Some(Outbound::Payload { dataflow_id, token, frame }) => {
-                    inner.send_payload(dataflow_id, token, frame).await;
+                Some(Outbound::Payload { dataflow_id, token, frame, hold }) => {
+                    inner.send_payload(dataflow_id, token, hold.as_ref(), frame).await;
+                    // Outside the state lock, which releasing it may take.
+                    drop(hold);
                 }
                 // Every entry queued before the barrier has been processed.
                 Some(Outbound::Barrier(waiter)) => {
@@ -1428,7 +1792,7 @@ impl SharedPeerManager {
         let inner = Arc::new(Inner {
             peer_node_id,
             config,
-            state: Mutex::new(State::default()),
+            state: StateLock::new(State::default()),
             prober: RttProber::new(),
             probe_counter: ProbeCounter::new(),
             connection_factory,
@@ -1436,6 +1800,8 @@ impl SharedPeerManager {
             task_handles: TaskHandles::default(),
             init_lock: TokioMutex::new(()),
             health_tx,
+            #[cfg(all(test, target_os = "linux", instancy_shuttle))]
+            steps: Default::default(),
         });
 
         // Payload queue: dataflow tasks send their frames here.
@@ -1607,6 +1973,8 @@ impl SharedPeerManager {
             hold_channels,
             outbound_failed: false,
             inbound_failed: false,
+            lane: std::sync::Weak::new(),
+            closing: false,
         };
         // Deliver control frames that arrived before registration (the
         // channel holds them all, see above).
@@ -1676,12 +2044,15 @@ impl SharedPeerManager {
 
     /// Wait until every payload frame queued before this call has been
     /// processed by the bridge task (sequenced and handed to a connection
-    /// writer, or dropped because its dataflow has failed or unregistered).
+    /// writer, or dropped because its registration was removed or its
+    /// connection failed).
     ///
-    /// Unregistering a dataflow drops its payload frames that are still
+    /// [`Self::unregister_dataflow`] drops a dataflow's payload frames still
     /// queued, so a dataflow that wants its last frames delivered calls this
-    /// first. The barrier waits behind every dataflow's frames queued before
-    /// it; callers should bound the wait.
+    /// first. [`Self::unregister_registration`] keeps them, but a dataflow
+    /// whose manager is closed next (see [`Self::close`]) still needs them
+    /// handed to the connections first. The barrier waits behind every
+    /// dataflow's frames queued before it; callers should bound the wait.
     pub(crate) async fn flush(&self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self.payload_tx.send(Outbound::Barrier(tx)).await.is_ok() {
@@ -1717,7 +2088,8 @@ impl SharedPeerManager {
     }
 
     /// Unregister a dataflow, removing its channels and pending control
-    /// frames; its payload frames still queued are dropped. The id is
+    /// frames; its payload frames still queued are dropped (the registration
+    /// is removed at once, even if senders of it are still alive). The id is
     /// remembered (boundedly) as finished: it cannot be registered again,
     /// and the late frames of this run are dropped.
     pub async fn unregister_dataflow(&self, dataflow_id: &DataflowId) {
@@ -1727,6 +2099,16 @@ impl SharedPeerManager {
     /// Unregister `dataflow_id` only if it is still the registration made
     /// with `token`: a cleanup must not remove another registration of the
     /// same id.
+    ///
+    /// Unlike [`Self::unregister_dataflow`], this keeps the registration's
+    /// lane while anything still sends under it: its payload frames, queued
+    /// or still sent by the senders that hold its lane (those of its
+    /// [`SharedTransportSession`]: the outbox forwarders of a teardown that
+    /// stopped waiting for them), are numbered and written, and it is
+    /// removed once the last of them is gone and the bridge has handled what
+    /// they queued.
+    /// A peer may be waiting for them (a goodbye, an acknowledgement).
+    /// Senders from [`Self::dataflow_sender`] do not hold the lane.
     pub(crate) async fn unregister_registration(&self, dataflow_id: &DataflowId, token: u64) {
         self.inner.unregister(dataflow_id, Some(token));
     }
@@ -1770,15 +2152,42 @@ impl SharedPeerManager {
     }
 
     /// A sender for `dataflow_id`'s payload frames (data and progress),
-    /// bound to its current registration: frames it sends after that
-    /// registration ends are dropped. `None` if the dataflow is not
-    /// registered.
+    /// bound to its current registration: once that registration is removed
+    /// (see [`Self::unregister_dataflow`]), the frames it sends are dropped,
+    /// never numbered into another registration's lane. `None` if the
+    /// dataflow is not registered (or was unregistered).
+    ///
+    /// It does not hold the registration's lane: keeping it does not keep a
+    /// registration that the runtime's teardown unregistered, and what it
+    /// sends from the unregistration on is dropped (see the
+    /// [module documentation](self)).
     pub fn dataflow_sender(&self, dataflow_id: &DataflowId) -> Option<DataframeSender> {
-        let token = self.inner.state().registered.get(dataflow_id)?.token;
+        let token = self
+            .inner
+            .state()
+            .registered
+            .get(dataflow_id)
+            .filter(|reg| !reg.closing)?
+            .token;
         Some(DataframeSender {
             dataflow_id: *dataflow_id,
             token,
             tx: self.payload_tx.clone(),
+            hold: None,
+        })
+    }
+
+    /// A sender for the payload frames of `token`'s registration of
+    /// `dataflow_id` that holds its lane (see
+    /// [`Self::unregister_registration`]). `None` if that registration is
+    /// not registered (or was unregistered).
+    fn registration_sender(&self, dataflow_id: &DataflowId, token: u64) -> Option<DataframeSender> {
+        let hold = self.inner.lane_hold(dataflow_id, token)?;
+        Some(DataframeSender {
+            dataflow_id: *dataflow_id,
+            token,
+            tx: self.payload_tx.clone(),
+            hold: Some(hold),
         })
     }
 
@@ -1906,7 +2315,7 @@ impl SharedTransportSession {
         let mut io_events = HashMap::new();
 
         for (peer_id, manager) in peer_managers {
-            let (receivers, events) = match manager
+            let registered = manager
                 .register(
                     dataflow_id,
                     token,
@@ -1915,9 +2324,23 @@ impl SharedTransportSession {
                     Arc::clone(&hold_channels),
                 )
                 .await
-            {
+                .and_then(|(receivers, events)| {
+                    let sender = manager
+                        .registration_sender(&dataflow_id, token)
+                        .ok_or_else(|| TransportError::InvalidRegistration {
+                            reason: format!(
+                                "dataflow {dataflow_id} was unregistered with peer {peer_id} \
+                                 while it registered"
+                            ),
+                        })?;
+                    Ok((receivers, events, sender))
+                });
+            let (receivers, events, sender) = match registered {
                 Ok(registered) => registered,
                 Err(e) => {
+                    // Nothing was sent under the registrations made so far:
+                    // without their senders' holds they go at once.
+                    drop(payload_senders);
                     for registered_peer in all_receivers.keys() {
                         if let Some(m) = peer_managers.get::<String>(registered_peer) {
                             m.unregister_registration(&dataflow_id, token).await;
@@ -1927,14 +2350,7 @@ impl SharedTransportSession {
                 }
             };
 
-            payload_senders.insert(
-                peer_id.clone(),
-                DataframeSender {
-                    dataflow_id,
-                    token,
-                    tx: manager.payload_tx.clone(),
-                },
-            );
+            payload_senders.insert(peer_id.clone(), sender);
             control_senders.insert(peer_id.clone(), manager.control_sender().clone());
             all_receivers.insert(peer_id.clone(), receivers);
             io_events.insert(peer_id.clone(), events);
@@ -2017,13 +2433,20 @@ impl SharedTransportSession {
 /// [`SharedPeerManager::dataflow_sender`]).
 ///
 /// Tags each frame with the dataflow id and its registration: frames it
-/// sends after the registration has ended are dropped, never sequenced into
-/// another registration's lane.
+/// sends after the registration was removed are dropped, never sequenced
+/// into another registration's lane. The senders of a
+/// [`SharedTransportSession`] (the runtime's) also hold the registration's
+/// lane, which keeps a registration the runtime's teardown unregistered until
+/// every such sender is gone and the bridge has handled what they queued (see
+/// the [module documentation](self)); one from
+/// [`SharedPeerManager::dataflow_sender`] does not, and what it sends from
+/// that unregistration on is dropped.
 #[derive(Clone)]
 pub struct DataframeSender {
     dataflow_id: DataflowId,
     token: u64,
     tx: tokio_mpsc::Sender<Outbound>,
+    hold: Option<LaneHold>,
 }
 
 impl DataframeSender {
@@ -2033,6 +2456,7 @@ impl DataframeSender {
             dataflow_id: self.dataflow_id,
             token: self.token,
             frame,
+            hold: self.hold.clone(),
         }
     }
 
@@ -2072,7 +2496,523 @@ impl DataframeSender {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+/// Schedule tests of a registration's closing state, under Shuttle (Linux,
+/// `RUSTFLAGS="--cfg instancy_shuttle"`; see `docs/testing/nextest.md`).
+///
+/// The registration under test (token `T`) is pinned to connection `CONN`,
+/// beside another registration. Its session holds its lane through the
+/// sender `S`, a frame `F` that `S` sent is queued for the bridge, and `P`
+/// holds nothing (a sender from `dataflow_sender`). Shuttle threads then run:
+/// - the bridge task, which handles the queue;
+/// - a cleanup that unregisters the registration, as teardown does (with
+///   `T`) or as the public call does (without);
+/// - the owner, which drops `S`;
+/// - a request for a hold on the registration's lane, dropping what it gets;
+/// - `P` sending a frame `G`;
+/// - in some cases, `CONN`'s writer failing.
+///
+/// Some cases hold a thread back until another has acted, to check what
+/// must follow from that order. In every execution, the steps whose order
+/// matters are logged where the state lock serializes them (see
+/// `log_step!`), and checked: no unheld frame is numbered after the
+/// cleanup, no frame after the public unregistration or after its
+/// connection failed, and no hold is made after the cleanup. The state lock
+/// is Shuttle's; Tokio's channels are opaque to it (each call is one step).
+/// Each case samples `SAMPLES` executions with PCT from seed `SEED`: their
+/// exhaustive search does not finish.
+#[cfg(all(test, target_os = "linux", instancy_shuttle))]
+mod closing_shuttle {
+    use super::*;
+    use std::sync::atomic::AtomicUsize as Count;
+
+    /// The only seed: `SHUTTLE_RANDOM_SEED` must be unset.
+    const SEED: u64 = 0x1a4e;
+    /// Sampled executions per case, not distinct interleavings.
+    const SAMPLES: usize = 5_000;
+    const T: u64 = 1;
+    const OTHER_TOKEN: u64 = 2;
+    const CONN: usize = 0;
+
+    /// The registration under test.
+    fn id() -> DataflowId {
+        DataflowId::from_bytes([1; 16])
+    }
+
+    /// Another registration on the same connection.
+    fn other() -> DataflowId {
+        DataflowId::from_bytes([2; 16])
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Cleanup {
+        /// Teardown's unregistration, with the registration's token.
+        Teardown,
+        /// `SharedPeerManager::unregister_dataflow`, without a token.
+        Public,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Order {
+        /// No thread waits for another.
+        Free,
+        /// `P` sends `G`, and the hold is asked for, only after the cleanup.
+        AfterCleanup,
+        /// The bridge starts only after the cleanup and the failure, if any.
+        BridgeLast,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct Case {
+        cleanup: Cleanup,
+        fail: bool,
+        order: Order,
+    }
+
+    /// A step the state lock serializes, logged where it takes effect (see
+    /// `log_step!`).
+    #[derive(Clone, Copy, Debug)]
+    pub(super) enum Step {
+        /// A payload frame took a number in its registration's lane.
+        Numbered {
+            dataflow_id: DataflowId,
+            held: bool,
+            seq: u64,
+        },
+        /// A registration was unregistered, by teardown or (`public`) by
+        /// `SharedPeerManager::unregister_dataflow`.
+        Unregistered {
+            dataflow_id: DataflowId,
+            public: bool,
+        },
+        /// A connection's writer failed.
+        OutboundFailed { conn: usize },
+        /// A hold on a registration's lane was handed out.
+        HoldMade { dataflow_id: DataflowId },
+    }
+
+    /// What an execution's frames and hold request came to.
+    #[derive(Default)]
+    struct Outcomes {
+        f_written: Count,
+        f_dropped: Count,
+        g_written: Count,
+        g_dropped: Count,
+        hold_made: Count,
+        hold_refused: Count,
+    }
+
+    /// A held registration's frames are written, an unheld sender's are
+    /// dropped once the registration closes, and it is removed once the
+    /// last hold is released.
+    #[test]
+    fn teardown_keeps_its_holders_frames_until_the_last_hold_goes() {
+        for order in [Order::Free, Order::AfterCleanup, Order::BridgeLast] {
+            sample(Case {
+                cleanup: Cleanup::Teardown,
+                fail: false,
+                order,
+            });
+        }
+    }
+
+    /// The public call removes a registration at once, held or not.
+    #[test]
+    fn the_public_unregistration_removes_a_registration_at_once() {
+        for order in [Order::Free, Order::AfterCleanup, Order::BridgeLast] {
+            sample(Case {
+                cleanup: Cleanup::Public,
+                fail: false,
+                order,
+            });
+        }
+    }
+
+    /// A failed connection drops what is handled after the failure and
+    /// leaves the pool; either cleanup still removes the registration.
+    #[test]
+    fn a_failed_connection_beside_either_cleanup() {
+        for cleanup in [Cleanup::Teardown, Cleanup::Public] {
+            for order in [Order::Free, Order::BridgeLast] {
+                sample(Case {
+                    cleanup,
+                    fail: true,
+                    order,
+                });
+            }
+        }
+    }
+
+    /// Run `case` in `SAMPLES` executions sampled by PCT from `SEED`. Each
+    /// must pass, and with no thread held back, each frame and the hold
+    /// request must have come out both ways in some of them.
+    fn sample(case: Case) {
+        assert!(
+            std::env::var_os("SHUTTLE_RANDOM_SEED").is_none(),
+            "SHUTTLE_RANDOM_SEED would replace the test's seed"
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let handle = runtime.handle().clone();
+        let outcomes = Arc::new(Outcomes::default());
+        let passed = Arc::new(Count::new(0));
+        let mut config = shuttle::Config::new();
+        config.stack_size = 0x10_0000;
+        config.max_steps = shuttle::MaxSteps::FailAfter(10_000);
+        config.max_time = None;
+        let scheduler = shuttle::scheduler::PctScheduler::new_from_seed(SEED, 3, SAMPLES);
+        let executions = shuttle::Runner::new(scheduler, config).run({
+            let outcomes = Arc::clone(&outcomes);
+            let passed = Arc::clone(&passed);
+            move || {
+                execution(case, &handle, &outcomes);
+                passed.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let count = |count: &Count| count.load(Ordering::Relaxed);
+        println!(
+            "{case:?}, seed {SEED:#x}: {executions} sampled executions; F written {}, dropped {}; \
+             G written {}, dropped {}; a hold made {}, refused {}",
+            count(&outcomes.f_written),
+            count(&outcomes.f_dropped),
+            count(&outcomes.g_written),
+            count(&outcomes.g_dropped),
+            count(&outcomes.hold_made),
+            count(&outcomes.hold_refused),
+        );
+        assert_eq!(executions, SAMPLES);
+        assert_eq!(count(&passed), executions, "every execution passed");
+        if case.order == Order::Free {
+            for (what, written, dropped) in [
+                ("G", &outcomes.g_written, &outcomes.g_dropped),
+                (
+                    "the hold request",
+                    &outcomes.hold_made,
+                    &outcomes.hold_refused,
+                ),
+            ] {
+                assert!(
+                    count(written) > 0 && count(dropped) > 0,
+                    "{what} came out only one way"
+                );
+            }
+        }
+    }
+
+    /// One execution of `case`.
+    fn execution(case: Case, runtime: &tokio::runtime::Handle, outcomes: &Outcomes) {
+        let (id, other) = (id(), other());
+        let inner = Arc::new(Inner {
+            peer_node_id: "peer".into(),
+            config: SharedConnectionConfig::default(),
+            state: StateLock::new(State::default()),
+            prober: RttProber::new(),
+            probe_counter: ProbeCounter::new(),
+            connection_factory: Arc::new(NoConnections),
+            runtime_handle: runtime.clone(),
+            task_handles: TaskHandles::default(),
+            init_lock: TokioMutex::new(()),
+            health_tx: tokio::sync::broadcast::channel(1).0,
+            steps: Default::default(),
+        });
+        let (writer, mut written) = tokio_mpsc::channel(8);
+        let (events, _events) = tokio_mpsc::channel(8);
+        {
+            let mut state = inner.state();
+            let alpha = inner.config.rtt_ema_alpha;
+            state.connections.insert(
+                CONN,
+                PooledConnection {
+                    metrics: Arc::new(ConnectionMetrics::new(CONN, alpha)),
+                    writer,
+                    pinned: 2,
+                    peer_closed: false,
+                },
+            );
+            state.next_conn_id = CONN + 1;
+            state.registered.insert(id, registration(T, events.clone()));
+            state
+                .registered
+                .insert(other, registration(OTHER_TOKEN, events));
+        }
+        let (payload_tx, payload_rx) = tokio_mpsc::channel(8);
+        let (_, control_rx) = tokio_mpsc::channel(1);
+        let s = DataframeSender {
+            dataflow_id: id,
+            token: T,
+            tx: payload_tx.clone(),
+            hold: inner.lane_hold(&id, T),
+        };
+        assert!(s.hold.is_some());
+        s.try_send(frame(b"F")).unwrap();
+        let p = DataframeSender {
+            dataflow_id: id,
+            token: T,
+            tx: payload_tx,
+            hold: None,
+        };
+
+        // Hold a thread back until another has acted (see `Order`).
+        let (cleaned_for_p, p_waits) = shuttle::sync::mpsc::channel::<()>();
+        let (cleaned_for_hold, hold_waits) = shuttle::sync::mpsc::channel::<()>();
+        let (cleaned_for_bridge, bridge_waits) = shuttle::sync::mpsc::channel::<()>();
+        let (failed_for_bridge, bridge_waits_failure) = shuttle::sync::mpsc::channel::<()>();
+
+        let mut threads = vec![
+            // The bridge task.
+            shuttle::thread::spawn({
+                let inner = Arc::clone(&inner);
+                move || {
+                    if case.order == Order::BridgeLast {
+                        bridge_waits.recv().unwrap();
+                        if case.fail {
+                            bridge_waits_failure.recv().unwrap();
+                        }
+                    }
+                    shuttle::future::block_on(bridge_task(inner, payload_rx, control_rx));
+                }
+            }),
+            // The cleanup.
+            shuttle::thread::spawn({
+                let inner = Arc::clone(&inner);
+                move || {
+                    let token = (case.cleanup == Cleanup::Teardown).then_some(T);
+                    inner.unregister(&id, token);
+                    if case.cleanup == Cleanup::Public {
+                        assert!(
+                            !inner.state().registered.contains_key(&id),
+                            "the public call left the registration"
+                        );
+                    }
+                    for gate in [cleaned_for_p, cleaned_for_hold, cleaned_for_bridge] {
+                        let _ = gate.send(());
+                    }
+                }
+            }),
+            // The owner.
+            shuttle::thread::spawn(move || drop(s)),
+            // `P`.
+            shuttle::thread::spawn(move || {
+                if case.order == Order::AfterCleanup {
+                    p_waits.recv().unwrap();
+                }
+                p.try_send(frame(b"G")).unwrap();
+            }),
+        ];
+        if case.fail {
+            threads.push(shuttle::thread::spawn({
+                let inner = Arc::clone(&inner);
+                move || {
+                    inner.fail_outbound(CONN, TransportError::ConnectionClosed);
+                    let _ = failed_for_bridge.send(());
+                }
+            }));
+        }
+        // The request for a hold: whether it got one.
+        let hold_request = shuttle::thread::spawn({
+            let inner = Arc::clone(&inner);
+            move || {
+                if case.order == Order::AfterCleanup {
+                    hold_waits.recv().unwrap();
+                }
+                let Some(hold) = inner.lane_hold(&id, T) else {
+                    return false;
+                };
+                assert!(
+                    case.order != Order::AfterCleanup,
+                    "a hold was made after the cleanup"
+                );
+                if case.cleanup == Cleanup::Teardown {
+                    let kept = inner
+                        .state()
+                        .registered
+                        .get(&id)
+                        .is_some_and(|reg| reg.token == T);
+                    assert!(kept, "a held registration was removed");
+                }
+                drop(hold);
+                true
+            }
+        });
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let hold_made = hold_request.join().unwrap();
+
+        // The steps in the order the state lock took them: nothing that
+        // must precede the cleanup or the failure followed it.
+        let steps = std::mem::take(&mut *inner.steps.lock().unwrap());
+        let cleaned_at = steps
+            .iter()
+            .position(|step| matches!(step, Step::Unregistered { .. }))
+            .expect("the cleanup ran");
+        let failed_at = steps
+            .iter()
+            .position(|step| matches!(step, Step::OutboundFailed { .. }));
+        let mut numbered = 0;
+        for (at, step) in steps.into_iter().enumerate() {
+            match step {
+                Step::Numbered {
+                    dataflow_id,
+                    held,
+                    seq,
+                } => {
+                    assert_eq!((dataflow_id, seq), (id, numbered), "numbered out of order");
+                    numbered += 1;
+                    assert!(
+                        at < cleaned_at || held,
+                        "an unheld frame was numbered after the cleanup"
+                    );
+                    assert!(
+                        at < cleaned_at || case.cleanup == Cleanup::Teardown,
+                        "a frame was numbered after the public unregistration"
+                    );
+                    assert!(
+                        failed_at.is_none_or(|failed_at| at < failed_at),
+                        "a frame was numbered after its connection failed"
+                    );
+                }
+                Step::HoldMade { dataflow_id } => {
+                    assert_eq!(dataflow_id, id);
+                    assert!(at < cleaned_at, "a hold was made after the cleanup");
+                }
+                Step::Unregistered {
+                    dataflow_id,
+                    public,
+                } => assert_eq!((dataflow_id, public), (id, case.cleanup == Cleanup::Public)),
+                Step::OutboundFailed { conn } => assert_eq!(conn, CONN),
+            }
+        }
+
+        // Every frame written is `id`'s, numbered from 0 in queue order (`F`,
+        // then `G`): none went to another registration's lane.
+        let mut names = Vec::new();
+        while let Ok(frame) = written.try_recv() {
+            assert_eq!(frame.dataflow_id, id);
+            assert_eq!(
+                frame.payload[..SEQUENCE_PREFIX],
+                (names.len() as u64).to_le_bytes()
+            );
+            names.push(frame.payload[SEQUENCE_PREFIX..].to_vec());
+        }
+        assert!(
+            [b"F".to_vec(), b"G".to_vec()].starts_with(&names),
+            "written out of queue order: {names:?}"
+        );
+        let f_written = !names.is_empty();
+        assert_eq!(
+            numbered,
+            names.len() as u64,
+            "a numbered frame was not written"
+        );
+        let g_written = names.len() == 2;
+        match case {
+            // `F` holds the lane, so the registration is there, closing, if
+            // the bridge handles it after the cleanup; `G` holds nothing.
+            Case {
+                cleanup: Cleanup::Teardown,
+                fail: false,
+                order,
+            } => {
+                assert!(f_written, "a held frame was lost");
+                assert!(
+                    !g_written || order == Order::Free,
+                    "an unheld frame was written after the cleanup"
+                );
+            }
+            Case {
+                order: Order::BridgeLast,
+                ..
+            } => assert!(
+                names.is_empty(),
+                "a frame was written after the cleanup or the failure"
+            ),
+            Case {
+                cleanup: Cleanup::Public,
+                order: Order::AfterCleanup,
+                ..
+            } => assert!(!g_written, "a frame was written after the cleanup"),
+            _ => {}
+        }
+        let state = inner.state();
+        assert_eq!(
+            state.registered[&other].next_send_seq, 0,
+            "a frame was numbered into another registration's lane"
+        );
+        assert!(
+            !state.registered.contains_key(&id),
+            "the registration outlived its cleanup and its holds"
+        );
+        if case.fail {
+            assert!(
+                !state.connections.contains_key(&CONN),
+                "the failed connection is still pooled"
+            );
+        } else {
+            assert_eq!(
+                state.connections[&CONN].pinned, 1,
+                "the pin count is not back"
+            );
+        }
+        assert!(
+            inner.id_unavailable(&state, &id, OTHER_TOKEN + 1).is_some(),
+            "the id can be registered again"
+        );
+        drop(state);
+        for (happened, yes, no) in [
+            (f_written, &outcomes.f_written, &outcomes.f_dropped),
+            (g_written, &outcomes.g_written, &outcomes.g_dropped),
+            (hold_made, &outcomes.hold_made, &outcomes.hold_refused),
+        ] {
+            if happened { yes } else { no }.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn registration(token: u64, events: tokio_mpsc::Sender<PeerIoNotice>) -> DataflowRegistration {
+        DataflowRegistration {
+            token,
+            conn: CONN,
+            next_send_seq: 0,
+            next_recv_seq: 0,
+            inbound_conn: None,
+            channel_senders: Some(HashMap::new()),
+            events,
+            hold_channels: Arc::default(),
+            outbound_failed: false,
+            inbound_failed: false,
+            lane: std::sync::Weak::new(),
+            closing: false,
+        }
+    }
+
+    fn frame(payload: &[u8]) -> Frame {
+        Frame {
+            dataflow_id: id(),
+            channel_id: 1,
+            payload: payload.to_vec(),
+        }
+    }
+
+    /// Never connects: the cases' connection is in the pool from the start.
+    struct NoConnections;
+
+    impl ConnectionFactory for NoConnections {
+        type Reader = tokio::io::Empty;
+        type Writer = tokio::io::Sink;
+
+        async fn establish(
+            &self,
+            _peer_node_id: &str,
+        ) -> Result<(Self::Reader, Self::Writer), Box<dyn std::error::Error + Send + Sync>>
+        {
+            Err("no connections".into())
+        }
+    }
+}
+
+// Native tests: under `--cfg instancy_shuttle` the manager's state lock is
+// Shuttle's model, which works only inside a model run.
+#[cfg(all(test, not(all(target_os = "linux", instancy_shuttle))))]
 mod tests {
     use super::*;
     use tokio::io::{DuplexStream, duplex};
@@ -2202,10 +3142,11 @@ mod tests {
     ) {
         let sender = manager
             .dataflow_sender(&dataflow_id)
-            .unwrap_or(DataframeSender {
+            .unwrap_or_else(|| DataframeSender {
                 dataflow_id,
                 token: 0,
                 tx: manager.payload_tx.clone(),
+                hold: None,
             });
         sender
             .send(frame(dataflow_id, channel_id, payload))
@@ -2320,9 +3261,10 @@ mod tests {
         assert!(state.pending_control.by_dataflow.contains_key(&fresh));
     }
 
-    /// Payload frames still queued when their registration ends are dropped:
-    /// they are never sequenced into another registration of the same id
-    /// (possible only once the id is no longer remembered).
+    /// Payload frames still queued when their registration is removed
+    /// (`unregister_dataflow`) are dropped: they are never sequenced into
+    /// another registration of the same id (possible only once the id is no
+    /// longer remembered).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_finished_registrations_queued_frames_never_reach_another() {
         let (manager, peer) = manager_with_raw_peer();
@@ -2348,6 +3290,293 @@ mod tests {
             "the old run's frame must not be sent"
         );
         drop(rx.remove(&1));
+    }
+
+    /// A registration unregistered with its token (as the runtime's teardown
+    /// does) is kept while a sender of it is alive: what the sender sends
+    /// still goes out in its own lane, the id cannot be registered again even
+    /// once it is no longer remembered, and the peer's late control frames
+    /// for it are dropped, not buffered. Once the sender is gone the
+    /// registration is removed, and a new registration of the id (possible
+    /// once it is forgotten) has a lane of its own: the frames of one never
+    /// reach the other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_closing_registrations_frames_never_reach_another() {
+        const TOKEN: u64 = 7;
+        let (manager, peer) = manager_with_raw_peer();
+        let (peer_read, peer_write) = tokio::io::split(peer);
+        let df = DataflowId::new();
+        let _first = manager
+            .register(df, TOKEN, &[1], 4, Arc::default())
+            .await
+            .unwrap();
+        let old = manager.registration_sender(&df, TOKEN).unwrap();
+        old.send(frame(df, 1, b"before".to_vec())).await.unwrap();
+        manager.unregister_registration(&df, TOKEN).await;
+        assert!(manager.dataflow_sender(&df).is_none());
+        // Forget the id, as after 16,384 later dataflows.
+        manager.inner.state().completed = RecentIds::default();
+        match manager.register_dataflow(df, &[1], 4).await {
+            Err(TransportError::InvalidRegistration { reason }) => {
+                assert!(reason.contains("fresh DataflowId"), "{reason}");
+            }
+            other => panic!("a registration still sending must keep its id: {other:?}"),
+        }
+        // A fresh id's early control frame, sent after the late one on the
+        // same connection, is buffered; the late one is not.
+        let mut peer_writer = FramedWriter::new(peer_write);
+        let fresh = DataflowId::new();
+        for id in [df, fresh] {
+            peer_writer
+                .write_frame(&frame(id, CONTROL_CHANNEL_ID, b"control".to_vec()))
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !manager
+                .inner
+                .state()
+                .pending_control
+                .by_dataflow
+                .contains_key(&fresh)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(manager.inner.state().pending_control.len(), 1);
+        old.send(frame(df, 1, b"after".to_vec())).await.unwrap();
+        drop(old);
+        manager.flush().await;
+        assert!(
+            !manager.inner.state().registered.contains_key(&df),
+            "removed once its last sender is gone and its frames were handled"
+        );
+        let (mut rx, _events) = manager.register_dataflow(df, &[1], 4).await.unwrap();
+        send(&manager, df, 1, b"new run".to_vec()).await;
+        manager.flush().await;
+        let mut peer_reader = FramedReader::new(peer_read);
+        for (seq, payload) in [(0u64, &b"before"[..]), (1, b"after"), (0, b"new run")] {
+            let frame = peer_reader.read_frame().await.unwrap();
+            assert_eq!(frame.payload[..SEQUENCE_PREFIX], seq.to_le_bytes());
+            assert_eq!(frame.payload[SEQUENCE_PREFIX..], *payload);
+        }
+        drop(rx.remove(&1));
+    }
+
+    /// The runtime's teardown waits for a dataflow's last frames to be
+    /// handled only for a bound, and then unregisters it, maybe with frames
+    /// still queued, or still on their way from its senders. None of them is
+    /// lost: the peer may be waiting for them (a goodbye, an
+    /// acknowledgement).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teardown_unregistering_loses_no_frame_still_queued_or_on_its_way() {
+        const TOKEN: u64 = 7;
+        let (manager, peer) = manager_with_raw_peer();
+        let df = DataflowId::new();
+        let (mut rx, _events) = manager
+            .register(df, TOKEN, &[1], 16, Arc::default())
+            .await
+            .unwrap();
+        let sender = manager.registration_sender(&df, TOKEN).unwrap();
+        for i in 0..100u8 {
+            sender.send(frame(df, 1, vec![i])).await.unwrap();
+        }
+        manager.unregister_registration(&df, TOKEN).await;
+        assert_eq!(
+            recv(rx.get_mut(&1).unwrap()).await,
+            None,
+            "its channels close"
+        );
+        let late = tokio::spawn(async move {
+            for i in 100..200u8 {
+                sender.send(frame(df, 1, vec![i])).await.unwrap();
+            }
+        });
+        let mut reader = FramedReader::new(peer);
+        for i in 0..200u8 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), reader.read_frame())
+                .await
+                .expect("a frame of the unregistered dataflow was lost")
+                .unwrap();
+            assert_eq!(frame.payload[..SEQUENCE_PREFIX], u64::from(i).to_le_bytes());
+            assert_eq!(frame.payload[SEQUENCE_PREFIX..], [i]);
+        }
+        late.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while manager.inner.state().registered.contains_key(&df) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the registration outlived its last sender and frame");
+    }
+
+    /// While teardown's unregistration keeps a registration closing for its
+    /// session's senders, a sender that doesn't hold the lane (one from
+    /// `dataflow_sender`, taken before) sends nothing more: what it sends
+    /// from then on is dropped, as once the registration is removed. The
+    /// holder's frames are still written, numbered in their lane.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_closing_registration_takes_only_frames_that_hold_its_lane() {
+        const TOKEN: u64 = 7;
+        let (manager, peer) = manager_with_raw_peer();
+        let df = DataflowId::new();
+        let _registered = manager
+            .register(df, TOKEN, &[1], 4, Arc::default())
+            .await
+            .unwrap();
+        let holder = manager.registration_sender(&df, TOKEN).unwrap();
+        let unheld = manager.dataflow_sender(&df).unwrap();
+        unheld
+            .send(frame(df, 1, b"unheld, before".to_vec()))
+            .await
+            .unwrap();
+        holder
+            .send(frame(df, 1, b"held, before".to_vec()))
+            .await
+            .unwrap();
+        manager.flush().await;
+        manager.unregister_registration(&df, TOKEN).await;
+        unheld
+            .send(frame(df, 1, b"unheld, after".to_vec()))
+            .await
+            .unwrap();
+        holder
+            .send(frame(df, 1, b"held, after".to_vec()))
+            .await
+            .unwrap();
+        drop(holder);
+        manager.flush().await;
+        assert!(
+            !manager.inner.state().registered.contains_key(&df),
+            "removed once its holder is gone and its frames were handled"
+        );
+        let mut reader = FramedReader::new(peer);
+        for (seq, payload) in [
+            (0u64, &b"unheld, before"[..]),
+            (1, b"held, before"),
+            (2, b"held, after"),
+        ] {
+            let frame = tokio::time::timeout(Duration::from_secs(5), reader.read_frame())
+                .await
+                .expect("a frame was lost")
+                .unwrap();
+            assert_eq!(frame.payload[..SEQUENCE_PREFIX], seq.to_le_bytes());
+            assert_eq!(frame.payload[SEQUENCE_PREFIX..], *payload);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), reader.read_frame())
+                .await
+                .is_err(),
+            "nothing more is written"
+        );
+    }
+
+    /// A sender from `dataflow_sender` does not hold a registration's lane:
+    /// keeping it does not keep a registration its owner unregistered, and
+    /// what it sends afterwards is dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_public_sender_does_not_keep_a_registration() {
+        const TOKEN: u64 = 7;
+        let (manager, peer) = manager_with_raw_peer();
+        let df = DataflowId::new();
+        let _registered = manager
+            .register(df, TOKEN, &[1], 4, Arc::default())
+            .await
+            .unwrap();
+        let public = manager.dataflow_sender(&df).unwrap();
+        manager.unregister_registration(&df, TOKEN).await;
+        assert!(!manager.inner.state().registered.contains_key(&df));
+        public.send(frame(df, 1, b"late".to_vec())).await.unwrap();
+        manager.flush().await;
+        let mut reader = FramedReader::new(peer);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), reader.read_frame())
+                .await
+                .is_err(),
+            "nothing is sent for a removed registration"
+        );
+    }
+
+    /// Releasing a registration's last lane hold takes its manager's state
+    /// lock, so a hold dropped under a state lock would deadlock if it were
+    /// the last. Debug builds catch every hold dropped under one, the last
+    /// or not, so the check doesn't depend on which drop comes last.
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[should_panic(expected = "a lane hold was dropped under a manager's state lock")]
+    async fn a_lane_hold_dropped_under_a_state_lock_is_caught() {
+        const TOKEN: u64 = 7;
+        let (manager, _peer) = manager_with_raw_peer();
+        let df = DataflowId::new();
+        let _registered = manager
+            .register(df, TOKEN, &[1], 4, Arc::default())
+            .await
+            .unwrap();
+        let kept = manager.inner.lane_hold(&df, TOKEN).unwrap();
+        let another = kept.clone();
+        let _state = manager.inner.state();
+        drop(another);
+    }
+
+    /// A control frame for a registration that is unregistering, as an
+    /// aborted spawn's Cancel while its session's senders still hold the
+    /// lane, goes out on another connection if its own one failed, as it
+    /// would once the registration is removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_closing_registrations_control_frame_avoids_its_failed_connection() {
+        const TOKEN: u64 = 7;
+        let (ours_0, theirs_0) = duplex(1 << 20);
+        let (ours_1, theirs_1) = duplex(1 << 20);
+        let manager = SharedPeerManager::new(
+            "peer".into(),
+            config(2),
+            Pre::factory([ours_0, ours_1]),
+            &tokio::runtime::Handle::current(),
+            health_tx(),
+        )
+        .unwrap();
+        let df = DataflowId::new();
+        let _registered = manager
+            .register(df, TOKEN, &[1], 4, Arc::default())
+            .await
+            .unwrap();
+        assert_eq!(manager.connection_count(), 2);
+        let _held = manager.registration_sender(&df, TOKEN).unwrap();
+        manager.unregister_registration(&df, TOKEN).await;
+        let pinned = {
+            let state = manager.inner.state();
+            let reg = &state.registered[&df];
+            assert!(reg.closing, "its sender keeps it");
+            reg.conn
+        };
+        manager
+            .inner
+            .fail_outbound(pinned, TransportError::ConnectionClosed);
+        let (seen_tx, mut seen) = tokio_mpsc::channel(4);
+        for theirs in [theirs_0, theirs_1] {
+            let seen_tx = seen_tx.clone();
+            tokio::spawn(async move {
+                let mut reader = FramedReader::new(theirs);
+                while let Ok(frame) = reader.read_frame().await {
+                    if frame.channel_id != PROBE_CHANNEL_ID {
+                        let _ = seen_tx.send(frame).await;
+                    }
+                }
+            });
+        }
+        manager
+            .control_sender()
+            .send(frame(df, CONTROL_CHANNEL_ID, b"cancel".to_vec()))
+            .await
+            .unwrap();
+        let sent = recv(&mut seen).await.unwrap();
+        assert_eq!(
+            (sent.dataflow_id, sent.channel_id, &sent.payload[..]),
+            (df, CONTROL_CHANNEL_ID, &b"cancel"[..])
+        );
     }
 
     /// M5: an unreachable peer fails registration within `connect_timeout`
@@ -2827,6 +4056,32 @@ mod tests {
             let (reader, inner) = tokio::io::split(stream);
             Ok((reader, BreakableWriter { inner, broken }))
         }
+    }
+
+    /// A frame over the size limit fails its connection, but the frames the
+    /// writer took with it and wrote before it go out and are counted.
+    #[tokio::test]
+    async fn frames_written_before_an_oversize_one_go_out_and_count() {
+        let (manager, peer) = manager_with_raw_peer();
+        let df = DataflowId::new();
+        let _registered = manager.register_dataflow(df, &[1], 4).await.unwrap();
+        let (writer, metrics) = {
+            let state = manager.inner.state();
+            let conn = state.connections.values().next().unwrap();
+            (conn.writer.clone(), Arc::clone(&conn.metrics))
+        };
+        // On one thread both are queued before the writer runs, so it takes
+        // them together.
+        writer
+            .try_send(frame(df, CONTROL_CHANNEL_ID, b"small".to_vec()))
+            .unwrap();
+        writer
+            .try_send(frame(df, CONTROL_CHANNEL_ID, vec![0; MAX_MESSAGE_SIZE + 1]))
+            .unwrap();
+        let mut reader = FramedReader::new(peer);
+        assert_eq!(reader.read_frame().await.unwrap().payload, b"small");
+        assert!(reader.read_frame().await.is_err(), "the connection closes");
+        assert_eq!(metrics.total_frames_written(), 1);
     }
 
     /// A write error closes the whole connection, not just its write
@@ -3321,14 +4576,40 @@ mod tests {
                 "the oldest is evicted"
             );
             assert!(pending.order.len() <= 2 * MAX_PENDING_DATAFLOWS);
+            assert_eq!(pending.bytes, MAX_PENDING_DATAFLOWS);
             // Frames from a failed connection are forgotten.
             pending.forget_connection(1);
             assert_eq!(pending.len(), 0);
+            assert_eq!(pending.bytes, 0);
             // Frames for a dataflow that never registers expire.
             pending.push(first, 0, vec![3]);
             tokio::time::advance(PENDING_CONTROL_TTL).await;
             pending.push(DataflowId::new(), 0, vec![4]);
             assert_eq!(pending.len(), 1);
+            assert_eq!(pending.bytes, 1);
+
+            // The bytes buffered are bounded too.
+            let mut pending = PendingControl::default();
+            let quarter = MAX_PENDING_BYTES / 4;
+            let ids: Vec<_> = (0..4).map(|_| DataflowId::new()).collect();
+            for &id in &ids {
+                pending.push(id, 0, vec![0; quarter]);
+            }
+            assert_eq!(pending.len(), 4);
+            pending.push(DataflowId::new(), 0, vec![5]);
+            assert_eq!(pending.len(), 4);
+            assert!(
+                !pending.by_dataflow.contains_key(&ids[0]),
+                "the oldest is evicted"
+            );
+            assert_eq!(pending.bytes, 3 * quarter + 1);
+            pending.take(&ids[1]);
+            assert_eq!(pending.bytes, 2 * quarter + 1);
+            // A frame over the byte bound by itself is dropped, and nothing
+            // is evicted for it.
+            pending.push(DataflowId::new(), 0, vec![0; MAX_PENDING_BYTES + 1]);
+            assert_eq!(pending.len(), 3);
+            assert_eq!(pending.bytes, 2 * quarter + 1);
         });
     }
 
@@ -3429,6 +4710,7 @@ mod tests {
             dataflow_id: df,
             token: 7,
             tx,
+            hold: None,
         };
         sender
             .send(frame(DataflowId::new(), 1, vec![1, 2, 3]))
@@ -3438,6 +4720,7 @@ mod tests {
             dataflow_id,
             token,
             frame: received,
+            ..
         }) = rx.recv().await
         else {
             panic!("expected a payload entry");

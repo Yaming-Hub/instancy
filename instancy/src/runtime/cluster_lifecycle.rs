@@ -2081,9 +2081,15 @@ impl ClusterLifecycle {
             // lane) and, for a peer we stopped waiting for (it cancelled and
             // may still be draining), our final progress. Hand our lanes to
             // the transport and, in Shared mode, let the bridges sequence
-            // those frames before unregistering, which would drop them.
-            // One task per peer, all bounded together, so an unreachable peer
-            // does not hold up the others.
+            // those frames, so they are on their connections before per-job
+            // managers are released below. One task per peer, all bounded
+            // together, so an unreachable peer does not hold up the others.
+            // Past the bound nothing queued is lost while the managers are
+            // kept: the forwarders drain on, and a Shared registration is
+            // removed only once the frames its session's payload senders
+            // queued were handled. A per-job manager closed below drops what
+            // is still queued, but closes its connections, which its peers
+            // see.
             let mut flushes = tokio::task::JoinSet::new();
             for (peer, forwarder) in forwarders {
                 let managers = managers.clone();
