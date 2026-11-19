@@ -121,11 +121,19 @@ What each configuration breaks is recorded in its golden file,
 kept as `tests/progress_conformance.golden` is: for each property, the number
 of violations, the set of their identities and a shortest trace. A test that
 finds anything else fails and says whether it found an identity the file
-does not list (a new counterexample) or no longer finds one it lists. Once
-the change is meant, run the test again with `INSTANCY_EXHAUSTIVE_GOLDEN=1`
-to rewrite the file, and cite, in the commit message, the `KNOWN_FAILURES`
-entry or the fix that explains each change: a fix shows in its diff as
-identities removed, none added. Never edit the files by hand.
+does not list (a new counterexample) or no longer finds one it lists.
+
+The files only shrink. Once a change is meant, run the test again with
+`INSTANCY_EXHAUSTIVE_GOLDEN=1`: it takes out of the file the identities it
+no longer finds, and still fails on a new one, which is a regression to fix.
+Only a change to the model may add identities: it bumps `MODEL_VERSION` in
+`exhaustive.rs`, and rewrites the files with
+`INSTANCY_EXHAUSTIVE_GOLDEN=reset`. CI's `golden-files` job fails a pull
+request that adds an identity without that bump, and that is all it
+checks: whether a bump, an identity taken out or a change to
+`KNOWN_FAILURES` is justified is for review. So cite, in the commit
+message, the `KNOWN_FAILURES` entry or the fix that explains each change,
+and never edit the files by hand.
 
 ## Differences from `cargo test`
 

@@ -5000,20 +5000,45 @@ const KNOWN_FAILURES: &[Known] = &[
 /// unless it finds exactly what its golden file lists, and says whether it
 /// found an identity the file does not list (a new counterexample, with a
 /// shortest trace to the first one of each property) or no longer finds one
-/// it lists: a fix can then show that it only removes violations. A change
-/// to what the environment's side of a state holds changes every identity:
-/// the files are then rewritten whole. Read when a test runs, so they can be
-/// updated without a rebuild: run a test with [`GOLDEN_VAR`] set and it
-/// writes what it found instead of comparing. They are never edited by hand,
-/// and every commit that changes one cites, in its message, the
-/// [`KNOWN_FAILURES`] entry or the fix that explains each change.
+/// it lists: a fix can then show that it only removes violations.
+///
+/// The files only shrink. A test run with [`GOLDEN_VAR`] set takes out of its
+/// file the identities it no longer finds, and still fails on a new one: a
+/// new counterexample is a regression to fix. Only a change to the model may
+/// add identities, and it bumps [`MODEL_VERSION`]; CI rejects a pull request
+/// that adds one without that bump. A change to what the environment's side
+/// of a state holds changes every identity, and the files are then rewritten
+/// whole. They are read when a test runs, so they can be updated without a
+/// rebuild. They are never edited by hand, and every commit that changes one
+/// cites, in its message, the [`KNOWN_FAILURES`] entry or the fix that
+/// explains each change.
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/runtime/cluster_lifecycle/exhaustive"
 );
 
-/// Set (to anything) to make a test write its configuration's golden file.
+/// Set to make a test rewrite its configuration's golden file ([`Rewrite`]):
+/// to `reset` to write whatever it finds, to anything else to only take
+/// identities out.
 const GOLDEN_VAR: &str = "INSTANCY_EXHAUSTIVE_GOLDEN";
+
+/// The model's version: the environment, the driver's scheduling, the
+/// configurations and the properties as this module writes them, which decide
+/// what a counterexample is. CI's `golden-files` job accepts identities added
+/// to the golden files only in a pull request that changes this number. Bump
+/// it with a change to the model, never to record a regression.
+const MODEL_VERSION: u32 = 1;
+
+/// What a test does with its golden file, as [`GOLDEN_VAR`] says.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rewrite {
+    /// Compare: fail on any difference.
+    No,
+    /// Take out the identities no longer found, but fail on a new one.
+    Shrink,
+    /// Write whatever is found, for a change to the model.
+    Reset,
+}
 
 /// The path of the golden file of the configuration called `name`.
 fn golden_path(name: &str) -> String {
@@ -5116,6 +5141,15 @@ impl Golden {
             }
         }
         text
+    }
+
+    /// Whether `found` has an identity this golden file does not list.
+    fn grows(&self, found: &Self) -> bool {
+        found.identities.iter().any(|(property, now)| {
+            self.identities
+                .get(property)
+                .is_none_or(|listed| !now.is_subset(listed))
+        })
     }
 
     /// How `found` differs from this golden file, for a failure.
@@ -5801,12 +5835,19 @@ fn check(wiring: Wiring, workers: u8, channels: u8, faults: Faults) {
         faults,
     };
     let path = golden_path(&cfg.name());
-    let writing = std::env::var_os(GOLDEN_VAR).is_some();
-    let golden = (!writing).then(|| {
+    let rewrite = match std::env::var_os(GOLDEN_VAR) {
+        None => Rewrite::No,
+        Some(value) if value == "reset" => Rewrite::Reset,
+        Some(_) => Rewrite::Shrink,
+    };
+    let golden = (rewrite != Rewrite::Reset).then(|| {
         std::fs::read_to_string(&path)
             .map(|text| Golden::parse(&text))
             .unwrap_or_else(|error| {
-                panic!("cannot read {path}: {error}; run the test with {GOLDEN_VAR}=1 to write it")
+                panic!(
+                    "cannot read {path}: {error}; a new configuration is a change to the model: \
+                     bump MODEL_VERSION and run the test with {GOLDEN_VAR}=reset to write it"
+                )
             })
     });
     let report = explore(cfg, golden.as_ref().map(|file| file.identities.clone()));
@@ -5866,6 +5907,18 @@ fn check(wiring: Wiring, workers: u8, channels: u8, faults: Faults) {
         return;
     };
     let changes = golden.changes(&found);
+    let grows = golden.grows(&found);
+    if rewrite == Rewrite::Shrink && !grows {
+        if !changes.is_empty() {
+            std::fs::write(&path, found.render(&cfg.name()))
+                .unwrap_or_else(|error| panic!("cannot write {path}: {error}"));
+            println!(
+                "{cfg}: golden file {path} rewritten:\n{}",
+                changes.join("\n")
+            );
+        }
+        return;
+    }
     let mut new = String::new();
     for finding in &report.unexpected {
         let _ = writeln!(
@@ -5879,11 +5932,22 @@ fn check(wiring: Wiring, workers: u8, channels: u8, faults: Faults) {
             let _ = writeln!(new, "  {line}");
         }
     }
+    let advice = if grows {
+        format!(
+            "A new counterexample is a regression to fix. Only a change to the model may add one: \
+             it bumps MODEL_VERSION (now {MODEL_VERSION}) and runs the test again with \
+             {GOLDEN_VAR}=reset, and CI rejects added identities without that bump."
+        )
+    } else {
+        format!(
+            "If the change is meant, run the test again with {GOLDEN_VAR}=1 to update the file (it \
+             only takes identities out), and cite, in the commit message, the KNOWN_FAILURES \
+             entry or the fix that explains each change."
+        )
+    };
     assert!(
         changes.is_empty(),
-        "{cfg}: the violations differ from the golden file {path}:\n{}\n{new}If the change is \
-         meant, run the test again with {GOLDEN_VAR}=1 to rewrite it, and cite, in the commit \
-         message, the KNOWN_FAILURES entry or the fix that explains each change.",
+        "{cfg}: the violations differ from the golden file {path}:\n{}\n{new}{advice}",
         changes.join("\n")
     );
 }
