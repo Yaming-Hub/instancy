@@ -229,7 +229,7 @@ instancy does not open or own the connections between nodes: your application pr
 **Your application provides:**
 
 - **Reliable, ordered byte streams.** Any transport works (TCP, TLS, QUIC, pipes) as long as each stream delivers bytes in order, without loss or duplication, while it lives.
-- **Paired connections (Shared mode).** Both nodes of a pool establish their connections independently; your factory must pair each connection one node establishes with one the peer establishes (one side dials, the other accepts and hands the accepted stream to its factory, for example). Both nodes must use the same `SharedConnectionConfig::connections`.
+- **Paired connections (Shared mode).** Both nodes of a pool establish their connections independently; your factory must pair each connection one node establishes with one the peer establishes (one side dials, the other accepts and hands the accepted stream to its factory, for example). A session sets up different peers concurrently, so a dial can wait for its matching accept without blocking setup for other peers. Each manager still opens its pool's connections one at a time. Both nodes must use the same `SharedConnectionConfig::connections`.
 - **Liveness.** Detecting that a peer is dead, partitioned or unreachable is yours: make your streams fail when the peer is gone (TCP keepalive with short timers, a TLS or QUIC idle timeout), or tell instancy through `report_node_leave` (see above). instancy runs no heartbeat of its own. The bundled `TcpConnectionFactory` sets no keepalive.
 
 **instancy guarantees:**
