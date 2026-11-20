@@ -67,6 +67,24 @@ const HEADER_SIZE: usize = 28;
 #[cfg(feature = "transport")]
 const CRC_SIZE: usize = 4;
 
+/// Largest payload a [`FramedWriter`] copies next to its frame's header and
+/// checksums, so the whole frame goes to the stream in one write. A larger
+/// payload is written straight from the frame: two more writes cost little
+/// next to its size.
+#[cfg(feature = "transport")]
+const COALESCED_PAYLOAD: usize = 16 * 1024;
+
+/// Encoded bytes after which [`FramedWriter::write_frames`] hands what it has
+/// encoded so far to the stream.
+#[cfg(feature = "transport")]
+const BATCH_BYTES: usize = 64 * 1024;
+
+/// Capacity a [`FramedWriter`]'s encoding buffer keeps between writes. A
+/// larger buffer is freed after use: a node holds one writer per connection,
+/// and Dedicated mode opens connections for every dataflow.
+#[cfg(feature = "transport")]
+const RETAINED_BUFFER: usize = 4 * 1024;
+
 #[cfg(feature = "transport")]
 fn encode_header(frame: &Frame, wire_len: u32) -> [u8; HEADER_SIZE] {
     let mut header = [0u8; HEADER_SIZE];
@@ -212,15 +230,26 @@ mod tokio_impl {
     /// length), a CRC32 of the header, the payload, and a CRC32 of header +
     /// payload (see the [module documentation](super) for the layout).
     ///
-    /// Writes are flushed after each frame for low latency.
+    /// A frame is encoded into one buffer and handed to the stream with one
+    /// `write_all` (three if its payload is over 16 KiB), and
+    /// [`Self::write_frames`] hands a batch over in pieces of about 64 KiB
+    /// (cut at frame boundaries), instead of a `write_all` for each of a
+    /// frame's four parts: on a plain socket, each call that is given bytes
+    /// makes at least one system call. Writes are flushed after each frame
+    /// (or batch) for low latency.
     pub struct FramedWriter<W> {
         writer: W,
+        /// The encoded frames not yet handed to `writer`.
+        buf: Vec<u8>,
     }
 
     impl<W: AsyncWrite + Unpin> FramedWriter<W> {
         /// Create a new framed writer wrapping the given stream.
         pub fn new(writer: W) -> Self {
-            Self { writer }
+            Self {
+                writer,
+                buf: Vec::new(),
+            }
         }
 
         /// Write a single frame to the stream.
@@ -237,25 +266,56 @@ mod tokio_impl {
                     max: MAX_MESSAGE_SIZE,
                 });
             }
-            self.write_unflushed(frame).await?;
+            self.write_unflushed(std::slice::from_ref(frame)).await?;
             self.writer.flush().await?;
             Ok(())
         }
 
-        /// Write one frame (already size-checked) without flushing.
-        async fn write_unflushed(&mut self, frame: &Frame) -> Result<(), TransportError> {
-            // The wire length includes the frame CRC trailer.
-            let wire_len = frame.payload.len() + CRC_SIZE;
-            let header = encode_header(frame, wire_len as u32);
+        /// Write `frames` (already size-checked) without flushing.
+        ///
+        /// Not cancel-safe, as before: a write cancelled after the stream took
+        /// some of a frame's bytes leaves the stream mid-frame. One cancelled
+        /// before it took any leaves nothing behind (the buffer is cleared
+        /// before encoding).
+        async fn write_unflushed(&mut self, frames: &[Frame]) -> Result<(), TransportError> {
+            self.buf.clear();
+            let written = self.encode_and_write(frames).await;
+            self.buf.clear();
+            if self.buf.capacity() > RETAINED_BUFFER {
+                self.buf = Vec::new();
+            }
+            written
+        }
 
-            self.writer.write_all(&header).await?;
-            self.writer
-                .write_all(&crc32fast::hash(&header).to_le_bytes())
-                .await?;
-            self.writer.write_all(&frame.payload).await?;
-            self.writer
-                .write_all(&frame_crc(&header, &frame.payload).to_le_bytes())
-                .await?;
+        async fn encode_and_write(&mut self, frames: &[Frame]) -> Result<(), TransportError> {
+            for frame in frames {
+                // The wire length includes the frame CRC trailer.
+                let wire_len = frame.payload.len() + CRC_SIZE;
+                let header = encode_header(frame, wire_len as u32);
+                let coalesced = frame.payload.len() <= COALESCED_PAYLOAD;
+                self.buf.reserve(
+                    HEADER_SIZE + 2 * CRC_SIZE + if coalesced { frame.payload.len() } else { 0 },
+                );
+                self.buf.extend_from_slice(&header);
+                self.buf
+                    .extend_from_slice(&crc32fast::hash(&header).to_le_bytes());
+                if coalesced {
+                    self.buf.extend_from_slice(&frame.payload);
+                } else {
+                    self.writer.write_all(&self.buf).await?;
+                    self.buf.clear();
+                    self.writer.write_all(&frame.payload).await?;
+                }
+                self.buf
+                    .extend_from_slice(&frame_crc(&header, &frame.payload).to_le_bytes());
+                if self.buf.len() >= BATCH_BYTES {
+                    self.writer.write_all(&self.buf).await?;
+                    self.buf.clear();
+                }
+            }
+            if !self.buf.is_empty() {
+                self.writer.write_all(&self.buf).await?;
+            }
             Ok(())
         }
 
@@ -276,9 +336,7 @@ mod tokio_impl {
                 }
             }
 
-            for frame in frames {
-                self.write_unflushed(frame).await?;
-            }
+            self.write_unflushed(frames).await?;
             self.writer.flush().await?;
             Ok(())
         }
@@ -1581,6 +1639,156 @@ mod transport_tests {
                 FramedReader::new(&wire[..]).read_frame().await.unwrap(),
                 frame
             );
+        }
+
+        /// A stream that records every write it is handed.
+        #[derive(Default)]
+        struct Writes {
+            sizes: Vec<usize>,
+            bytes: Vec<u8>,
+        }
+
+        impl tokio::io::AsyncWrite for Writes {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<io::Result<usize>> {
+                self.sizes.push(buf.len());
+                self.bytes.extend_from_slice(buf);
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        /// On a socket every write is a system call: a frame goes out in one
+        /// write (one with a large payload in three) and a batch in one per
+        /// 64 KiB, with the bytes of its frames written one by one.
+        #[tokio::test]
+        async fn frames_are_written_with_one_write_each() {
+            let df = DataflowId::new();
+            let make = |channel_id: u64, len: usize| Frame {
+                dataflow_id: df,
+                channel_id,
+                payload: vec![channel_id as u8; len],
+            };
+            let overhead = HEADER_SIZE + 2 * CRC_SIZE;
+
+            let mut writer = FramedWriter::new(Writes::default());
+            writer.write_frame(&make(1, 100)).await.unwrap();
+            writer
+                .write_frame(&make(2, COALESCED_PAYLOAD + 1))
+                .await
+                .unwrap();
+            assert_eq!(
+                writer.into_inner().sizes,
+                [
+                    overhead + 100,
+                    HEADER_SIZE + CRC_SIZE,
+                    COALESCED_PAYLOAD + 1,
+                    CRC_SIZE
+                ]
+            );
+
+            let batch: Vec<Frame> = (0..200).map(|i| make(i, 1000)).collect();
+            let mut writer = FramedWriter::new(Writes::default());
+            writer.write_frames(&batch).await.unwrap();
+            let writes = writer.into_inner();
+            // The encoded frames go out once they reach 64 KiB: 64 at a time.
+            let size = overhead + 1000;
+            assert_eq!(writes.sizes, [64 * size, 64 * size, 64 * size, 8 * size]);
+            let mut one_by_one = Vec::new();
+            for frame in &batch {
+                FramedWriter::new(&mut one_by_one)
+                    .write_frame(frame)
+                    .await
+                    .unwrap();
+            }
+            assert!(writes.bytes == one_by_one);
+            let mut reader = FramedReader::new(&writes.bytes[..]);
+            for frame in &batch {
+                assert_eq!(reader.read_frame().await.unwrap(), *frame);
+            }
+        }
+
+        /// A write cancelled before the stream took any of its bytes leaves
+        /// nothing behind: the next frame goes out alone.
+        #[tokio::test]
+        async fn a_write_cancelled_before_any_byte_leaves_nothing_behind() {
+            /// Not ready for the first write, then takes everything.
+            #[derive(Default)]
+            struct RefusesOnce {
+                refused: bool,
+                inner: Writes,
+            }
+
+            impl tokio::io::AsyncWrite for RefusesOnce {
+                fn poll_write(
+                    mut self: std::pin::Pin<&mut Self>,
+                    cx: &mut std::task::Context<'_>,
+                    buf: &[u8],
+                ) -> std::task::Poll<io::Result<usize>> {
+                    if !self.refused {
+                        self.refused = true;
+                        return std::task::Poll::Pending;
+                    }
+                    std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+                }
+
+                fn poll_flush(
+                    self: std::pin::Pin<&mut Self>,
+                    _: &mut std::task::Context<'_>,
+                ) -> std::task::Poll<io::Result<()>> {
+                    std::task::Poll::Ready(Ok(()))
+                }
+
+                fn poll_shutdown(
+                    self: std::pin::Pin<&mut Self>,
+                    _: &mut std::task::Context<'_>,
+                ) -> std::task::Poll<io::Result<()>> {
+                    std::task::Poll::Ready(Ok(()))
+                }
+            }
+
+            use std::future::Future;
+            let df = DataflowId::new();
+            let cancelled = Frame {
+                dataflow_id: df,
+                channel_id: 1,
+                payload: b"cancelled".to_vec(),
+            };
+            let sent = Frame {
+                dataflow_id: df,
+                channel_id: 2,
+                payload: b"sent".to_vec(),
+            };
+            let mut writer = FramedWriter::new(RefusesOnce::default());
+            {
+                let mut write = std::pin::pin!(writer.write_frame(&cancelled));
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(write.as_mut().poll(&mut cx).is_pending());
+            }
+            writer.write_frame(&sent).await.unwrap();
+            let bytes = writer.into_inner().inner.bytes;
+            let mut reader = FramedReader::new(&bytes[..]);
+            assert_eq!(reader.read_frame().await.unwrap(), sent);
+            assert!(matches!(
+                reader.read_frame().await,
+                Err(TransportError::ConnectionClosed)
+            ));
         }
     }
 }

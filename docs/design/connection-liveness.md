@@ -1,6 +1,6 @@
 # Connection liveness in the Shared transport
 
-Status: design, not implemented. Decision log R54–R58 and O17. Models: [`tla/ClusterTransport.tla`](./tla/ClusterTransport.tla) (extended) and [`tla/ConnSilence.tla`](./tla/ConnSilence.tla); see the [model README](./tla/README.md#connection-liveness-clustertransporttla-and-connsilencetla-o17). Cross-node backpressure (M7) is a separate, later design. It must keep CL6 below.
+Status: design, not implemented, except an interim fix for R58's hang (section 5). Decision log R54–R58 and O17. Models: [`tla/ClusterTransport.tla`](./tla/ClusterTransport.tla) (extended) and [`tla/ConnSilence.tla`](./tla/ConnSilence.tla); see the [model README](./tla/README.md#connection-liveness-clustertransporttla-and-connsilencetla-o17). Cross-node backpressure (M7) is a separate, later design. It must keep CL6 below.
 
 ## 1. The problem
 
@@ -105,10 +105,22 @@ GoAway would only let the peer notice sooner, with a precise reason. It remains 
 1. **Number at enqueue.** A payload frame gets its lane sequence number when it is enqueued, under the lane's lock, atomically with the enqueue. Async senders such as the outbox forwarder reserve a queue slot first, so numbering never waits.
 2. **Straight to the connection.** Frames go into the pinned connection's writer queue. It is bounded, so a full queue gives the pushing operator `Backpressure`, as the manager's payload queue does today. Only lanes pinned to a stuck connection feel it.
 3. **Control first.** Each writer has two queues and always serves the control queue first, keeping today's priority for control frames, as HTTP/2 puts control frames ahead of DATA. A control frame for a dataflow not registered here goes to any live connection, as today.
-4. **Admitted frames are written.** A frame is numbered into its own registration's lane when it is enqueued. So once it is in a writer queue, it is written even if the registration ends meanwhile; a peer whose own run has finished drops it as a late frame, as today. PR9 dropped a registration's queued frames when it ended only because the bridge numbered frames later and could have numbered them into another registration's lane, which can't happen any more. Frames not yet admitted (still in an outbox) when the registration ends are dropped, as today.
+4. **Admitted frames are written.** A frame is numbered into its own registration's lane when it is enqueued. So once it is in a writer queue, it is written even if the registration ends meanwhile; a peer whose own run has finished drops it as a late frame, as today. PR9 dropped a registration's queued frames when it ended only because the bridge numbered frames later and could have numbered them into another registration's lane, which can't happen any more. Frames not yet admitted (still in an outbox) when the registration ends are dropped.
 5. **Per-connection flush, with no fixed deadline.** Teardown's flush waits until the run's outbox has been handed to its connection's writer queue, or until that connection ends (it fails, or the peer closes it). It needs no barrier through the writer, since admitted frames are written anyway (item 4). The liveness rule bounds the wait: a writer can only stay stuck if its connection has stopped delivering in some direction. Then a node's verdict closes the connection, and the other node sees it end.
 
-   Today the flush gives up after `handshake_timeout` and unregisters, and the bridge then drops the run's remaining frames. With kept managers, a peer waiting for that run's goodbye or ack waits forever. This happens whenever the shared bridge stalls for longer than the flush's deadline, behind a silent connection or just a very slow one (`ct_silence_sharedbridge_stall`). The multi-process harness reproduces it on real processes (`finished_dataflow_survives_a_one_way_stall_longer_than_handshake` in `instancy-integration/tests/shared_connection_faults.rs`, scenario `one_way_stall_schedule`, ignored until the fix): a one-way stall that stops reading a→b on one connection blocks a's bridge, and a dataflow on the other connection ends `Ok` on a at the flush deadline while its peer never finishes. With this design, that dataflow's frames go straight to its own, healthy connection, so it ends promptly on both nodes.
+   Before the interim fix below, the flush gave up after `handshake_timeout` and unregistered, and the bridge then dropped the run's remaining frames. With kept managers, a peer waiting for that run's goodbye or ack waited forever. That happened whenever the shared bridge stalled for longer than the flush's deadline, behind a silent connection or just a very slow one (`ct_silence_sharedbridge_stall`). The multi-process harness reproduced it on real processes (`finished_dataflow_survives_a_one_way_stall_longer_than_handshake` in `instancy-integration/tests/shared_connection_faults.rs`, scenario `one_way_stall_schedule`): a one-way stall that stops reading a→b on one connection blocks a's bridge, and a dataflow on the other connection ends `Ok` on a at the flush deadline while its peer never finished. With the interim fix the test passes, after the stall heals. With this design, that dataflow's frames go straight to its own, healthy connection, so it ends promptly on both nodes, whether or not the stall heals.
+
+**Interim fix (R58).** Until this design is implemented, the code keeps the bridge and the flush deadline, but unregistering no longer drops what the run's own senders queued:
+- The runtime's payload senders of a dataflow (its `SharedTransportSession`'s, which its outbox forwarders and data pushes use) hold its registration's lane, and so does every frame they queue.
+- Teardown unregisters as before: the id is retired and the peer's frames are no longer delivered. While the lane is held, the registration stays, closing. The bridge goes on numbering the frames its holders send into the registration's own lane and handing them to its connection, including those the forwarders send after the flush gave up. It is removed when the last hold goes. The lifecycle coordinator holds the session until it ends, so every Shared teardown passes through this state.
+- `SharedPeerManager::unregister_dataflow` and the senders from `dataflow_sender` keep their behaviour. That call removes a registration at once, and such a sender holds nothing, so its frames are dropped once the registration is unregistered, closing or not.
+
+So with kept managers, the run's goodbye and acks reach the peer once the bridge moves again. What remains until this design:
+- **The stall.** A stuck writer still holds up every dataflow to that peer (CL4) until its connection heals or fails. With no liveness rule yet, a silent connection never fails.
+- **The flush deadline.** A per-job manager released after the deadline drops what is still queued and closes its connections. A peer that sees a connection close stops waiting for frames on it: a dataflow whose workers still needed them fails (a clean close is never completion), and one whose workers had finished, with only the goodbye or ack outstanding, can end `Ok`. A silent connection's close doesn't reach the peer, so its dataflows still hang until the liveness rule exists.
+- **Wider admission than item 4's.** A closing registration numbers whatever its holders send until the last hold goes, also frames sent after it was unregistered. Nothing may rely on that.
+
+This design replaces the interim rather than building on it. Once frames are numbered at enqueue and the flush waits for the outbox, a hold has nothing left to keep, and the holds and the closing state go.
 
 The public API doesn't change; the work is inside `shared_transport.rs`.
 
@@ -123,7 +135,7 @@ The model numbers each lane atomically from one ordered outbox, so it doesn't ch
 
 **Why the stall rule alone isn't enough.** With the shared bridge, a writer stuck on one connection holds up every dataflow to that peer until the stall rule fails its connection, about T after the writer stopped making progress. Two things go wrong in that window:
 - **A failure on a healthy connection.** A new dataflow's handshake (its timeout is chosen by the caller, often a few seconds) or a drain's grace (R50, 500 ms) can fail.
-- **A hang on a healthy connection.** A dataflow that finishes during the stall times out its flush, and its last frames are dropped. The model finds this hang (`ct_silence_sharedbridge_stall`).
+- **A hang on a healthy connection.** A dataflow that finishes during the stall times out its flush. Before the interim fix, its last frames were then dropped and its peer waited forever; the model finds this hang (`ct_silence_sharedbridge_stall`). With the interim fix they wait in the bridge instead: with kept managers they go out once the stuck connection fails, and a per-job manager released first drops them and closes its connections. The peer then sees the healthy connection close and stops waiting: it fails the dataflow if its workers still needed those frames, and can end it `Ok` if they had finished.
 
 Removing the bridge removes the stall.
 
@@ -159,12 +171,13 @@ Every rule here follows a mature, widely deployed system. None is invented for i
 | `"silence"` in `Faults` | One direction of a connection stops delivering anything. A writer into it buffers `StuckCap` frames, then blocks. |
 | `Detect` | `"none"` is today. `"silence"` lets a node declare a connection dead exactly when its inbound direction is silent. |
 | `StallAbort` | `TRUE`: a writer stuck on a silent direction fails its connection like a write error, at any time (the untimed form of "nothing written for T"). |
-| `SharedBridge`, `WQCap` | Today's single bridge per node, with bounded writer queues. Without it, each lane is forwarded on its own, which is the proposal. |
+| `SharedBridge`, `WQCap` | The single bridge per node, with bounded writer queues, as the code had it before R58's interim fix: a frame whose registration has ended is dropped. Without it, each lane is forwarded on its own, which is the proposal. |
 
 **What it doesn't model:**
 - The inbound binding. `Arrive` reads the peer's pin, so the model doesn't show that a dataflow which hasn't yet received a frame ends by `handshake_timeout` rather than by the verdict.
 - The flush's wait for a connection failure. Its untimed form: the flush gives up only when its own connection's writer is stuck, which matches the design's flush with no fixed deadline (section 5).
 - Races between a lane's producers (section 5).
+- The interim fix (section 5). With `SharedBridge`, an ended registration's frames are dropped, as before that fix. The fix's own races, between unregistering, the release of the last hold and the bridge, are below the model's abstraction and left to code tests.
 
 **`ConnSilence.tla`, a new timed model of one direction of one connection.** It covers:
 - probes every P, skipped when the writer queue is full;
@@ -188,7 +201,7 @@ It justifies the untimed model's "dead exactly when the inbound is silent".
 1. **Detection.** The reader and writer wrappers, the verdict in the probe loop, the config field with validation, and an error variant for a silent connection.
 2. **CL6 by construction.** The reader hands each frame to an unbounded per-channel queue and never awaits a consumer.
 3. **The reaction.** On a dead verdict, stop the reader and abort the writer. Apply the writer stall rule to every connection. Fix `TransportDegraded`: a recoverable connection-failure event, or corrected documentation.
-4. **Remove the bridge.** Number at enqueue, two-queue writers, admitted frames always written, and a flush with no fixed deadline, with the ordering obligations of section 5 under a Loom or Shuttle test.
+4. **Remove the bridge.** Number at enqueue, two-queue writers, admitted frames always written, and a flush with no fixed deadline, with the ordering obligations of section 5 under a Loom or Shuttle test. Remove the interim fix's lane holds and closing state with it. A writer takes up to 64 queued frames per write: with two queues, it must still serve control first, so it takes control frames first and bounds a batch of payload frames.
 5. **Documentation:**
    - the transport contract (shared_transport.rs module and `ConnectionFactory` docs);
    - communication.md ("instancy runs no heartbeat");
