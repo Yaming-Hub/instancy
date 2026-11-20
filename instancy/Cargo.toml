@@ -27,6 +27,7 @@ serde_json = { version = "1", optional = true }
 tokio = { version = "1", features = ["io-util", "sync", "rt", "rt-multi-thread", "macros", "time", "net"] }
 tokio-util = "0.7"
 crc32fast = { version = "1.5.0", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -42,7 +43,7 @@ default = ["tracing", "transport"]
 tracing = ["dep:tracing"]
 bincode-codec = ["dep:bincode", "dep:serde"]
 chrome-trace = ["dep:serde", "dep:serde_json"]
-transport = ["dep:crc32fast"]
+transport = ["dep:crc32fast", "dep:futures-util"]
 test-utils = []
 # Compile the progress invariant checker (V1, V4–V7) into release builds.
 # Debug builds (including every `cargo test` build) always include it.
