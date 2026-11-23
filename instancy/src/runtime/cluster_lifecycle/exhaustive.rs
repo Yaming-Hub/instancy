@@ -60,7 +60,9 @@
 //! flips a one-way flag, and whatever is queued was produced by a one-way
 //! change (the peer's frames, a fault, a worker's result, our frames and the
 //! grace timer by the machine's one-way decisions, never by the timer's own
-//! expiry). A step that changes nothing fails the check.
+//! expiry). When the timer's branch ends nothing, it undoes its poll, but
+//! only because an event has come in since, which it leaves queued. A step
+//! that changes nothing fails the check.
 //!
 //! A run ends once teardown has published its result and every worker has
 //! finished. Its result is what the completion makes of it
@@ -202,8 +204,9 @@
 //!   - its biased `select!`: the dataflow token (once), the bridges'
 //!     cancellation, the next event, the grace timer. The branches are polled
 //!     in turn, so once it has found no event and the grace deadline has
-//!     passed it takes the timer's branch, with an event queued meanwhile
-//!     (the timer race);
+//!     passed it takes the timer's branch, also with an event queued
+//!     meanwhile (the timer race). That branch then ends nothing: it starts
+//!     the grace period again, and the loop applies the event first;
 //!   - the token branch applying what is queued first, one event at a time;
 //!   - each action prepared just before it is taken. A `Cancel` broadcast is
 //!     awaited: the actions after it wait while the environment moves (events
@@ -281,7 +284,8 @@
 //!   cancelled first (`ClusterCancelHandle::cancel_with_reason`).
 //! - The grace deadline passes only once nothing is on its way to the
 //!   coordinator: the model's timing assumption, which the timer race above
-//!   relaxes for the moment the driver takes it.
+//!   relaxes for the moment the driver takes it. A grace period the timer's
+//!   branch starts again is a whole one, so its deadline passes so too.
 //!
 //! # Not covered
 //!
@@ -1278,7 +1282,9 @@ struct World {
     /// A grace deadline is armed.
     timer: bool,
     /// `select!` found no event, and the grace deadline it polls next has
-    /// passed: it takes that branch, whatever is queued meanwhile.
+    /// passed: it takes that branch, whatever is queued meanwhile. If
+    /// anything is, the branch ends nothing and starts the grace period
+    /// again.
     polled: bool,
     /// The actions the driver takes once the `Cancel` broadcast it awaits is
     /// done.
@@ -4116,7 +4122,9 @@ mod driver {
     /// takes the dataflow token (once), then the bridges' cancellation, then
     /// the next event, then the grace timer. Its branches are polled one
     /// after another: once it has found no event and the deadline passed, it
-    /// takes the timer's branch, also with an event queued since.
+    /// takes the timer's branch, also with an event queued since. A grace
+    /// deadline passes only with nothing on its way (the timing assumption),
+    /// also one the timer's branch started again.
     pub(super) fn next(w: &World, cfg: Config) -> Option<Step> {
         if w.tearing_down {
             Some(Step::TeardownEnds(Script::NONE))
@@ -4174,11 +4182,18 @@ mod driver {
                 applies(w, d, ev, cfg, tables, cursor, seen)
             }
             // The deadline of the first soft failure armed; it stays armed
-            // after the failure resolves.
+            // after the failure resolves. With an event queued since
+            // `select!` found none, nothing ends: the grace period starts
+            // again, and the event goes first.
             Step::GraceEnds(_) => {
-                w.timer = false;
                 w.polled = false;
-                grace_expires(w, d, seen)
+                if w.queue.is_empty() {
+                    w.timer = false;
+                    grace_expires(w, d, seen)
+                } else {
+                    seen.note(|| "the grace period starts again".into());
+                    Vec::new()
+                }
             }
             Step::Resume(_) => {
                 let mut actions = Vec::new();
@@ -4910,6 +4925,9 @@ fn describe(step: Step, before: &World, after: &World, cfg: Config, tables: &Tab
         ),
         Step::AbortSeen(_) => "the coordinator sees the bridges cancelled from outside".into(),
         Step::Apply(_) => "the coordinator takes the next event".into(),
+        Step::GraceEnds(_) if !before.queue.is_empty() => {
+            "the coordinator takes the grace deadline, but an event has come in since".into()
+        }
         Step::GraceEnds(_) => "the grace period ends".into(),
         Step::Poll => {
             "the coordinator finds no event and polls the grace deadline, which has passed".into()
@@ -5119,8 +5137,8 @@ const KNOWN_FAILURES: &[Known] = &[
         faults: &[Faults::Transport, Faults::Inbound],
         why: "a send fails (ours, or a write on our lane's connection that is not ours) and the \
               peer's end-of-stream is applied after its ControlClosed: nothing settles the send \
-              then (only ControlClosed or a link failure does), so the grace period holds a loss \
-              although the peer said goodbye and its link closed",
+              then (only ControlClosed or a link failure does), so the grace period, ending with \
+              nothing queued, holds a loss although the peer said goodbye and its link closed",
     },
     Known {
         property: Property::NoFalseSettle,
@@ -5128,15 +5146,8 @@ const KNOWN_FAILURES: &[Known] = &[
         faults: &[Faults::Transport, Faults::Inbound],
         why: "while draining, the forwarder's refusal of our goodbye is a second SendFailed, \
               which settles the first at once as a loss although the peer's Cancel is on its \
-              way; the grace period also holds a loss after the peer's goodbye, as in Shared mode",
-    },
-    Known {
-        property: Property::NoFalseSettle,
-        wirings: &[Wiring::SharedSplit, Wiring::Dedicated],
-        faults: &[Faults::Transport],
-        why: "the timer race: select! finds no event, the peer's Cancel is queued next, and it \
-              still takes the expired grace deadline, which settles the failed send as a link \
-              failure with the Cancel waiting in the channel",
+              way; the grace period, ending with nothing queued, also holds a loss after the \
+              peer's goodbye, as in Shared mode",
     },
     Known {
         property: Property::NoOkAfterFailedSend,

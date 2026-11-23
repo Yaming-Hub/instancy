@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Lifecycle coordinator: a grace period ends only with nothing queued
+
+- **Fixed: the cluster lifecycle coordinator no longer ends a grace period
+  with an event waiting.** After a soft link failure, such as a send that
+  failed while the workers ran, the coordinator waits a grace period for the
+  peer's `Cancel`, goodbye or ack before it settles the failure. Its
+  `select!` could find no event, and then take the expired deadline although
+  one had just come in. It then settled a failed send as a link failure, or
+  as a data loss, although the peer had cancelled or finished. Now the
+  timer's branch ends nothing while anything is queued: it starts the grace
+  period again, and the loop applies the events first. The lifecycle check's
+  timer race is gone from `KNOWN_FAILURES`, and its golden files lose the
+  NoFalseSettle counterexamples it caused.
+
 ### Lifecycle check: stable identities, and a failed read as a cause of loss
 
 - **Tests:** in the cluster lifecycle check, a counterexample's identity now

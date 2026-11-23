@@ -427,12 +427,14 @@ this node leaving. The same
 grace period applies while draining. A failed send dropped frames the peer
 needs, so it stays undecided, and the node does not tear down, until the
 link has fully closed or the grace period has expired; by then any `Cancel`
-the peer queued has been applied. A peer that cancelled, or that said
-goodbye and then closed the link (it left after finishing, which is what
-made the send fail), does not need the frames. A peer that said goodbye
-while the link stayed open (only our writer failed), or a failure that our
-own workers outlived, leaves the result incomplete and is reported as data
-loss. It never tears down silently: that
+the peer queued has been applied. A grace period ends only with nothing
+queued for the coordinator: if an event came in as its deadline passed, the
+grace period starts again, and the event is applied first. A peer that
+cancelled, or that said goodbye and then closed the link (it left after
+finishing, which is what made the send fail), does not need the frames. A
+peer that said goodbye while the link stayed open (only our writer failed),
+or a failure that our own workers outlived, leaves the result incomplete
+and is reported as data loss. It never tears down silently: that
 would leave the workers running without bridges and peers that already
 finished waiting for an acknowledgement that never comes. An operator whose
 push finds the queue to a peer that has not finished closed does not fail
@@ -636,10 +638,12 @@ their way in and corrupt frames (inbound faults). The dataflow token holds its
 reasons as values, and it can change between any two of the coordinator's
 reads of it. The driver awaits its `Cancel` broadcasts while the environment
 moves, its `select!` can take an expired grace deadline with an event queued
-since it found none, and teardown lets the inbound bridges drain (when every
-worker is done) and waits for them for a bound, then applies the lost records
-and corrupt traffic it finds queued. States are deduplicated exactly, and the
-search is breadth first, so every finding comes with a shortest trace.
+since it found none (the timer's branch then starts the grace period again,
+and the event goes first), and teardown lets the inbound bridges drain (when
+every worker is done) and waits for them for a bound, then applies the lost
+records and corrupt traffic it finds queued. States are deduplicated
+exactly, and the search is breadth first, so every finding comes with a
+shortest trace.
 
 On every step, a copy of the decisions as the driver made them before
 `Coordinator` existed takes the same step, from the same state and with the
@@ -678,15 +682,12 @@ The properties:
 - (3), Shared: after a send fails (also on a write that is not ours), the
   peer's end-of-stream can be applied after its `ControlClosed`; nothing
   settles the send then (only `ControlClosed` or a link failure does), so
-  the grace period holds a loss although the peer said goodbye and its link
-  closed.
+  the grace period, ending with nothing queued, holds a loss although the
+  peer said goodbye and its link closed.
 - (3), Dedicated: while draining, the outbox forwarder's refusal of our
   goodbye is a second `SendFailed`, which settles the first at once as a loss
   although the peer's `Cancel` is on its way. The grace period also holds a
   loss after the peer's goodbye, as in Shared mode.
-- (3), split Shared and Dedicated: `select!` finds no event, the peer's
-  `Cancel` is queued next, and it still takes the expired grace deadline,
-  which settles the failed send as a link failure with the `Cancel` waiting.
 - (4) and (5): a write fails before the last worker succeeds, but its
   `SendFailed` is applied after that success. Draining takes it for the
   failure of our goodbye, marks the link lost and ends `Ok`, although the
