@@ -126,6 +126,7 @@ use shuttle::sync::{Mutex as StateLock, MutexGuard as StateLockGuard};
 #[cfg(not(all(test, target_os = "linux", instancy_shuttle)))]
 use std::sync::{Mutex as StateLock, MutexGuard as StateLockGuard};
 
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -402,7 +403,8 @@ fn push_task_handle(
 /// works: TCP, TLS, Unix sockets, named pipes, QUIC, shared-memory channels,
 /// etc. The factory is called when a dataflow registers and the pool is
 /// missing connections (the first registration, or one after a connection
-/// failed), at most [`SharedConnectionConfig::connections`] at a time.
+/// failed). Each manager establishes its pool's missing connections one at
+/// a time, but a session registers with different peers concurrently.
 ///
 /// # Contract
 ///
@@ -2268,8 +2270,25 @@ pub struct SharedTransportSession {
     hold_channels: Arc<AtomicBool>,
 }
 
+/// Undo this setup's completed registrations on error or cancellation.
+struct RegistrationRollback<'a> {
+    dataflow_id: DataflowId,
+    token: u64,
+    peers: Vec<&'a SharedPeerManager>,
+}
+
+impl Drop for RegistrationRollback<'_> {
+    fn drop(&mut self) {
+        for manager in &self.peers {
+            manager
+                .inner
+                .unregister(&self.dataflow_id, Some(self.token));
+        }
+    }
+}
+
 impl SharedTransportSession {
-    /// Create a new shared transport session by registering with peer managers.
+    /// Create a new shared transport session by registering with all peers concurrently.
     ///
     /// # Arguments
     /// - `dataflow_id`: Identifies this dataflow
@@ -2280,7 +2299,7 @@ impl SharedTransportSession {
     /// # Errors
     ///
     /// Returns the first [`SharedPeerManager::register_dataflow`] error. Peers
-    /// that were already registered by this call are unregistered again.
+    /// already registered by this call are unregistered on error or cancellation.
     pub async fn new(
         dataflow_id: DataflowId,
         peer_managers: &HashMap<String, SharedPeerManager>,
@@ -2309,53 +2328,49 @@ impl SharedTransportSession {
         channel_capacity: usize,
     ) -> Result<Self, RegisterError> {
         let hold_channels = Arc::new(AtomicBool::new(false));
+        // Drop the payload senders' lane holds before rolling back their registrations.
+        let mut rollback = RegistrationRollback {
+            dataflow_id,
+            token,
+            peers: Vec::new(),
+        };
         let mut payload_senders = HashMap::new();
         let mut control_senders = HashMap::new();
         let mut all_receivers = HashMap::new();
         let mut io_events = HashMap::new();
 
+        // A factory may wait for its counterpart. Drive all peers here so
+        // one connection cannot prevent another peer's rendezvous.
+        let mut pending = FuturesUnordered::new();
         for (peer_id, manager) in peer_managers {
-            let registered = manager
-                .register(
-                    dataflow_id,
-                    token,
-                    channel_ids,
-                    channel_capacity,
-                    Arc::clone(&hold_channels),
-                )
-                .await
-                .and_then(|(receivers, events)| {
-                    let sender = manager
-                        .registration_sender(&dataflow_id, token)
-                        .ok_or_else(|| TransportError::InvalidRegistration {
-                            reason: format!(
-                                "dataflow {dataflow_id} was unregistered with peer {peer_id} \
-                                 while it registered"
-                            ),
-                        })?;
-                    Ok((receivers, events, sender))
-                });
-            let (receivers, events, sender) = match registered {
-                Ok(registered) => registered,
-                Err(e) => {
-                    // Nothing was sent under the registrations made so far:
-                    // without their senders' holds they go at once.
-                    drop(payload_senders);
-                    for registered_peer in all_receivers.keys() {
-                        if let Some(m) = peer_managers.get::<String>(registered_peer) {
-                            m.unregister_registration(&dataflow_id, token).await;
-                        }
-                    }
-                    return Err(e);
-                }
-            };
+            let register = manager.register(
+                dataflow_id,
+                token,
+                channel_ids,
+                channel_capacity,
+                Arc::clone(&hold_channels),
+            );
+            pending.push(async move { (peer_id, manager, register.await) });
+        }
 
+        while let Some((peer_id, manager, result)) = pending.next().await {
+            let (receivers, events) = result?;
+            rollback.peers.push(manager);
+            let sender = manager
+                .registration_sender(&dataflow_id, token)
+                .ok_or_else(|| TransportError::InvalidRegistration {
+                    reason: format!(
+                        "dataflow {dataflow_id} was unregistered with peer {peer_id} \
+                         while it registered"
+                    ),
+                })?;
             payload_senders.insert(peer_id.clone(), sender);
             control_senders.insert(peer_id.clone(), manager.control_sender().clone());
             all_receivers.insert(peer_id.clone(), receivers);
             io_events.insert(peer_id.clone(), events);
         }
 
+        rollback.peers.clear();
         Ok(Self {
             dataflow_id,
             payload_senders,
@@ -4681,6 +4696,149 @@ mod tests {
     }
 
     // --- Session --------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn cold_three_node_sessions_establish_all_peer_links() {
+        struct Rendezvous {
+            started: Arc<tokio::sync::Barrier>,
+            end: Pre,
+        }
+
+        impl ConnectionFactory for Rendezvous {
+            type Reader = tokio::io::ReadHalf<DuplexStream>;
+            type Writer = tokio::io::WriteHalf<DuplexStream>;
+
+            async fn establish(
+                &self,
+                peer: &str,
+            ) -> Result<(Self::Reader, Self::Writer), Box<dyn std::error::Error + Send + Sync>>
+            {
+                self.started.wait().await;
+                self.end.establish(peer).await
+            }
+        }
+
+        let names = ["a", "b", "c"];
+        let mut nodes = names.map(|_| HashMap::new());
+        // Hold both ends of all three links until every factory has been
+        // entered, so serial setup stalls regardless of HashMap order.
+        let started = Arc::new(tokio::sync::Barrier::new(6));
+        for (a, b) in [(0, 1), (1, 2), (2, 0)] {
+            let (left, right) = duplex(1024);
+            for (node, peer, end) in [(a, b, left), (b, a, right)] {
+                let manager = SharedPeerManager::new(
+                    names[peer].into(),
+                    config(1),
+                    Arc::new(Rendezvous {
+                        started: started.clone(),
+                        end: Pre(Mutex::new(VecDeque::from([end]))),
+                    }),
+                    &tokio::runtime::Handle::current(),
+                    health_tx(),
+                )
+                .unwrap();
+                nodes[node].insert(names[peer].to_owned(), manager);
+            }
+        }
+
+        let id = DataflowId::new();
+        let [a, b, c] = nodes
+            .each_ref()
+            .map(|peers| SharedTransportSession::new(id, peers, &[1], 4));
+        let (a, b, c) = tokio::try_join!(a, b, c).expect("all three cold sessions should register");
+        for (session, peers) in [a, b, c].iter().zip(&nodes) {
+            for peer in peers.keys() {
+                assert!(
+                    session.data_sender(peer).is_some(),
+                    "missing link to {peer}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_session_setup_rolls_back_ready_peers() {
+        let (a, _remote_a) = manager_with_raw_peer();
+        let (b, _remote_b) = manager_with_raw_peer();
+        let peers = HashMap::from([("a".into(), a), ("b".into(), b)]);
+        let mut managers = peers.values();
+        let ready = managers.next().unwrap();
+        let blocked = managers.next().unwrap();
+        let _connecting = blocked.inner.init_lock.lock().await;
+
+        let id = DataflowId::new();
+        let setup = SharedTransportSession::new(id, &peers, &[1], 4);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), setup)
+                .await
+                .is_err(),
+            "a peer is still connecting"
+        );
+        assert!(ready.dataflow_sender(&id).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_connection_error_rolls_back_a_registered_peer() {
+        let (ready, _remote) = manager_with_raw_peer();
+        let offline = SharedPeerManager::new(
+            "offline".into(),
+            config(1),
+            Pre::factory([]),
+            &tokio::runtime::Handle::current(),
+            health_tx(),
+        )
+        .unwrap();
+        let peers = HashMap::from([("peer".into(), ready), ("offline".into(), offline)]);
+        let gate = peers["offline"].inner.init_lock.lock().await;
+        let id = DataflowId::new();
+
+        // Only let the empty factory fail once the other registration is visible.
+        let release = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while peers["peer"].dataflow_sender(&id).is_none() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the reachable peer did not register");
+            drop(gate);
+        };
+        let (result, ()) = tokio::join!(SharedTransportSession::new(id, &peers, &[1], 4), release);
+        assert!(matches!(
+            result,
+            Err(TransportError::Io(e)) if e.kind() == std::io::ErrorKind::NotConnected
+        ));
+        assert!(peers["peer"].dataflow_sender(&id).is_none());
+        assert_eq!(peers["peer"].metrics_snapshot()[0].pinned_lanes, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refused_session_leaves_the_original_registration_receiving() {
+        let (manager, remote) = manager_with_raw_peer();
+        let peers = HashMap::from([("peer".into(), manager)]);
+        let id = DataflowId::new();
+        let (mut owner_rx, _events) = peers["peer"].register_dataflow(id, &[1], 4).await.unwrap();
+
+        let refused =
+            SharedTransportSession::with_token(id, new_registration_token(), &peers, &[2], 4)
+                .await
+                .err()
+                .expect("the second session took an already-owned ID");
+        assert!(refused.id_unavailable);
+        assert!(matches!(
+            refused.error,
+            TransportError::InvalidRegistration { .. }
+        ));
+
+        FramedWriter::new(remote)
+            .write_frame(&sequenced(id, 1, 0, b"still running"))
+            .await
+            .unwrap();
+        assert_eq!(
+            recv(owner_rx.get_mut(&1).unwrap()).await.unwrap(),
+            b"still running"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shared_transport_session_api() {
