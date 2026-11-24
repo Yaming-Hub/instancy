@@ -3899,6 +3899,11 @@ impl SimpleRuntime {
             .name(format!("dataflow-{}", name))
             .spawn(move || {
                 let result = executor.run_contained();
+                // Drop the executor, closing the dataflow's inputs and
+                // outputs, before publishing the result, as the pool does: a
+                // caller that sees the result sees them closed.
+                let _ =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(executor)));
                 notifier.complete(result);
             })
             .map_err(|e| {

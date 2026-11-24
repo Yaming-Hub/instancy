@@ -251,6 +251,15 @@ fn reason(result: &Option<Result<()>>) -> Option<&CancellationReason> {
     }
 }
 
+/// Whether `done` holds within 10 s.
+async fn eventually(done: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    done()
+}
+
 // ---------------------------------------------------------------------------
 // Healthy runs: no spurious failures
 // ---------------------------------------------------------------------------
@@ -500,7 +509,10 @@ async fn cut_while_draining_keeps_finished_result_and_fails_the_rest() {
             "{mode:?}: a's workers did not finish"
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(a_to_b.holding(), "{mode:?}: the paused link held nothing");
+        assert!(
+            eventually(|| a_to_b.holding()).await,
+            "{mode:?}: the paused link held nothing"
+        );
         assert!(
             !jb.is_finished(),
             "{mode:?}: b finished without a's releases"
@@ -535,8 +547,10 @@ async fn cut_after_retirement_is_benign() {
         cluster.close_all();
         let ra = cluster.join("a", DETECT).await.unwrap();
         assert!(matches!(ra, Some(Ok(()))), "{mode:?}: a {}", fmt_join(&ra));
+        // b's and c's frames to each other are written by tasks of their
+        // own, so they can reach the paused links after a has finished.
         assert!(
-            b_to_c.holding() && c_to_b.holding(),
+            eventually(|| b_to_c.holding() && c_to_b.holding()).await,
             "{mode:?}: the paused links held nothing"
         );
         assert!(
