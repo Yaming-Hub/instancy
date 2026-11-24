@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Lifecycle check: golden files only shrink
+
+- **Tests:** the golden files of the cluster lifecycle check only shrink.
+  `INSTANCY_EXHAUSTIVE_GOLDEN=1` now takes out of a file the counterexamples
+  a test no longer finds, and the test still fails on a new one;
+  `INSTANCY_EXHAUSTIVE_GOLDEN=reset` rewrites a file whole, for a change to
+  the model, which also bumps `MODEL_VERSION` in `exhaustive.rs`. A new CI
+  job, `golden-files`, fails a pull request that adds a counterexample without
+  that bump (`docs/testing/nextest.md`).
+
 ### Shared transport at scale
 
 - **Fixed: a Shared-mode dataflow whose teardown stopped waiting for its last

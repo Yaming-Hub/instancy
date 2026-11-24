@@ -280,3 +280,105 @@ jobs:
           wait "$a" || status=1
           wait "$b" || status=1
           exit "$status"
+
+  # A pull request may only take counterexamples out of the lifecycle check's
+  # golden files: an identity it adds is a regression, unless the model itself
+  # changed, which bumps MODEL_VERSION in exhaustive.rs (docs/testing/nextest.md).
+  # A count is of states, and a change to the machine can raise it with no new
+  # counterexample, so a count that rises is only reported. Whether a bump or
+  # an identity taken out is justified is for review. A re-run checks the same
+  # merge commit: a newer base needs a new push.
+  golden-files:
+    name: Lifecycle golden files only shrink
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The pull request's merge commit and its parents: ^1 is the base.
+          fetch-depth: 2
+      - name: No identity added without a new MODEL_VERSION
+        run: |
+          shopt -s inherit_errexit
+          export LC_ALL=C
+          dir=instancy/src/runtime/cluster_lifecycle/exhaustive
+          git rev-parse --verify --quiet HEAD^2 > /dev/null \
+            || { echo "::error::expected the pull request's merge commit"; exit 1; }
+          # Reads the golden files at commit $1 into $2.ids, one line per
+          # identity ("<file> <property> <identity>"), and $2.counts, one line
+          # per broken property ("<file>:<property> <violations>"). A line the
+          # tests do not write that way fails the job.
+          golden() {
+            local file
+            git ls-tree --name-only "$1" "$dir/" > "$2.files"
+            : > "$2.ids"
+            : > "$2.counts"
+            while read -r file; do
+              case $file in *.golden) ;; *) continue ;; esac
+              git show "$1:$file" > "$2.text"
+              awk -F ' [|] ' -v file="${file##*/}" -v ids="$2.ids" -v counts="$2.counts" '
+                /^\/\// || /^$/ { next }
+                /^\[[A-Za-z]+\]$/ { property = substr($0, 2, length($0) - 2); next }
+                property != "" && /^[0-9a-f]+$/ && length($0) == 12 {
+                  print file, property, $0 >> ids; next
+                }
+                property == "" && NF == 4 && $1 ~ /^[A-Za-z]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ {
+                  print file ":" $1, $2 >> counts; next
+                }
+                {
+                  print "::error::" file ", line " NR ", is not as the tests write it: " $0
+                  bad = 1
+                }
+                END { exit bad }' "$2.text"
+            done < "$2.files"
+            sort -o "$2.ids" "$2.ids"
+            sort -o "$2.counts" "$2.counts"
+          }
+          # Sets v to the MODEL_VERSION exhaustive.rs declares at commit $1, or
+          # to 0 if it declares none (before there was one).
+          version() {
+            local n status=0
+            git show "$1:$dir.rs" > version.rs
+            # grep exits 1 when nothing matches; anything above that is an error.
+            n=$(grep -c 'const MODEL_VERSION' version.rs) || status=$?
+            [ "$status" -le 1 ] || { echo "::error::$1: cannot read exhaustive.rs"; exit 1; }
+            case $n in
+              0) v=0 ;;
+              1)
+                v=$(sed -nE 's#^const MODEL_VERSION: u32 = ([0-9]+);[[:space:]]*(//.*)?$#\1#p' \
+                  version.rs)
+                [ -n "$v" ] || {
+                  echo "::error::$1: MODEL_VERSION is not declared as" \
+                    "const MODEL_VERSION: u32 = <number>;"
+                  exit 1
+                } ;;
+              *) echo "::error::$1: exhaustive.rs declares MODEL_VERSION more than once"; exit 1 ;;
+            esac
+          }
+          version HEAD^1
+          old=$v
+          version HEAD
+          new=$v
+          [ "$new" -ne 0 ] || { echo "::error::exhaustive.rs no longer declares MODEL_VERSION"; exit 1; }
+          golden HEAD^1 base
+          golden HEAD head
+          comm -13 base.ids head.ids > added.ids
+          removed=$(comm -23 base.ids head.ids | wc -l)
+          added=$(wc -l < added.ids)
+          echo "Identities taken out: $removed; added: $added; MODEL_VERSION: $old -> $new"
+          join base.counts head.counts \
+            | awk '$3 > $2 { print "Note: " $1 " violations rose from " $2 " to " $3 }'
+          if [ "$added" -gt 0 ]; then
+            if [ "$old" -ne "$new" ]; then
+              echo "MODEL_VERSION changed: the identities added are accepted"
+            else
+              echo "::error::This pull request adds counterexamples to the lifecycle check's" \
+                "golden files. Fix the regression: only a change to the model may add one," \
+                "and it bumps MODEL_VERSION in exhaustive.rs."
+              head -n 50 added.ids
+              exit 1
+            fi
+          fi

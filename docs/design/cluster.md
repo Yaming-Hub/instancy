@@ -705,7 +705,9 @@ configuration, like `tests/progress_conformance.golden`: for each property
 the number of violations, the set of their identities, the environment's
 side of each violating state, and a shortest trace), so any change to them
 fails the check until the golden files are updated, and a fix shows as
-identities removed and none added. Not covered: several peers, a data
+identities removed and none added. The files only shrink: CI fails a pull
+request that adds an identity, unless it changes the model and bumps
+`MODEL_VERSION`. Not covered: several peers, a data
 channel that ends without its close sentinel, an oversize frame, an encoding
 failure, a corrupt control message or corrupt framing, a write reported
 failed although its frame went out whole (a stream whose flush fails after
