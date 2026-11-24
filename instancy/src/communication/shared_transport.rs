@@ -4777,6 +4777,69 @@ mod tests {
         assert!(ready.dataflow_sender(&id).is_none());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn session_connection_error_rolls_back_a_registered_peer() {
+        let (ready, _remote) = manager_with_raw_peer();
+        let offline = SharedPeerManager::new(
+            "offline".into(),
+            config(1),
+            Pre::factory([]),
+            &tokio::runtime::Handle::current(),
+            health_tx(),
+        )
+        .unwrap();
+        let peers = HashMap::from([("peer".into(), ready), ("offline".into(), offline)]);
+        let gate = peers["offline"].inner.init_lock.lock().await;
+        let id = DataflowId::new();
+
+        // Only let the empty factory fail once the other registration is visible.
+        let release = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while peers["peer"].dataflow_sender(&id).is_none() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the reachable peer did not register");
+            drop(gate);
+        };
+        let (result, ()) = tokio::join!(SharedTransportSession::new(id, &peers, &[1], 4), release);
+        assert!(matches!(
+            result,
+            Err(TransportError::Io(e)) if e.kind() == std::io::ErrorKind::NotConnected
+        ));
+        assert!(peers["peer"].dataflow_sender(&id).is_none());
+        assert_eq!(peers["peer"].metrics_snapshot()[0].pinned_lanes, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refused_session_leaves_the_original_registration_receiving() {
+        let (manager, remote) = manager_with_raw_peer();
+        let peers = HashMap::from([("peer".into(), manager)]);
+        let id = DataflowId::new();
+        let (mut owner_rx, _events) = peers["peer"].register_dataflow(id, &[1], 4).await.unwrap();
+
+        let refused =
+            SharedTransportSession::with_token(id, new_registration_token(), &peers, &[2], 4)
+                .await
+                .err()
+                .expect("the second session took an already-owned ID");
+        assert!(refused.id_unavailable);
+        assert!(matches!(
+            refused.error,
+            TransportError::InvalidRegistration { .. }
+        ));
+
+        FramedWriter::new(remote)
+            .write_frame(&sequenced(id, 1, 0, b"still running"))
+            .await
+            .unwrap();
+        assert_eq!(
+            recv(owner_rx.get_mut(&1).unwrap()).await.unwrap(),
+            b"still running"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shared_transport_session_api() {
         let (a, _b, _relays) = managers(1);
