@@ -2396,20 +2396,28 @@ impl<T: Copy> Chunked<T> {
 /// reached them, so that a level of the search is a range of them. With
 /// each, the state it was first reached from and the step that took it
 /// there. `index` finds a state by its key: open addressing, probing
-/// linearly, of 1 + the state's number (0 marks an empty slot), never more
-/// than half full. Each key is held once, here.
+/// linearly, of 1 + the state's number (0 marks an empty slot). It is never
+/// more than half full, or three quarters once it has `large` slots: from
+/// there on, the memory a doubling takes matters more than longer probes.
+/// Each key is held once, here.
 struct States {
     keys: Chunked<Key>,
     trail: Chunked<(u32, Step)>,
     index: Vec<u32>,
+    large: usize,
 }
 
 impl States {
     fn new() -> Self {
+        Self::with_large(1 << 30)
+    }
+
+    fn with_large(large: usize) -> Self {
         Self {
             keys: Chunked::new(),
             trail: Chunked::new(),
             index: vec![0; 1 << 16],
+            large,
         }
     }
 
@@ -2446,8 +2454,17 @@ impl States {
         self.index[slot] = at.checked_add(1).expect("fewer than 2^32 states");
         self.keys.push(key);
         self.trail.push((from, step));
-        if self.keys.len * 2 > self.index.len() {
-            let mut index = vec![0; self.index.len() * 2];
+        let slots = self.index.len();
+        let full = if slots < self.large {
+            slots / 2
+        } else {
+            slots / 4 * 3
+        };
+        if self.keys.len > full {
+            // The new index is built from `keys` alone: free the old one
+            // first, so that the two are never held together.
+            self.index = Vec::new();
+            let mut index = vec![0; slots * 2];
             for n in 0..self.keys.len {
                 let slot = Self::slot(&index, &self.keys, self.keys.get(n));
                 index[slot] = u32::try_from(n + 1).expect("fewer than 2^32 states");
@@ -5222,6 +5239,33 @@ fn reach(cfg: Config, trace: &[Step]) -> (World, Mach, Tables, Vec<String>) {
         })
         .collect();
     (w, m, tables, texts)
+}
+
+/// The state index doubles once it is more than half full, and from
+/// `large` slots on only once it is more than three quarters full. Either
+/// way it numbers each new key in order and finds every key it holds.
+#[test]
+fn the_state_index_fills_further_once_large() {
+    let large = 1 << 17;
+    let mut states = States::with_large(large);
+    let key = |n: usize| {
+        let mut words = [0; WORDS];
+        words[0] = n as u64;
+        Key(words)
+    };
+    let step = Step::Apply(Script::NONE);
+    let mut grew = Vec::new();
+    for n in 0..large {
+        let slots = states.index.len();
+        assert_eq!(states.insert(key(n), 0, step), Some(n as u32));
+        if states.index.len() != slots {
+            grew.push((n + 1, states.index.len()));
+        }
+    }
+    assert_eq!(grew, [((1 << 15) + 1, 1 << 17), ((3 << 15) + 1, 1 << 18)]);
+    for n in 0..large {
+        assert_eq!(states.insert(key(n), 0, step), None);
+    }
 }
 
 /// The token changes between the coordinator's reads of it. A worker fails
