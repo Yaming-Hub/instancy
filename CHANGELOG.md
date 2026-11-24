@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Two flaky tests
+
+- **Fixed: `SimpleRuntime` closes a dataflow's inputs and outputs before
+  its completion resolves** (`join_blocking`, or `join` awaited), on
+  `spawn` and `spawn_multi`, as `RuntimeHandle` does. It published the
+  result first, so a send right after `join_blocking` returned could still
+  succeed.
+- **Tests:** two tests in `cluster_failure_adversarial` wait up to 10 s for
+  a paused link to hold a frame, instead of checking once: the frames are
+  written by tasks that nothing orders before the check.
+
 ### Lifecycle check: golden files only shrink
 
 - **Tests:** the golden files of the cluster lifecycle check only shrink.
