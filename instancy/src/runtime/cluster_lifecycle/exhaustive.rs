@@ -27,9 +27,11 @@
 //!
 //! 1. **Termination**: once the peer has gone, the machine always finishes.
 //! 2. **NoLossWithoutCause**: a run reports a data loss only if a send to the
-//!    peer failed (the transport failed our writer or lane), records
-//!    addressed to us were lost on their way in, or corrupt traffic reached
-//!    us.
+//!    peer failed (the transport failed our writer or lane), a read of the
+//!    connection that carries our frames failed (in Dedicated mode a reset
+//!    fails the reader at once, and the writer only at its next write),
+//!    records addressed to us were lost on their way in, or corrupt traffic
+//!    reached us.
 //! 3. **NoFalseSettle**: a failed send is never settled as a failure (a link
 //!    failure, or the loss of its frames recorded or held) while the peer's
 //!    `Cancel`, goodbye or ack is still on its way to the coordinator; nor by
@@ -110,7 +112,9 @@
 //! counterexample, so a fix has to show that it only removes identities.
 //! The identity leaves out the coordinator's channel and the driver's state,
 //! so it is coarser than a state: a new counterexample whose identity matches
-//! one the file lists goes unnoticed.
+//! one the file lists goes unnoticed. It has an encoding of its own, so a
+//! change to the driver's or the machine's state changes no identity (see
+//! [`World::identity`] for what does).
 //!
 //! # Configurations
 //!
@@ -450,14 +454,18 @@ trait Code: Copy {
 /// The 64-bit words a state packs into.
 const WORDS: usize = 4;
 
-/// Bits written, or read, in order.
-struct Bits {
-    words: [u64; WORDS],
+/// The 64-bit words an identity packs into ([`World::identity`]): its own,
+/// so that a state packed into more words keeps its identity.
+const IDENTITY_WORDS: usize = 4;
+
+/// Bits written, or read, in order, in `N` words.
+struct Bits<const N: usize = WORDS> {
+    words: [u64; N],
     at: u32,
 }
 
-impl Bits {
-    fn new(words: [u64; WORDS]) -> Self {
+impl<const N: usize> Bits<N> {
+    fn new(words: [u64; N]) -> Self {
         Self { words, at: 0 }
     }
 
@@ -586,6 +594,53 @@ impl<T: Code, const N: usize> Fifo<T, N> {
     }
 }
 
+/// An identity's slots ([`World::identity`]), written in order into
+/// [`IDENTITY_WORDS`] words of their own. A slot's width is fixed, and its
+/// value must fit: a value that outgrows it (a wider code, a queue holding
+/// more items than its slot) needs a further slot, after the last.
+struct Slots(Bits<IDENTITY_WORDS>);
+
+impl Slots {
+    fn new() -> Self {
+        Self(Bits::new([0; IDENTITY_WORDS]))
+    }
+
+    fn put(&mut self, value: u64, width: u32) {
+        assert!(
+            value >> width == 0,
+            "{value} outgrows its identity slot of {width} bits: put the rest in a further \
+             slot, after the last"
+        );
+        self.0.put(value, width);
+    }
+
+    fn flag(&mut self, flag: bool) {
+        self.put(u64::from(flag), 1);
+    }
+
+    fn item<T: Code>(&mut self, item: Option<T>, width: u32) {
+        self.put(item.map_or(0, T::code), width);
+    }
+
+    /// A queue in a slot of `items` items of `width` bits, whatever its
+    /// bound.
+    fn queue<T: Code, const N: usize>(&mut self, queue: &Fifo<T, N>, items: usize, width: u32) {
+        assert!(
+            queue.len() <= items,
+            "{} items outgrow their identity slot of {items}: put the rest in a further slot, \
+             after the last",
+            queue.len()
+        );
+        for at in 0..items {
+            self.item(queue.items.get(at).copied().flatten(), width);
+        }
+    }
+
+    fn hash(&self) -> u64 {
+        mix(self.0.words)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The environment's vocabulary
 // ---------------------------------------------------------------------------
@@ -696,9 +751,13 @@ impl Code for Why {
 /// reasons seen so far. A loss is held as 1 + its index here (0 for none), a
 /// reason as a [`Why`]. The first reasons are the environment's, so their
 /// codes are fixed; the coordinator's own escalations follow as they appear.
+/// An identity holds a reason by a code of its own ([`Self::identity_code`]).
 struct Tables {
     losses: Vec<DataLoss>,
     reasons: Vec<CancellationReason>,
+    /// Each reason's code in an identity, distinct, in the order of
+    /// `reasons`.
+    identity_codes: Vec<u32>,
 }
 
 impl Tables {
@@ -713,17 +772,21 @@ impl Tables {
                 .to_string(),
             },
         };
-        let tables = Self {
+        let mut tables = Self {
             losses: Vec::new(),
-            reasons: vec![
-                CancellationReason::UserRequested,
-                CancellationReason::WorkerFailed {
-                    detail: "a local worker failed".into(),
-                },
-                peer(Kind::Stop),
-                peer(Kind::Fail),
-            ],
+            reasons: Vec::new(),
+            identity_codes: Vec::new(),
         };
+        for reason in [
+            CancellationReason::UserRequested,
+            CancellationReason::WorkerFailed {
+                detail: "a local worker failed".into(),
+            },
+            peer(Kind::Stop),
+            peer(Kind::Fail),
+        ] {
+            tables.intern(reason);
+        }
         for (why, failure) in [
             (Why::LOCAL_STOP, false),
             (Why::LOCAL_FAILURE, true),
@@ -758,7 +821,7 @@ impl Tables {
         let index = match self.reasons.iter().position(|known| known == reason) {
             Some(index) => index,
             None => {
-                self.reasons.push(reason.clone());
+                self.intern(reason.clone());
                 self.reasons.len() - 1
             }
         };
@@ -768,6 +831,28 @@ impl Tables {
             "more reasons than codes: raise Why::BITS"
         );
         why
+    }
+
+    /// Add `reason`, with its code in an identity: a hash of its text, so
+    /// that an identity does not depend on the order the search meets
+    /// reasons in, and distinct, so that it tells reasons apart as a [`Why`]
+    /// does.
+    fn intern(&mut self, reason: CancellationReason) {
+        let hash = mix([text_hash(&reason.to_string())]) >> 32;
+        let code = u32::try_from(hash).expect("32 bits").max(1);
+        assert!(
+            !self.identity_codes.contains(&code),
+            "two cancellation reasons share an identity code: {reason}"
+        );
+        self.reasons.push(reason);
+        self.identity_codes.push(code);
+    }
+
+    /// How an identity holds `why`: 0 for none.
+    fn identity_code(&self, why: Option<Why>) -> u64 {
+        why.map_or(0, |why| {
+            u64::from(self.identity_codes[usize::from(why.0 - 1)])
+        })
     }
 
     fn reason(&self, why: Why) -> CancellationReason {
@@ -1197,7 +1282,7 @@ struct World {
     polled: bool,
     /// The actions the driver takes once the `Cancel` broadcast it awaits is
     /// done.
-    pending: Fifo<Act, 3>,
+    pending: Fifo<Act, 4>,
     /// Teardown has begun: its bounded waits are not over. Whether it
     /// drains the inbound bridges (`drain_inbound`).
     tearing_down: bool,
@@ -1724,22 +1809,126 @@ impl World {
     /// The identity of a violation found in this state: the environment's
     /// side of it, without the coordinator's channel and the driver's state,
     /// and nothing of the machine, whose representation may change.
-    fn identity(&self) -> u64 {
-        let mut env = *self;
-        env.queue = Fifo::EMPTY;
-        env.cancel_seen = false;
-        env.timer = false;
-        env.polled = false;
-        env.pending = Fifo::EMPTY;
-        env.tearing_down = false;
-        env.drain_inbound = false;
-        env.finished = false;
-        env.failure_announced = false;
-        env.unfinished_announced = false;
-        env.worker_failure = false;
-        let mut bits = Bits::new([0; WORDS]);
-        env.pack(&mut bits);
-        mix(bits.words)
+    ///
+    /// Its encoding is its own, and frozen: the environment's fields in a
+    /// fixed order, each in a slot of fixed width ([`Slots`]). So a change to
+    /// the driver's state, to the machine or to how a search packs a state
+    /// ([`Key`]) changes no identity. The dataflow token's reasons go in by a
+    /// code of their text ([`Tables::identity_code`]), not by the order the
+    /// search met them, so a reason the coordinator gains or loses leaves the
+    /// others alone; a change to a reason's text changes the identities of
+    /// the states that hold it. A field the environment loses keeps its
+    /// slot, written as zero. A field it gains, or a value that outgrows its
+    /// slot, takes a further slot after the last, so a state that leaves it
+    /// empty keeps its identity. Any other change to the encoding changes
+    /// every identity, and is a change to the model ([`MODEL_VERSION`]).
+    fn identity(&self, tables: &Tables) -> u64 {
+        let Self {
+            // The coordinator's channel, and what the coordinator and the
+            // driver remember.
+            queue: _,
+            cancel_seen: _,
+            timer: _,
+            polled: _,
+            pending: _,
+            tearing_down: _,
+            drain_inbound: _,
+            finished: _,
+            failure_announced: _,
+            unfinished_announced: _,
+            worker_failure: _,
+            token,
+            escalation,
+            aborted,
+            workers_left,
+            workers_failed,
+            outbound,
+            locked,
+            writer_dead,
+            refusing,
+            unsure,
+            write_fails,
+            forwarder,
+            lane_reader_up,
+            wire,
+            peer_locked,
+            reader_up,
+            read_fails,
+            read_failed,
+            io,
+            channels_closed,
+            ctrl,
+            dispatching,
+            ctrl_close_reported,
+            prog: [prog_0, prog_1],
+            end_of_stream: [end_of_stream_0, end_of_stream_1],
+            prog_close_reported: [prog_close_reported_0, prog_close_reported_1],
+            to_peer,
+            from_peer,
+            fault,
+            records_delivered,
+            goodbye_delivered,
+            peer_goodbye,
+            peer_ack,
+            peer_cancel,
+            peer_announced,
+            peer_fin,
+            peer_gone,
+            late,
+            inbound_lost,
+            corrupt_in,
+            corrupt_unheard,
+            failed_at_finish,
+            lost_at_finish,
+        } = self;
+        let mut slots = Slots::new();
+        slots.put(tables.identity_code(*token), 32);
+        slots.put(tables.identity_code(*escalation), 32);
+        slots.flag(*aborted);
+        slots.put(u64::from(*workers_left), 2);
+        slots.flag(*workers_failed);
+        slots.queue(outbound, 7, 3);
+        slots.put(u64::from(*locked), 2);
+        slots.flag(*writer_dead);
+        slots.flag(*refusing);
+        slots.flag(*unsure);
+        slots.flag(*write_fails);
+        slots.put(forwarder.code(), 2);
+        slots.flag(*lane_reader_up);
+        slots.queue(wire, 5, 3);
+        slots.flag(*peer_locked);
+        slots.flag(*reader_up);
+        slots.flag(*read_fails);
+        slots.flag(*read_failed);
+        slots.queue(io, 4, 3);
+        slots.flag(*channels_closed);
+        slots.queue(ctrl, 2, 2);
+        slots.flag(*dispatching);
+        slots.flag(*ctrl_close_reported);
+        slots.queue(prog_0, 3, 3);
+        slots.queue(prog_1, 3, 3);
+        slots.flag(*end_of_stream_0);
+        slots.flag(*end_of_stream_1);
+        slots.flag(*prog_close_reported_0);
+        slots.flag(*prog_close_reported_1);
+        slots.flag(*to_peer);
+        slots.flag(*from_peer);
+        slots.flag(*fault);
+        slots.flag(*records_delivered);
+        slots.flag(*goodbye_delivered);
+        slots.flag(*peer_goodbye);
+        slots.flag(*peer_ack);
+        slots.item(*peer_cancel, 2);
+        slots.flag(*peer_announced);
+        slots.flag(*peer_fin);
+        slots.flag(*peer_gone);
+        slots.item(*late, 2);
+        slots.flag(*inbound_lost);
+        slots.flag(*corrupt_in);
+        slots.flag(*corrupt_unheard);
+        slots.flag(*failed_at_finish);
+        slots.flag(*lost_at_finish);
+        slots.hash()
     }
 
     fn pack(&self, bits: &mut Bits) {
@@ -2348,8 +2537,9 @@ impl Key {
     }
 }
 
-/// A well-mixed 64-bit hash of a state's words.
-fn mix(words: [u64; WORDS]) -> u64 {
+/// A well-mixed 64-bit hash of a state's words, or of an identity's: changing
+/// it changes every identity.
+fn mix<const N: usize>(words: [u64; N]) -> u64 {
     let mut h = 0x9e37_79b9_7f4a_7c15_u64;
     for word in words {
         h = (h ^ word).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -4285,13 +4475,10 @@ fn text_hash(text: &str) -> u64 {
     })
 }
 
-/// What an identity is hashed from: the environment's side of a violating
-/// state, and the clause it broke.
-fn identity_words(env: u64, what: &str) -> [u64; WORDS] {
-    let mut words = [0; WORDS];
-    words[0] = env;
-    words[1] = text_hash(what);
-    words
+/// The identity of a violation of the clause `what` found in `w`: the
+/// environment's side of the state ([`World::identity`]) and the clause.
+fn violation_identity(w: &World, what: &str, tables: &Tables) -> u64 {
+    mix([w.identity(tables), text_hash(what)])
 }
 
 impl Search {
@@ -4318,7 +4505,7 @@ impl Search {
         at: u32,
         last: Option<Step>,
     ) {
-        let identity = mix(identity_words(w.identity(), what));
+        let identity = violation_identity(w, what, &self.tables);
         let violations = self.violations.entry(property).or_default();
         violations.count += 1;
         violations.identities.insert(identity);
@@ -4381,11 +4568,14 @@ impl Search {
         let loss = m.data_loss != 0;
         if loss {
             self.stats.loss_runs += 1;
-            if !(w.writer_dead || w.inbound_lost || w.corrupt_in) {
+            // As for NoOkOverKnownLoss (`latch`), a failed read is the
+            // connection seen failing.
+            if !(w.writer_dead || w.read_failed || w.inbound_lost || w.corrupt_in) {
                 self.record(
                     Property::NoLossWithoutCause,
-                    "the run reports a data loss although no send to the peer failed, no \
-                     records were lost on their way in and no corrupt traffic reached us",
+                    "the run reports a data loss although no send to the peer failed, no read \
+                     of the connection that carries our frames failed, no records were lost on \
+                     their way in and no corrupt traffic reached us",
                     w,
                     at,
                     None,
@@ -5023,12 +5213,13 @@ const KNOWN_FAILURES: &[Known] = &[
 /// file the identities it no longer finds, and still fails on a new one: a
 /// new counterexample is a regression to fix. Only a change to the model may
 /// add identities, and it bumps [`MODEL_VERSION`]; CI rejects a pull request
-/// that adds one without that bump. A change to what the environment's side
-/// of a state holds changes every identity, and the files are then rewritten
-/// whole. They are read when a test runs, so they can be updated without a
-/// rebuild. They are never edited by hand, and every commit that changes one
-/// cites, in its message, the [`KNOWN_FAILURES`] entry or the fix that
-/// explains each change.
+/// that adds one without that bump. Such a change rewrites the files whole,
+/// but leaves the identity of every counterexample still found as it was,
+/// unless it changes how identities are encoded ([`World::identity`]). They
+/// are read when a test runs, so they can be updated without a rebuild. They
+/// are never edited by hand, and every commit that changes one cites, in its
+/// message, the [`KNOWN_FAILURES`] entry or the fix that explains each
+/// change.
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/runtime/cluster_lifecycle/exhaustive"
@@ -5044,7 +5235,7 @@ const GOLDEN_VAR: &str = "INSTANCY_EXHAUSTIVE_GOLDEN";
 /// what a counterexample is. CI's `golden-files` job accepts identities added
 /// to the golden files only in a pull request that changes this number. Bump
 /// it with a change to the model, never to record a regression.
-const MODEL_VERSION: u32 = 1;
+const MODEL_VERSION: u32 = 2;
 
 /// What a test does with its golden file, as [`GOLDEN_VAR`] says.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5299,6 +5490,151 @@ fn the_state_index_fills_further_once_large() {
     assert_eq!(grew, [((1 << 15) + 1, 1 << 17), ((3 << 15) + 1, 1 << 18)]);
     for n in 0..large {
         assert_eq!(states.insert(key(n), 0, step), None);
+    }
+}
+
+/// A counterexample's identity holds the token's reasons by a code of their
+/// text, not by the order the search met them: two searches that meet the
+/// same reasons in opposite orders number them differently, but give the
+/// same world the same identity.
+#[test]
+fn an_identity_does_not_depend_on_the_order_reasons_are_met() {
+    let cfg = Config {
+        wiring: Wiring::Shared,
+        workers: 1,
+        channels: 1,
+        faults: Faults::Transport,
+    };
+    let x = CancellationReason::NetworkError {
+        detail: "link to peer b failed: the connection was reset".into(),
+    };
+    let y = CancellationReason::InternalError {
+        detail: "lock poisoned on the link to peer b".into(),
+    };
+    let (mut a, mut b) = (Tables::new(), Tables::new());
+    let (ax, ay) = (a.why(&x), a.why(&y));
+    let (by, bx) = (b.why(&y), b.why(&x));
+    assert!(ax != bx && ay != by, "met in opposite orders");
+    let mut wa = World::new(cfg);
+    wa.token = Some(ax);
+    wa.escalation = Some(ay);
+    let mut wb = wa;
+    wb.token = Some(bx);
+    wb.escalation = Some(by);
+    assert_eq!(wa.identity(&a), wb.identity(&b));
+    assert_eq!(
+        violation_identity(&wa, "a clause", &a),
+        violation_identity(&wb, "a clause", &b)
+    );
+    // Another reason is another identity.
+    wb.escalation = Some(bx);
+    assert_ne!(wa.identity(&a), wb.identity(&b));
+}
+
+/// A counterexample's identity is the environment's side of the state: the
+/// coordinator's channel and what the coordinator and the driver remember
+/// leave it alone, so a change to them moves no identity. Each field of the
+/// environment changes it, and no two of them alike.
+#[test]
+fn an_identity_is_the_environment_s_side_of_a_state() {
+    let cfg = Config {
+        wiring: Wiring::Shared,
+        workers: 1,
+        channels: 1,
+        faults: Faults::Transport,
+    };
+    let tables = Tables::new();
+    let w = World::new(cfg);
+    let id = w.identity(&tables);
+    let mut driver = w;
+    driver.queue.push_back(Ev::Cancel);
+    driver.cancel_seen = !driver.cancel_seen;
+    driver.timer = !driver.timer;
+    driver.polled = !driver.polled;
+    driver.pending.push_back(Act::BroadcastCancel);
+    driver.tearing_down = !driver.tearing_down;
+    driver.drain_inbound = !driver.drain_inbound;
+    driver.finished = !driver.finished;
+    driver.failure_announced = !driver.failure_announced;
+    driver.unfinished_announced = !driver.unfinished_announced;
+    driver.worker_failure = !driver.worker_failure;
+    assert_eq!(driver.identity(&tables), id);
+    let changes: &[(&str, fn(&mut World))] = &[
+        ("token", |w| w.token = Some(Why::LOCAL_STOP)),
+        ("escalation", |w| w.escalation = Some(Why::LOCAL_FAILURE)),
+        ("aborted", |w| w.aborted = !w.aborted),
+        ("workers_left", |w| w.workers_left += 1),
+        ("workers_failed", |w| w.workers_failed = !w.workers_failed),
+        ("outbound", |w| w.outbound.push_back(Out::Cancel)),
+        ("locked", |w| w.locked += 1),
+        ("writer_dead", |w| w.writer_dead = !w.writer_dead),
+        ("refusing", |w| w.refusing = !w.refusing),
+        ("unsure", |w| w.unsure = !w.unsure),
+        ("write_fails", |w| w.write_fails = !w.write_fails),
+        ("forwarder", |w| w.forwarder = Forwarder::Refused),
+        ("lane_reader_up", |w| w.lane_reader_up = !w.lane_reader_up),
+        ("wire", |w| w.wire.push_back(In::Ack)),
+        ("peer_locked", |w| w.peer_locked = !w.peer_locked),
+        ("reader_up", |w| w.reader_up = !w.reader_up),
+        ("read_fails", |w| w.read_fails = !w.read_fails),
+        ("read_failed", |w| w.read_failed = !w.read_failed),
+        ("io", |w| w.io.push_back(Notice::WriteFailed)),
+        ("channels_closed", |w| {
+            w.channels_closed = !w.channels_closed
+        }),
+        ("ctrl", |w| w.ctrl.push_back(Kind::Stop)),
+        ("dispatching", |w| w.dispatching = !w.dispatching),
+        ("ctrl_close_reported", |w| {
+            w.ctrl_close_reported = !w.ctrl_close_reported;
+        }),
+        ("prog[0]", |w| w.prog[0].push_back(In::Ack)),
+        ("prog[1]", |w| w.prog[1].push_back(In::Ack)),
+        ("end_of_stream[0]", |w| {
+            w.end_of_stream[0] = !w.end_of_stream[0]
+        }),
+        ("end_of_stream[1]", |w| {
+            w.end_of_stream[1] = !w.end_of_stream[1]
+        }),
+        ("prog_close_reported[0]", |w| {
+            w.prog_close_reported[0] = !w.prog_close_reported[0];
+        }),
+        ("prog_close_reported[1]", |w| {
+            w.prog_close_reported[1] = !w.prog_close_reported[1];
+        }),
+        ("to_peer", |w| w.to_peer = !w.to_peer),
+        ("from_peer", |w| w.from_peer = !w.from_peer),
+        ("fault", |w| w.fault = !w.fault),
+        ("records_delivered", |w| {
+            w.records_delivered = !w.records_delivered;
+        }),
+        ("goodbye_delivered", |w| {
+            w.goodbye_delivered = !w.goodbye_delivered;
+        }),
+        ("peer_goodbye", |w| w.peer_goodbye = !w.peer_goodbye),
+        ("peer_ack", |w| w.peer_ack = !w.peer_ack),
+        ("peer_cancel", |w| w.peer_cancel = Some(Kind::Stop)),
+        ("peer_announced", |w| w.peer_announced = !w.peer_announced),
+        ("peer_fin", |w| w.peer_fin = !w.peer_fin),
+        ("peer_gone", |w| w.peer_gone = !w.peer_gone),
+        ("late", |w| w.late = Some(Late::Lost)),
+        ("inbound_lost", |w| w.inbound_lost = !w.inbound_lost),
+        ("corrupt_in", |w| w.corrupt_in = !w.corrupt_in),
+        ("corrupt_unheard", |w| {
+            w.corrupt_unheard = !w.corrupt_unheard
+        }),
+        ("failed_at_finish", |w| {
+            w.failed_at_finish = !w.failed_at_finish
+        }),
+        ("lost_at_finish", |w| w.lost_at_finish = !w.lost_at_finish),
+    ];
+    let mut seen = BTreeSet::from([id]);
+    for (field, change) in changes {
+        let mut env = w;
+        change(&mut env);
+        assert!(
+            seen.insert(env.identity(&tables)),
+            "{field}: the identity changes, and to one of its own"
+        );
     }
 }
 

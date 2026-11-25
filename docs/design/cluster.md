@@ -655,7 +655,9 @@ The properties:
    happen (faults, cancellations, the abort, the peer's goodbye, ack and
    `Cancel`, and a write that is not ours may never happen).
 2. *NoLossWithoutCause*: a run reports a data loss only if a send to the
-   peer failed, records addressed to us were lost on their way in, or
+   peer failed, a read of the connection that carries our frames failed (in
+   Dedicated mode a reset fails the reader at once, and the writer only at
+   its next write), records addressed to us were lost on their way in, or
    corrupt traffic reached us.
 3. *NoFalseSettle*: a failed send is never settled as a failure while the
    peer's `Cancel`, goodbye or ack is still on its way to the coordinator,
