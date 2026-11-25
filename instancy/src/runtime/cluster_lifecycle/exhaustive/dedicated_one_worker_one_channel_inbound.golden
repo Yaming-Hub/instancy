@@ -5,7 +5,7 @@
 // KNOWN_FAILURES entry or the fix that explains it.
 //
 // property | violations | identities | shortest trace
-NoFalseSettle | 28116 | 3628 | PeerCancel(Fail), PeerFin, PeerGone, WriteFails, DropQueues { forwarder_holds: false }, ForwardNotice, Apply, Finish(Ok), Apply, ForwarderRefused, Apply
+NoFalseSettle | 28092 | 3616 | PeerCancel(Fail), PeerFin, PeerGone, WriteFails, DropQueues { forwarder_holds: false }, ForwardNotice, Apply, Finish(Ok), Apply, ForwarderRefused, Apply
 NoOkAfterFailedSend | 673 | 63 | PeerFin, PeerGone, WriteFails, Finish(Ok), Apply, ForwardNotice, Apply, TeardownEnds
 NoOkOverInboundLoss | 24757 | 2481 | LateRecord { late: Lost }, LocalCancel(Stop), TokenSeen, Finish(Ok), Apply, TeardownEnds
 NoOkOverKnownLoss | 452 | 34 | PeerFin, PeerGone, WriteFails, Finish(Ok), Apply, ForwardNotice, Apply, TeardownEnds
@@ -68,7 +68,6 @@ NoOkOverKnownLoss | 452 | 34 | PeerFin, PeerGone, WriteFails, Finish(Ok), Apply,
 03f15d4466aa
 04124d486b7e
 0413c77ed856
-041a173065b3
 041fab928f7b
 0429e00fb4e7
 043108d7ce77
@@ -278,7 +277,6 @@ NoOkOverKnownLoss | 452 | 34 | PeerFin, PeerGone, WriteFails, Finish(Ok), Apply,
 1141b9777a08
 114496cef490
 11487d062ade
-1158c1818764
 11612ba8f071
 1164eeb65dc0
 117356567ebb
@@ -1299,7 +1297,6 @@ NoOkOverKnownLoss | 452 | 34 | PeerFin, PeerGone, WriteFails, Finish(Ok), Apply,
 5691728936dc
 5692717b6466
 56a160fc3235
-56bb82e70906
 56bfd83cc9ea
 56de8e75aefc
 56e071421002
@@ -2167,7 +2164,6 @@ NoOkOverKnownLoss | 452 | 34 | PeerFin, PeerGone, WriteFails, Finish(Ok), Apply,
 9418116ad628
 94215a8e5721
 94460512d47e
-944752ca373e
 945f56223349
 947711052e94
 947f8083f048
@@ -2251,7 +2247,6 @@ NoOkOverKnownLoss | 452 | 34 | PeerFin, PeerGone, WriteFails, Finish(Ok), Apply,
 990e147aaa01
 991fe39e0ab1
 99240d78d9ab
-99275b0bc459
 9950edc5a329
 9967bf74e32f
 996ecae0d76e
@@ -2295,7 +2290,6 @@ NoOkOverKnownLoss | 452 | 34 | PeerFin, PeerGone, WriteFails, Finish(Ok), Apply,
 9c569bd20b2d
 9c97bc0b054a
 9cabb51698c3
-9cdbcf41885f
 9ce607007f0f
 9ce9f869fdac
 9cf54288ccd1
@@ -2304,7 +2298,6 @@ NoOkOverKnownLoss | 452 | 34 | PeerFin, PeerGone, WriteFails, Finish(Ok), Apply,
 9d506cd04e02
 9d79655d82b5
 9da99bf77508
-9db24bd2656e
 9dc440cabf8e
 9dd82afbb6ab
 9e0c8339c799
@@ -2467,7 +2460,6 @@ ab54b31f25a4
 ab67fab122db
 ab70a1a0a7a7
 ab7a88e3cdf9
-ab886d87ebc4
 ab9ff2876fa6
 aba538cdf64e
 aba557bfa3e9
@@ -2810,7 +2802,6 @@ c4edebc84b49
 c4f9fe43f71d
 c525b20f9dcf
 c52b3d2a1897
-c53ef31bc086
 c54993880b51
 c566faa993c6
 c56ddaba6e9f
@@ -2903,7 +2894,6 @@ cb7e6d7697f9
 cb8d97548f0e
 cb9c9b4277f6
 cba00d2067f8
-cbafbe9324fc
 cbc68709b505
 cbce3a6aff60
 cbd6106d7cdb
@@ -2971,7 +2961,6 @@ d063b3fe2afd
 d07739cf3120
 d07e1ed6810b
 d0881b1f1b41
-d089be409442
 d096b7d6e4e6
 d0a062394585
 d0b7b2b029c1
@@ -3383,7 +3372,6 @@ ed6b77bcfca2
 ed6cd9042f4c
 ed7d9ecd0dbc
 edb31a49699a
-edbad095ab53
 edc715d3db72
 eddba15875a2
 edebd7ca550e

@@ -5,57 +5,31 @@
 // KNOWN_FAILURES entry or the fix that explains it.
 //
 // property | violations | identities | shortest trace
-NoFalseSettle | 203 | 45 | Deliver, PeerGoodbye, Read, PeerFin, ReaderEof, PeerGone, OtherWriteFails, ForwardAheadOfEnd, ForwardNotice, DispatchClosed, Bridge(0), LocalCancel(Stop), TokenSeen, Poll, GraceEnds
+NoFalseSettle | 45 | 19 | Deliver, PeerGoodbye, Read, PeerFin, ReaderEof, PeerGone, OtherWriteFails, ForwardAheadOfEnd, ForwardNotice, DispatchClosed, Bridge(0), LocalCancel(Stop), TokenSeen, Poll, GraceEnds
 NoOkAfterFailedSend | 1270 | 68 | Finish(Ok), PeerFin, PeerGone, WriteFails, Finish(Ok), ForwardNotice, LocalCancel(Stop), TokenSeen, TeardownEnds
 NoOkOverInboundLoss | 29764 | 2130 | Finish(Ok), LateRecord { late: Lost }, LocalCancel(Stop), TokenSeen, Finish(Ok), Apply, TeardownEnds
 NoOkOverKnownLoss | 635 | 34 | Finish(Ok), PeerFin, PeerGone, WriteFails, Finish(Ok), ForwardNotice, LocalCancel(Stop), TokenSeen, TeardownEnds
 
 [NoFalseSettle]
 0090bb30591b
-00c61f472692
 0fa16714befb
-101416a4e92c
-139652684722
 19327b6e7391
 22e19275800b
 2312d1a1ae0e
 247e01fa28a6
-2839a43eadbd
-287bd9b50690
-31ab8e35983e
 340fe16c77d6
-356cb3ee7c76
-393107f4e0bc
 4ec8ee09a5c8
-5b775eed370b
-65f698eec159
-66075c6f430e
 678cdd712c10
 68273fa85177
 6d59f62ceb0e
-6d7d608eb38e
-6ff57757153d
 7a80ea5bffa2
-7cdf9dd96793
-82aaa2091942
 85735bce8cee
 87b0848c5cff
-89387e4675be
 90529be0fff1
 90e0763d1f32
-b1fca27921f3
-b3a8bf1df237
-bb9b03360109
 c184a02bbe61
 c32a2e0678df
-ce8d33ac57f0
-d3d7eab7bfba
-d56563086076
 ebe2dc79f323
-ecf9ebc61835
-f7b91cec10ad
-fbec7708fac6
-fec928f9aa10
 
 [NoOkAfterFailedSend]
 0566a5a577a1

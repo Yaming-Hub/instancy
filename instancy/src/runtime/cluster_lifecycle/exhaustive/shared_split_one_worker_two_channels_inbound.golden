@@ -5,7 +5,7 @@
 // KNOWN_FAILURES entry or the fix that explains it.
 //
 // property | violations | identities | shortest trace
-NoFalseSettle | 74 | 27 | Deliver, PeerGoodbye, Read, Read, Bridge(0), PeerFin, ReaderEof, PeerGone, OtherWriteFails, ForwardAheadOfEnd, ForwardNotice, DispatchClosed, Bridge(1), LocalCancel(Stop), TokenSeen, Poll, GraceEnds
+NoFalseSettle | 34 | 14 | Deliver, PeerGoodbye, Read, Read, Bridge(0), PeerFin, ReaderEof, PeerGone, OtherWriteFails, ForwardAheadOfEnd, ForwardNotice, DispatchClosed, Bridge(1), LocalCancel(Stop), TokenSeen, Poll, GraceEnds
 NoOkAfterFailedSend | 1376 | 68 | PeerFin, PeerGone, WriteFails, Finish(Ok), Apply, ForwardNotice, Apply, TeardownEnds
 NoOkOverInboundLoss | 46907 | 2817 | LateRecord { late: Lost }, LocalCancel(Stop), TokenSeen, Finish(Ok), Apply, TeardownEnds
 NoOkOverKnownLoss | 688 | 34 | PeerFin, PeerGone, WriteFails, Finish(Ok), Apply, ForwardNotice, Apply, TeardownEnds
@@ -13,30 +13,17 @@ NoOkOverKnownLoss | 688 | 34 | PeerFin, PeerGone, WriteFails, Finish(Ok), Apply,
 [NoFalseSettle]
 06451f93f8a8
 08eb42c84704
-1734993d205c
 2c6a825c68cf
 2d452338c36a
-31037bd4fd32
-33d32db22cae
-3c4a5a232140
-3e95fbee8e52
-42e2af9cba5a
 431509851b36
 45b217f33535
 4dfef9040cda
 5a6b0d97dbb8
-776b7fa3e5a2
-880ed160eeb0
-8f623a390e2d
 8fd7a80b986d
 a0ed466c4c67
-aa5ba1bde0ad
 ac43b8de8eb4
-b64a3c666542
 cc76a57be62f
-cfaf14baedc6
 f2d64a1b0ec1
-fcddf8f4f593
 fcf9417f6a37
 
 [NoOkAfterFailedSend]

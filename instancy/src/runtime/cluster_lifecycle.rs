@@ -1835,8 +1835,7 @@ impl ClusterLifecycle {
                 },
                 _ = sleep_until_opt(soft_deadline), if soft_deadline.is_some() => {
                     let (peer, _) = next_soft.expect("guarded by soft_deadline");
-                    soft_deadlines.remove(&peer);
-                    self.coordinator.on_soft_failure_expired(peer)
+                    self.grace_deadline_passed(peer, &mut soft_deadlines)
                 }
             };
             for action in actions {
@@ -1879,6 +1878,31 @@ impl ClusterLifecycle {
                 }
             }
         }
+    }
+
+    /// The timer's branch: the grace deadline of `peer`'s soft failure has
+    /// passed. `select!` found no event before it polled the timer, but one
+    /// may have come in since, such as the peer's `Cancel`, which excuses a
+    /// failed send. Then nothing ends yet: the grace period starts again, and
+    /// the loop applies what is queued first, as it applies any event. So a
+    /// grace period ends only with nothing queued, after a whole grace period
+    /// in which whatever was on its way has had time to arrive (the timing
+    /// `exhaustive` assumes). It looks at the channel once, so a flood of
+    /// events only postpones the end.
+    fn grace_deadline_passed(
+        &mut self,
+        peer: String,
+        soft_deadlines: &mut HashMap<String, tokio::time::Instant>,
+    ) -> Vec<Action> {
+        if !self.events.is_empty() {
+            soft_deadlines.insert(
+                peer,
+                tokio::time::Instant::now() + self.cancel_broadcast_timeout,
+            );
+            return Vec::new();
+        }
+        soft_deadlines.remove(&peer);
+        self.coordinator.on_soft_failure_expired(peer)
     }
 
     /// Hand one event to the coordinator, noting it in the flight recorder
@@ -4031,6 +4055,201 @@ mod tests {
             ),
             "{seen:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A real coordinator whose send to `node-b` failed while its worker ran
+    /// (and whose worker then succeeded, if `drained`), with that failure's
+    /// grace deadline, which has just passed. `node-b` has `channels`
+    /// progress channels.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn grace_rig(
+        drained: bool,
+        channels: usize,
+        dir: &std::path::Path,
+    ) -> (
+        ClusterLifecycle,
+        tokio_mpsc::UnboundedSender<LifecycleEvent>,
+        HashMap<String, tokio::time::Instant>,
+    ) {
+        let (mut m, _) = machine(1, &[("node-b", channels)]);
+        assert!(matches!(
+            m.on_event(send_failed("node-b")).as_slice(),
+            [Action::ArmSoftFailureTimer(_)]
+        ));
+        if drained {
+            assert!(matches!(
+                m.on_event(done(true)).as_slice(),
+                [Action::SendGoodbye]
+            ));
+        }
+        let (lifecycle, events, _, _, _) = teardown_rig(m, dir);
+        let deadlines = HashMap::from([("node-b".to_string(), tokio::time::Instant::now())]);
+        (lifecycle, events, deadlines)
+    }
+
+    /// The timer's branch with something queued ends nothing: the grace
+    /// period starts again, a whole one, and nothing queued is taken.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn grace_starts_again(
+        lifecycle: &mut ClusterLifecycle,
+        deadlines: &mut HashMap<String, tokio::time::Instant>,
+    ) {
+        let queued = lifecycle.events.len();
+        let actions = lifecycle.grace_deadline_passed("node-b".to_string(), deadlines);
+        assert!(actions.is_empty(), "{actions:?}");
+        assert_eq!(
+            deadlines.get("node-b"),
+            Some(&(tokio::time::Instant::now() + lifecycle.cancel_broadcast_timeout)),
+        );
+        assert_eq!(lifecycle.events.len(), queued, "the branch takes no event");
+    }
+
+    /// The loop applies what is queued, one event at a time.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    fn apply_queued(lifecycle: &mut ClusterLifecycle) -> Vec<Action> {
+        let mut actions = Vec::new();
+        while let Ok(event) = lifecycle.events.try_recv() {
+            actions.extend(lifecycle.apply(event));
+        }
+        actions
+    }
+
+    /// The timer race: `select!` found no event, the peer's `Cancel` came
+    /// in, and then the timer's branch was taken. The `Cancel` goes first and
+    /// excuses the failed send, so the grace period that starts again ends
+    /// with nothing to settle: no link failure, no loss.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_queued_as_the_grace_deadline_passes_excuses_the_failed_send() {
+        let dir = temp_dir("grace-cancel");
+        let (mut lifecycle, events, mut deadlines) = grace_rig(false, 1, &dir);
+        events
+            .send(link_event("node-b", LinkEvent::CancelReceived))
+            .unwrap();
+        grace_starts_again(&mut lifecycle, &mut deadlines);
+        assert!(apply_queued(&mut lifecycle).is_empty());
+        let actions = lifecycle.grace_deadline_passed("node-b".to_string(), &mut deadlines);
+        assert!(actions.is_empty(), "{actions:?}");
+        assert!(deadlines.is_empty());
+        assert!(lifecycle.coordinator.data_loss().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// As the deadline passes, the peer's goodbye and the close of its
+    /// control channel are queued: it finished and left, which is what made
+    /// our send fail. They go first and settle the send as excused.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[tokio::test(start_paused = true)]
+    async fn a_goodbye_and_close_queued_as_the_grace_deadline_passes_excuse_the_failed_send() {
+        let dir = temp_dir("grace-goodbye");
+        let (mut lifecycle, events, mut deadlines) = grace_rig(false, 1, &dir);
+        events
+            .send(link_event("node-b", LinkEvent::ProgressEndOfStream))
+            .unwrap();
+        events
+            .send(link_event("node-b", LinkEvent::ControlClosed))
+            .unwrap();
+        grace_starts_again(&mut lifecycle, &mut deadlines);
+        let actions = apply_queued(&mut lifecycle);
+        assert!(
+            matches!(actions.as_slice(), [Action::SendAck(_)]),
+            "{actions:?}"
+        );
+        let actions = lifecycle.grace_deadline_passed("node-b".to_string(), &mut deadlines);
+        assert!(actions.is_empty(), "{actions:?}");
+        assert!(lifecycle.coordinator.data_loss().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Our worker succeeded after the failed send. The peer's `Cancel`,
+    /// queued as the deadline passes, goes first: it excuses the send and
+    /// finishes the machine, which tears down without a loss, so the grace
+    /// period never ends.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[tokio::test(start_paused = true)]
+    async fn an_event_queued_as_the_grace_deadline_passes_can_finish_the_machine_first() {
+        let dir = temp_dir("grace-finish");
+        let (mut lifecycle, events, mut deadlines) = grace_rig(true, 1, &dir);
+        events
+            .send(link_event("node-b", LinkEvent::CancelReceived))
+            .unwrap();
+        grace_starts_again(&mut lifecycle, &mut deadlines);
+        let actions = apply_queued(&mut lifecycle);
+        assert!(is_teardown(&actions, true), "{actions:?}");
+        assert_eq!(lifecycle.coordinator.machine().phase(), Phase::Finished);
+        assert!(lifecycle.coordinator.data_loss().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Events keep coming each time the deadline passes: each time, the
+    /// branch looks at the channel once, takes none of them and starts the
+    /// grace period again, and the loop applies them. A flood only postpones
+    /// the end, which still comes once the channel is found empty: here a
+    /// link failure, as nothing excused the send.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[tokio::test(start_paused = true)]
+    async fn a_flood_of_events_only_postpones_the_end_of_a_grace_period() {
+        let dir = temp_dir("grace-flood");
+        let (mut lifecycle, events, mut deadlines) = grace_rig(false, 64, &dir);
+        for _ in 0..3 {
+            for _ in 0..10 {
+                events
+                    .send(link_event("node-b", LinkEvent::ProgressEndOfStream))
+                    .unwrap();
+            }
+            grace_starts_again(&mut lifecycle, &mut deadlines);
+            assert!(apply_queued(&mut lifecycle).is_empty());
+        }
+        let actions = lifecycle.grace_deadline_passed("node-b".to_string(), &mut deadlines);
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [
+                    Action::LinkFailed {
+                        failure: LinkFailure::SendFailed,
+                        ..
+                    },
+                    Action::BroadcastCancel
+                ]
+            ),
+            "{actions:?}"
+        );
+        assert!(deadlines.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Through the driver, on paused time: a grace deadline that passes with
+    /// nothing queued ends the grace period then, and not before. A send that
+    /// failed while the worker ran, and that nothing excused, is then a link
+    /// failure, which cancels the dataflow.
+    #[cfg(any(debug_assertions, feature = "progress-check", feature = "test-utils"))]
+    #[tokio::test(start_paused = true)]
+    async fn a_grace_period_that_ends_with_nothing_queued_fails_the_link() {
+        let dir = temp_dir("grace-quiet");
+        let (m, _) = machine(1, &[("node-b", 1)]);
+        let (lifecycle, events, _, _, _) = teardown_rig(m, &dir);
+        let token = lifecycle.dataflow_cancel.clone();
+        let grace = lifecycle.cancel_broadcast_timeout;
+        events.send(send_failed("node-b")).unwrap();
+        let run = tokio::spawn(lifecycle.run());
+        tokio::time::sleep(grace - Duration::from_millis(1)).await;
+        assert!(!token.is_cancelled(), "the grace period is not over");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert!(
+            matches!(
+                token.reason(),
+                Some(CancellationReason::NetworkError { detail })
+                    if detail.contains("link to peer node-b failed")
+            ),
+            "{:?}",
+            token.reason()
+        );
+        events.send(done(false)).unwrap();
+        tokio::time::timeout(Duration::from_secs(60), run)
+            .await
+            .unwrap()
+            .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

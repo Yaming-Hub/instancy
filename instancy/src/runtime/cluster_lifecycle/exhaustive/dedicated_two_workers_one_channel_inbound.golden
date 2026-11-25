@@ -5,7 +5,7 @@
 // KNOWN_FAILURES entry or the fix that explains it.
 //
 // property | violations | identities | shortest trace
-NoFalseSettle | 14736 | 2254 | Finish(Ok), PeerCancel(Fail), PeerFin, PeerGone, WriteFails, DropQueues { forwarder_holds: false }, ForwardNotice, Finish(Ok), LocalCancel(Stop), TokenSeen, ForwarderRefused, Apply
+NoFalseSettle | 14636 | 2230 | Finish(Ok), PeerCancel(Fail), PeerFin, PeerGone, WriteFails, DropQueues { forwarder_holds: false }, ForwardNotice, Finish(Ok), LocalCancel(Stop), TokenSeen, ForwarderRefused, Apply
 NoOkAfterFailedSend | 971 | 63 | Finish(Ok), PeerFin, PeerGone, WriteFails, Finish(Ok), ForwardNotice, LocalCancel(Stop), TokenSeen, TeardownEnds
 NoOkOverInboundLoss | 23290 | 1863 | Finish(Ok), LateRecord { late: Lost }, LocalCancel(Stop), TokenSeen, Finish(Ok), Apply, TeardownEnds
 NoOkOverKnownLoss | 622 | 34 | Finish(Ok), PeerFin, PeerGone, WriteFails, Finish(Ok), ForwardNotice, LocalCancel(Stop), TokenSeen, TeardownEnds
@@ -19,7 +19,6 @@ NoOkOverKnownLoss | 622 | 34 | Finish(Ok), PeerFin, PeerGone, WriteFails, Finish
 0060c264781b
 00d91ae0abcf
 00e0e076f512
-00e5d38f6c0b
 00ebcb60702a
 00fe8047f89a
 010129030628
@@ -54,12 +53,10 @@ NoOkOverKnownLoss | 622 | 34 | Finish(Ok), PeerFin, PeerGone, WriteFails, Finish
 03f09133ad01
 03f15d4466aa
 0413c77ed856
-041a173065b3
 041fab928f7b
 0429e00fb4e7
 043108d7ce77
 04a04d6bd3ba
-04aa00a530c5
 05010adadca8
 050893c12016
 051ad3e1679e
@@ -191,11 +188,9 @@ NoOkOverKnownLoss | 622 | 34 | Finish(Ok), PeerFin, PeerGone, WriteFails, Finish
 1141b9777a08
 114496cef490
 11487d062ade
-1158c1818764
 11612ba8f071
 1164eeb65dc0
 117356567ebb
-117bc8bc3bed
 11e5808552e1
 11f60c0ee71c
 1251077ad5ca
@@ -620,7 +615,6 @@ NoOkOverKnownLoss | 622 | 34 | Finish(Ok), PeerFin, PeerGone, WriteFails, Finish
 4356e7d567aa
 438773de4808
 438e17413afc
-43c649d0a991
 43ca54cb2320
 43cbbe3eacbd
 43db4114f387
@@ -799,7 +793,6 @@ NoOkOverKnownLoss | 622 | 34 | Finish(Ok), PeerFin, PeerGone, WriteFails, Finish
 566bd374343f
 5691728936dc
 56a160fc3235
-56bb82e70906
 56bfd83cc9ea
 56de8e75aefc
 56e866befe75
@@ -883,7 +876,6 @@ NoOkOverKnownLoss | 622 | 34 | Finish(Ok), PeerFin, PeerGone, WriteFails, Finish
 5fdba4b21e89
 60178fcfeae3
 6069b34f65fe
-608613117d6a
 60badaddd143
 60c7fd0fa32b
 60e9971a42c1
@@ -935,7 +927,6 @@ NoOkOverKnownLoss | 622 | 34 | Finish(Ok), PeerFin, PeerGone, WriteFails, Finish
 65408fdd87c6
 6591cbdc8743
 6596bb70d3bd
-659739edff40
 659f89b2c704
 65dc6c87fa1e
 65e812b00ea6
@@ -1047,7 +1038,6 @@ NoOkOverKnownLoss | 622 | 34 | Finish(Ok), PeerFin, PeerGone, WriteFails, Finish
 72e7e312e33e
 73095e8f5c69
 731219e6356c
-7317a5e0bbab
 73258d5130ef
 73389053d952
 7358ea93547f
@@ -1057,7 +1047,6 @@ NoOkOverKnownLoss | 622 | 34 | Finish(Ok), PeerFin, PeerGone, WriteFails, Finish
 73e503c0cfdf
 73f2be28afda
 7445021ac5cd
-744aeee6a985
 745d7add2ca7
 7466eaaebbd3
 74a5318f1dea
@@ -1161,7 +1150,6 @@ NoOkOverKnownLoss | 622 | 34 | Finish(Ok), PeerFin, PeerGone, WriteFails, Finish
 802a7859b9b3
 804453e4e3f4
 80615ac8307e
-807f1deb6f4e
 8095ddf68ef5
 80ced7dd96e1
 80fb7b3bd8fd
@@ -1305,7 +1293,6 @@ NoOkOverKnownLoss | 622 | 34 | Finish(Ok), PeerFin, PeerGone, WriteFails, Finish
 8eac1e49b00e
 8eb1e8e595fe
 8ec50839f40b
-8ee06087f9d6
 8ee8de7c2923
 8f30acddb2dc
 8f4fbcfbc8e4
@@ -1356,7 +1343,6 @@ NoOkOverKnownLoss | 622 | 34 | Finish(Ok), PeerFin, PeerGone, WriteFails, Finish
 9418116ad628
 94215a8e5721
 94460512d47e
-944752ca373e
 945f56223349
 9482a67507d9
 949283d2d2e5
@@ -1407,7 +1393,6 @@ NoOkOverKnownLoss | 622 | 34 | Finish(Ok), PeerFin, PeerGone, WriteFails, Finish
 98f3374e8fdc
 990e147aaa01
 991fe39e0ab1
-99275b0bc459
 9950edc5a329
 9967bf74e32f
 9971982c9a80
@@ -1428,14 +1413,12 @@ NoOkOverKnownLoss | 622 | 34 | Finish(Ok), PeerFin, PeerGone, WriteFails, Finish
 9c3e94df5153
 9c569bd20b2d
 9c97bc0b054a
-9cdbcf41885f
 9cf54288ccd1
 9d09d34c57ee
 9d3f40e51ea6
 9d4be8817ece
 9d506cd04e02
 9d79655d82b5
-9db24bd2656e
 9dd82afbb6ab
 9e0c8339c799
 9e1f2cac279d
@@ -1539,7 +1522,6 @@ ab2eb93d933e
 ab3a087fc626
 ab54b31f25a4
 ab67fab122db
-ab886d87ebc4
 ab9ff2876fa6
 aba557bfa3e9
 abc972be5216
@@ -1742,7 +1724,6 @@ c4ea4f1d99de
 c4edebc84b49
 c4f9fe43f71d
 c52b3d2a1897
-c53ef31bc086
 c54993880b51
 c56ddaba6e9f
 c59eada4cbdc
@@ -1811,7 +1792,6 @@ cb0756a9d168
 cb7e6d7697f9
 cb8d97548f0e
 cb9c9b4277f6
-cbafbe9324fc
 cbc68709b505
 cbce3a6aff60
 cc3d2b07ff6e
@@ -1851,7 +1831,6 @@ d006b24094da
 d01c468d7674
 d063b3fe2afd
 d07739cf3120
-d089be409442
 d0b7b2b029c1
 d0b93f15d153
 d0cd64b53dcc
@@ -2066,7 +2045,6 @@ e90c4385ddf9
 e923e5efccf4
 e9340648ec8e
 e948798d1855
-e94fc5590406
 e9580aae6ef6
 e9661502811f
 e96894d593c8
@@ -2076,7 +2054,6 @@ e9f57e1f6d60
 e9f6fd45cbef
 e9ff0fd585e2
 ea33634ed4d5
-ea3ad460c3ab
 ea55e7634f19
 ea5d70631675
 ea865d074c5a
@@ -2101,7 +2078,6 @@ ed217c9f3b1b
 ed2ea7770442
 ed5565c58414
 edb31a49699a
-edbad095ab53
 edc715d3db72
 eddba15875a2
 edebd7ca550e

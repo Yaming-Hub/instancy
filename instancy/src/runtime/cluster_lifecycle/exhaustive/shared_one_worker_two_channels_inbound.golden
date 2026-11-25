@@ -5,79 +5,47 @@
 // KNOWN_FAILURES entry or the fix that explains it.
 //
 // property | violations | identities | shortest trace
-NoFalseSettle | 256 | 84 | Deliver, PeerGoodbye, Read, Read, Bridge(0), PeerFin, PeerGone, OtherWriteFails, ForwardNotice, ForwardNotice, DispatchClosed, Bridge(1), LocalCancel(Stop), TokenSeen, Poll, GraceEnds
+NoFalseSettle | 124 | 48 | Deliver, PeerGoodbye, Read, Read, Bridge(0), PeerFin, PeerGone, OtherWriteFails, ForwardNotice, ForwardNotice, DispatchClosed, Bridge(1), LocalCancel(Stop), TokenSeen, Poll, GraceEnds
 NoOkAfterFailedSend | 1488 | 72 | PeerFin, PeerGone, WriteFails, Finish(Ok), Apply, ForwardNotice, Apply, TeardownEnds
 NoOkOverInboundLoss | 53545 | 2837 | LateRecord { late: Lost }, LocalCancel(Stop), TokenSeen, Finish(Ok), Apply, TeardownEnds
 NoOkOverKnownLoss | 744 | 36 | PeerFin, PeerGone, WriteFails, Finish(Ok), Apply, ForwardNotice, Apply, TeardownEnds
 
 [NoFalseSettle]
-060fc6fecd4a
 06d6a8a0b23c
 06ea37feaa45
 0b5162dac7be
 0f4028647021
-129e44ffddf0
 202707a029f9
-221a3dbbda24
 241356a445c1
 2e9ab315e961
-30e016a9632c
-33dab9dcec3e
 3544284c0df7
-385182744445
-3aa416ac19ed
 3adfe257d78f
 3bf428996a2a
-44ee9402f501
 46bddea02e8d
 49a5420c8a49
 4a6c5cccc970
 4ab0f05197dc
-4b583e471935
-4d81a19ed10e
 51c2e05431c3
-54a83dd21bd6
 55867f94607d
 560a019e4033
-57d34e29c4b6
-5986a198dfbe
 5acd4a5e3868
 5f8df04fd103
-63d7100bb2b4
-651308073f8f
-65e0e2694894
 6776e2b53632
 7102fddaa373
 710d7e4be60b
 7454ac1acb02
-74bd9a47355a
 7ae795b0e3e9
-7cba609f743f
 7d314ad1a466
 7d5ee98b8d40
-8473762ea2a1
 8501f0ade613
-86857a02d2a5
 87aba29078d2
-89df7977f806
 8a80712f7a65
-957f91baf0c1
 98171772be50
-9b1aed9dc251
-a75bacc9cf67
-acc8bcd63d58
 b5927b80af4a
 b7980d5c42ee
 bc25d32c0ee8
-bdc678e11c6d
-bfbb49e0e7bd
 c02840a4a439
-cb071e315207
-cb2494bcdc0a
-ccbf7a6edefe
-d0b69201d9bb
 dd156e8075dd
-dd92e36e32e3
 de4da9d99a7d
 de6f25627084
 e4127ebbed71
@@ -88,13 +56,9 @@ ea31dfc1975a
 ecea1ba04041
 efe013643767
 eff3b8de3aa1
-f01200f34a4b
-f1b4e1b8168d
 f2936fab9bb5
-f4b4c382e0cc
 f69e80d5b5bb
 fac4b427c01e
-fe4f4d63d735
 
 [NoOkAfterFailedSend]
 0566a5a577a1
